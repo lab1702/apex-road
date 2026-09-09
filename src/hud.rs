@@ -271,8 +271,8 @@ fn track_map(track: &Track, position: Vec3, heading: f32, x: f32, y: f32, u: f32
         max = max.max(p);
     }
     let size = max - min;
-    let map_scale =
-        ((width - 47.0 * u) / size.x.max(1.0)).min((height - 63.0 * u) / size.y.max(1.0));
+    let map_extent = vec2(width - 47.0 * u, height - 63.0 * u);
+    let map_scale = (map_extent.x / size.x.max(1.0)).min(map_extent.y / size.y.max(1.0));
     let center = (min + max) * 0.5;
     let map_center = vec2(x + width * 0.5, y + 42.0 * u + (height - 54.0 * u) * 0.5);
     let project = |p: Vec3| map_center + vec2(p.x - center.x, -(p.z - center.y)) * map_scale;
@@ -284,7 +284,9 @@ fn track_map(track: &Track, position: Vec3, heading: f32, x: f32, y: f32, u: f32
     }
     let start = project(track.samples[0].pos);
     draw_circle(start.x, start.y, 3.0 * u, PAPER);
-    let car = project(position);
+    // Keep the entire marker within the map when the car drives beyond the
+    // course bounds. The projection's padding also contains its 9 px halo.
+    let car = project(position).clamp(map_center - map_extent * 0.5, map_center + map_extent * 0.5);
     // In world space heading zero points along +Z.
     let forward = vec2(heading.sin(), -heading.cos());
     let right = vec2(-forward.y, forward.x);

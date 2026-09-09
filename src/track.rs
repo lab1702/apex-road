@@ -492,6 +492,12 @@ impl Builder {
                     .into(),
             );
         }
+        if closing_chord.y.abs() > closing_chord.xz().length() {
+            return Err(
+                "'close' would exceed the maximum slope 100%; match the endpoint elevation more precisely or use a longer final segment"
+                    .into(),
+            );
+        }
         self.track.length = length;
         self.track.samples[index] = RoadSample {
             distance: self.track.length,
@@ -865,6 +871,26 @@ mod tests {
                 assert!((pair[1].pos - pair[0].pos).dot(pair[0].forward) > 0.0);
             }
         }
+    }
+
+    #[test]
+    fn close_rejects_a_drift_correction_exceeding_the_slope_limit() {
+        // Both endpoints have level frames and differ by only 20 cm. The
+        // final bank transition, however, has samples less than 6 cm apart;
+        // snapping the endpoint down would create a slope well above 100%.
+        let source = "straight 20\nright 180 radius 20\nstraight 21\nright 180 radius 20 rise 0.2 bank 60\nstraight 1 bank 0";
+        let open = Track::parse(source).unwrap();
+        let closing_chord = open.samples[0].pos - open.samples[open.samples.len() - 2].pos;
+        assert!(closing_chord.y.abs() > closing_chord.xz().length());
+        let error = Track::parse(&format!("{source}\nclose")).unwrap_err();
+        assert!(error.contains("maximum slope 100%"), "{error}");
+
+        // The same elevation drift can be corrected across an ordinary
+        // final segment without exceeding the geometric slope limit.
+        let safe = Track::parse("straight 20\nright 180 radius 20\nstraight 30\nright 180 radius 20 rise 0.2 bank 60\nstraight 10 bank 0\nclose").unwrap();
+        let closing_chord =
+            safe.samples.last().unwrap().pos - safe.samples[safe.samples.len() - 2].pos;
+        assert!(closing_chord.y.abs() <= closing_chord.xz().length());
     }
 
     #[test]

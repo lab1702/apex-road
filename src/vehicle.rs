@@ -86,6 +86,8 @@ struct Surface {
     height: f32,
     normal: Vec3,
     offroad: bool,
+    /// Decks and shoulders have finite footprints; the base terrain does not.
+    finite: bool,
 }
 
 impl Car {
@@ -292,13 +294,13 @@ impl Car {
             && (new_road.is_some_and(|road| road.swept_contact)
                 || (previous_clearance >= -0.08
                     && self.velocity.y <= required_vertical + 0.3))
-            // The height crossing must occur on the finite deck. A car can
-            // fall below a landing while over a gap, then reach the road's
+            // The height crossing must occur on the finite road or shoulder.
+            // A car can fall below a landing while over a gap, then reach its
             // footprint later in this step without ever touching its top.
-            && (surface.offroad
+            && (!surface.finite
                 || new_road.is_some_and(|road| {
                     road.swept_contact
-                        || crosses_finite_deck(
+                        || crosses_finite_road_surface(
                             track,
                             road,
                             surface,
@@ -616,14 +618,7 @@ fn nearest_road(
             position.y - RIDE_HEIGHT <= surface.height
                 && sweep.is_some_and(|sweep| {
                     sweep.support.is_some_and(|support| {
-                        crosses_connected_surface(
-                            track,
-                            support,
-                            point,
-                            sweep.before,
-                            position,
-                            true,
-                        )
+                        crosses_connected_surface(track, support, point, sweep.before, position)
                     })
                 })
         });
@@ -637,15 +632,14 @@ fn nearest_road(
                     && sweep.is_some_and(|sweep| {
                         sweep.before.y - RIDE_HEIGHT
                             >= plane_height_at(surface, position, sweep.before) - 0.08
-                            && (surface.offroad
-                                || crosses_finite_deck(
-                                    track,
-                                    point,
-                                    surface,
-                                    sweep.before,
-                                    position,
-                                    ground_height,
-                                ))
+                            && crosses_finite_road_surface(
+                                track,
+                                point,
+                                surface,
+                                sweep.before,
+                                position,
+                                ground_height,
+                            )
                     })
             });
             // Downward motion can exceed ordinary contact's current-position
@@ -666,10 +660,10 @@ fn nearest_road(
     best.map(|(_, point)| point)
 }
 
-/// Crossing an extended deck plane outside the road is not a landing. Locate
-/// the actual contact point and require a solid route from there to this step's
-/// endpoint, including any intervening sample boundaries.
-fn crosses_finite_deck(
+/// Crossing an extended road or shoulder plane outside its footprint is not a
+/// landing. Locate the actual contact point and require a solid route from there
+/// to this step's endpoint, including any intervening sample boundaries.
+fn crosses_finite_road_surface(
     track: &Track,
     to: RoadPoint,
     surface: Surface,
@@ -691,9 +685,8 @@ fn crosses_finite_deck(
     )
     .is_some_and(|from| {
         road_surface(from, ground_height).is_some_and(|surface| {
-            !surface.offroad
-                && (crossing.y - RIDE_HEIGHT - surface.height).abs() <= 0.08
-                && crosses_connected_surface(track, from, to, crossing, after, false)
+            (crossing.y - RIDE_HEIGHT - surface.height).abs() <= 0.08
+                && crosses_connected_surface(track, from, to, crossing, after)
         })
     })
 }
@@ -706,7 +699,6 @@ fn crosses_connected_surface(
     to: RoadPoint,
     before: Vec3,
     after: Vec3,
-    allow_shoulders: bool,
 ) -> bool {
     let mut delta = to.sample.distance - from.sample.distance;
     if track.closed {
@@ -746,9 +738,8 @@ fn crosses_connected_surface(
         };
         // A shoulder ends when either side of the join is a bridge, tunnel,
         // or gap. Recovery must not extend terrain support across that edge.
-        let shoulder_width = if allow_shoulders
-            && (starts_at_boundary
-                || matches!(track.samples[index].kind, RoadKind::Road | RoadKind::Ramp))
+        let shoulder_width = if (starts_at_boundary
+            || matches!(track.samples[index].kind, RoadKind::Road | RoadKind::Ramp))
             && matches!(
                 track.samples[next_index].kind,
                 RoadKind::Road | RoadKind::Ramp
@@ -777,6 +768,7 @@ fn contact_surface(
         height: ground_height,
         normal: Vec3::Y,
         offroad: true,
+        finite: false,
     };
     road.and_then(|road| {
         road_surface(road, ground_height)
@@ -795,9 +787,10 @@ fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
             height: road.plane_height,
             normal: road.sample.up,
             offroad: false,
+            finite: true,
         }
     } else if matches!(road.sample.kind, RoadKind::Road | RoadKind::Ramp)
-        && road.lateral.abs() < half_width + SHOULDER_WIDTH
+        && road.lateral.abs() <= half_width + SHOULDER_WIDTH + SEGMENT_TOLERANCE
     {
         let side = road.lateral.signum();
         let edge = road.sample.pos + road.sample.right * half_width * side;
@@ -813,6 +806,7 @@ fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
             height: edge.y + (ground_height - edge.y) * fraction,
             normal,
             offroad: true,
+            finite: true,
         }
     } else {
         return None;
@@ -1513,6 +1507,47 @@ mod tests {
                 "pulled through the landing edge at dt {dt}: {car:?}"
             );
             assert!(car.position.y < RIDE_HEIGHT);
+        }
+    }
+
+    #[test]
+    fn shoulder_landings_require_crossing_the_top_within_its_footprint() {
+        for intervening in ["gap", "bridge", "tunnel"] {
+            let track =
+                Track::parse(&format!("straight 10\n{intervening} 10\nstraight 100")).unwrap();
+            for direction in [-1.0, 1.0] {
+                let edge = if direction > 0.0 { 20.0 } else { 10.0 };
+                for side in [-1.0, 1.0] {
+                    for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                        for lands_on_top in [false, true] {
+                            let mut car = Car::new(&track);
+                            // At x = +/-10 the shoulder is one metre below its
+                            // deck. Enter its footprint partway through this
+                            // step, either before or after crossing its height.
+                            let clearance = if lands_on_top { 15.0 * dt * 0.9 } else { 0.01 };
+                            car.position = vec3(
+                                side * 10.0,
+                                RIDE_HEIGHT - 1.0 + clearance,
+                                edge - direction * 45.0 * dt * 0.75,
+                            );
+                            car.velocity = vec3(0.0, -15.0, direction * 45.0);
+                            car.grounded = false;
+                            car.distance = car.position.z;
+                            car.update(&track, Control::default(), dt);
+                            assert!((car.position.z - edge) * direction > 0.0);
+                            assert_eq!(
+                                car.grounded, lands_on_top,
+                                "wrong shoulder contact after {intervening}, direction {direction}, side {side}, dt {dt}: {car:?}"
+                            );
+                            if lands_on_top {
+                                assert!((car.position.y - (RIDE_HEIGHT - 1.0)).abs() < 0.001);
+                            } else {
+                                assert!(car.position.y < RIDE_HEIGHT - 1.0);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
