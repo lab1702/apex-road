@@ -1534,7 +1534,7 @@ fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
 }
 
 fn plane_height_at(surface: Surface, origin: Vec3, point: Vec3) -> f32 {
-    surface.height - horizontal(point - origin).dot(surface.normal) / surface.normal.y.max(0.15)
+    surface.height - horizontal(point - origin).dot(surface.normal) / surface.normal.y.max(0.0001)
 }
 
 /// Check the finite roof panels crossed by the chassis top. A lookup at only
@@ -1611,7 +1611,9 @@ fn tunnel_roof_sweep(track: &Track, before: Vec3, after: Vec3) -> Option<(Vec3, 
 }
 
 fn surface_vertical_speed(velocity: Vec3, normal: Vec3) -> f32 {
-    -horizontal(velocity).dot(normal) / normal.y.max(0.15)
+    // Tall embankments can be much steeper than the road's allowed grade.
+    // Preserve their actual slope so tangential motion stays on the shoulder.
+    -horizontal(velocity).dot(normal) / normal.y.max(0.0001)
 }
 
 fn horizontal(v: Vec3) -> Vec3 {
@@ -3821,6 +3823,65 @@ mod tests {
                     );
                 }
                 assert!(car.grounded && car.offroad);
+            }
+        }
+    }
+
+    #[test]
+    fn tall_embankment_contact_preserves_the_actual_slope_in_both_directions() {
+        for bank in [-60, 0, 60] {
+            let track =
+                Track::parse(&format!("straight 500 rise 200 bank {bank}\nstraight 200")).unwrap();
+            let ground = track.ground_height();
+            let sample = track.sample_at(track.length - 100.0);
+            for side in [-1.0, 1.0] {
+                let edge_height = sample.pos.y + sample.right.y * side * sample.width * 0.5;
+                let height_at = |position: Vec3| {
+                    let lateral = position.x.abs() / sample.right.x;
+                    ground + (edge_height - ground) * (18.0 - lateral) / SHOULDER_WIDTH
+                };
+                for direction in [-1.0, 1.0] {
+                    for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                        let mut car = Car::new(&track);
+                        car.reset(&track, sample.distance);
+                        car.position.x = sample.right.x * side * 12.0;
+                        car.position.y = height_at(car.position) + RIDE_HEIGHT;
+                        car.heading = side * direction * std::f32::consts::FRAC_PI_2;
+                        car.velocity = vec3(
+                            side * direction * 5.0,
+                            -(edge_height - ground) * direction * 5.0
+                                / (SHOULDER_WIDTH * sample.right.x),
+                            0.0,
+                        );
+                        let road = nearest_road(
+                            &track,
+                            car.position,
+                            car.distance,
+                            car.position.y,
+                            ground,
+                            None,
+                        )
+                        .unwrap();
+                        let surface = road_surface(road, ground).unwrap();
+                        let ahead = car.position + Vec3::X * side * direction * 0.25;
+                        // The landing sweep must intersect this same physical
+                        // plane, including when the endpoint leaves its footprint.
+                        assert!(
+                            (plane_height_at(surface, car.position, ahead) - height_at(ahead))
+                                .abs()
+                                < 0.001
+                        );
+                        for _ in 0..10 {
+                            car.update(&track, Control::default(), dt);
+                            assert!(
+                                (car.position.y - RIDE_HEIGHT - height_at(car.position)).abs()
+                                    < 0.02,
+                                "lost the slope at bank {bank}, side {side}, direction {direction}, dt {dt}: {car:?}"
+                            );
+                            assert!(car.grounded && car.offroad);
+                        }
+                    }
+                }
             }
         }
     }
