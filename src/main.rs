@@ -154,15 +154,16 @@ fn read_record(path: &Path) -> Option<f32> {
     try_read_record(path).ok().flatten()
 }
 fn try_read_record(path: &Path) -> std::io::Result<Option<f32>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    Ok(text
-        .trim()
-        .parse::<f32>()
+    // Invalid encoding is corrupt record data, just like an invalid number.
+    // Keep filesystem errors distinct so only successfully read data is replaced.
+    Ok(std::str::from_utf8(&bytes)
         .ok()
+        .and_then(|text| text.trim().parse::<f32>().ok())
         .filter(|x| x.is_finite() && *x > 0.))
 }
 #[derive(Debug)]
@@ -847,6 +848,28 @@ mod driving_checks {
         assert!(saved.improved);
         assert_eq!(saved.best, 60.0);
         assert_eq!(read_record(&path), Some(60.0));
+    }
+
+    #[test]
+    fn corrupt_record_encoding_can_be_replaced_by_a_completed_run() {
+        let directory = TempDir::new("apex-record-encoding-test");
+        let path = directory.path().join("course.best");
+        std::fs::write(&path, [0xff, 0xfe, b'6', b'0', b'\n']).unwrap();
+        let track = Track::parse("straight 40").unwrap();
+        let mut records = RunRecords::new(read_record(&path));
+        let mut race = records.start_race(track.finish_distance() - 1.0, true);
+        race.started = true;
+        race.next_checkpoint = track.checkpoints.len();
+        let candidate = race.update(&track, 40.0, track.finish_distance(), true);
+        let saved = records
+            .save_candidate(&path, &mut race, candidate)
+            .unwrap()
+            .unwrap();
+        assert!(saved.improved);
+        assert_eq!(saved.best, 40.0);
+        assert_eq!(read_record(&path), Some(40.0));
+        assert_eq!(race.best, Some(40.0));
+        assert_eq!(records.start_race(0.0, true).best, Some(40.0));
     }
 
     #[test]

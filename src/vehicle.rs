@@ -604,6 +604,11 @@ impl Car {
         // The barrier follows the banked road frame. Both its correction and
         // impulse must stay in the road plane, or an uphill impact launches
         // the car by retaining its old upward velocity after the rebound.
+        // An inward path can traverse a short endpoint deck and its rail in
+        // one step while neither endpoint has a road contact. Seed that sweep
+        // from the crossed open endpoint, as for finite road-surface landings.
+        let previous_road =
+            previous_road.or_else(|| open_track_entry_road(track, before, self.position));
         let swept_hit = previous_road.and_then(|prior| {
             let destination =
                 road.unwrap_or_else(|| guardrail_exit_road(track, prior, before, self.position));
@@ -2914,6 +2919,63 @@ mod tests {
                 car.update(&track, Control::default(), STEP);
                 assert!((car.position.y - RIDE_HEIGHT).abs() < 0.001, "{car:?}");
                 assert!(car.velocity.y.abs() < 0.001 && car.impact > 0.0, "{car:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn entering_an_open_endpoint_cannot_skip_its_short_deck_guardrails() {
+        for kind in ["bridge", "tunnel"] {
+            for direction in [-1.0, 1.0] {
+                let track = Track::parse(&if direction > 0.0 {
+                    format!("{kind} 1\ngap 10\nstraight 20")
+                } else {
+                    format!("straight 20\ngap 1\n{kind} 1")
+                })
+                .unwrap();
+                let endpoint = if direction > 0.0 { 0.0 } else { 22.0 };
+                for side in [-1.0, 1.0] {
+                    for clearance in [-3.0, 0.2, 8.0] {
+                        let mut car = Car::new(&track);
+                        car.position = vec3(
+                            side * 4.9,
+                            RIDE_HEIGHT + clearance,
+                            endpoint - direction * 0.05,
+                        );
+                        car.distance = endpoint;
+                        car.velocity = vec3(side * 20.0, -10.0, direction * 40.0);
+                        car.grounded = false;
+                        car.update(&track, Control::default(), 1.0 / 30.0);
+                        let hit = clearance == 0.2;
+                        assert_eq!(
+                            car.position.x.abs() <= 5.15,
+                            hit,
+                            "{kind}, direction {direction}, side {side}, clearance {clearance}: {car:?}"
+                        );
+                        assert_eq!(
+                            car.velocity.x * side < 0.0,
+                            hit,
+                            "{kind}, direction {direction}, side {side}, clearance {clearance}: {car:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn entering_a_tapered_finish_hits_its_guardrail_at_the_game_step() {
+        for kind in ["bridge", "tunnel"] {
+            let track = Track::parse(&format!("width 4\n{kind} 30\nwidth 40\n{kind} 1")).unwrap();
+            for side in [-1.0, 1.0] {
+                let mut car = Car::new(&track);
+                car.position = vec3(side * 19.0, RIDE_HEIGHT + 0.2, 31.05);
+                car.distance = track.length;
+                car.velocity = vec3(0.0, -1.0, -40.0);
+                car.grounded = false;
+                car.update(&track, Control::default(), STEP);
+                assert!(car.impact > 0.0, "{kind}, side {side}: {car:?}");
+                assert!(car.velocity.z > -30.0, "{kind}, side {side}: {car:?}");
             }
         }
     }
