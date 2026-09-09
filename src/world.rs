@@ -169,7 +169,21 @@ fn shoulder_segment(
     // its outer edge stays on the terrain. Bound that vertical error as well.
     let height_change =
         (edge(b, side * b.width * 0.5, 0.).y - edge(a, side * a.width * 0.5, 0.).y).abs();
-    let steps = surface_steps(a, b).max((height_change / 0.08).ceil() as usize);
+    // Curved cross-sections bow away from the straight triangle edges.
+    // On a high shoulder even a few millimetres of horizontal displacement
+    // becomes a visible height error, proportional to its downhill slope.
+    let frame_change = a.forward.distance(b.forward).max(a.right.distance(b.right));
+    let shoulder_slope = [a, b]
+        .into_iter()
+        .map(|s| {
+            (edge(s, side * s.width * 0.5, 0.).y - ground).abs() / (12.0 * s.right.xz().length())
+        })
+        .fold(0.0_f32, f32::max);
+    let curve_error =
+        frame_change.powi(2) * (a.width.max(b.width) * 0.5 + 12.0) * 0.25 * shoulder_slope;
+    let steps = surface_steps(a, b)
+        .max((height_change / 0.08).ceil() as usize)
+        .max((curve_error / 0.01).sqrt().ceil() as usize);
     for step in 0..steps {
         let start = surface_sample(track, a, b, step as f32 / steps as f32);
         let end = surface_sample(track, a, b, (step + 1) as f32 / steps as f32);
@@ -1037,6 +1051,46 @@ mod tests {
     }
 
     #[test]
+    fn elevated_curving_shoulders_follow_the_contact_surface() {
+        let track =
+            Track::parse("width 40\nstraight 1000 rise 500\nright 180 radius 40\nstraight 100")
+                .unwrap();
+        let ground = track.ground_height();
+        let chunks = World::build_chunks(&track);
+        let mut checked = 0;
+        for pair in track.samples.windows(2) {
+            // Inspect the level curve, whose complete shoulders fit outside
+            // its center of curvature and do not overlap another road.
+            if pair[0].pos.y < 499.9 || pair[0].forward.distance(pair[1].forward) < 0.01 {
+                continue;
+            }
+            for side in [-1.0, 1.0] {
+                for fraction in [0.2, 0.5, 0.8] {
+                    for t in [0.25, 0.5, 0.75] {
+                        let sample = surface_sample(&track, pair[0], pair[1], t);
+                        let point =
+                            edge(sample, side * (sample.width * 0.5 + 12.0 * fraction), 0.0);
+                        let edge_y = edge(sample, side * sample.width * 0.5, 0.0).y;
+                        let expected = edge_y + (ground - edge_y) * fraction;
+                        let actual = chunks
+                            .iter()
+                            .filter(|chunk| !chunk.distant)
+                            .find_map(|chunk| triangle_height(&chunk.mesh, point))
+                            .expect("the rendered shoulder covers its contact footprint");
+                        assert!(
+                            (actual - expected).abs() < 0.05,
+                            "shoulder error {} at {point:?}, side {side}, fraction {fraction}, t {t}",
+                            (actual - expected).abs()
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1_000);
+    }
+
+    #[test]
     fn rapid_bank_markings_and_road_chunks_fit_renderer_limits() {
         let check_chunks = |track: &Track| {
             for chunk in World::build_chunks(track) {
@@ -1071,6 +1125,14 @@ mod tests {
         source.push_str(&"width 4\nstraight 1\nwidth 40\nstraight 1\n".repeat(40));
         let track = Track::parse(&source).unwrap();
         check_chunks(&track);
+
+        // Curvature refinement is largest when a wide, banked road is at
+        // the maximum height above terrain. It must still fit GPU batches.
+        let mut source = String::from("start 0 -1000 0\nwidth 40\n");
+        source.push_str(&"straight 1000 rise 500\n".repeat(6));
+        source.push_str("right 180 radius 40 bank 60\n");
+        source.push_str(&"width 4\nstraight 1\nwidth 40\nstraight 1\n".repeat(40));
+        check_chunks(&Track::parse(&source).unwrap());
     }
 
     #[test]

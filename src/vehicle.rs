@@ -301,6 +301,22 @@ impl Car {
                         .map(|contact| (contact, true))
                     })
                 })
+                .or_else(|| {
+                    // Outside an open start or finish there is no preceding
+                    // road to seed the sweep. The crossed endpoint only
+                    // bounds the search; finite triangles still prove a hit.
+                    open_track_entry_road(track, before, self.position).and_then(|from| {
+                        road_entry_contact_before_exit(
+                            track,
+                            from,
+                            new_road,
+                            before,
+                            self.position,
+                            ground_height,
+                        )
+                        .map(|contact| (contact, true))
+                    })
+                })
         {
             self.resolve_landing(surface);
             if entering {
@@ -641,6 +657,45 @@ impl Car {
             self.impact = self.impact.max((outward_speed / 10.0).clamp(0.08, 1.0));
         }
     }
+}
+
+/// Seed an inward sweep at an open endpoint even when the preceding position
+/// has no road lookup. This does not extend the endpoint's collision footprint.
+fn open_track_entry_road(track: &Track, before: Vec3, after: Vec3) -> Option<RoadPoint> {
+    if track.closed || track.samples.len() < 2 {
+        return None;
+    }
+    let last = track.samples.len() - 1;
+    [
+        (0, track.samples[0], 1.0),
+        (last - 1, track.samples[last], -1.0),
+    ]
+    .into_iter()
+    .filter_map(|(index, sample, direction)| {
+        let normal = horizontal(sample.right).cross(Vec3::Y).normalize() * direction;
+        let start = horizontal(before - sample.pos).dot(normal);
+        let end = horizontal(after - sample.pos).dot(normal);
+        if start >= 0.0 || end < 0.0 {
+            return None;
+        }
+        let fraction = -start / (end - start);
+        let crossing = before.lerp(after, fraction);
+        let plane_height =
+            sample.pos.y - horizontal(crossing - sample.pos).dot(sample.up) / sample.up.y.max(0.15);
+        let contact = vec3(crossing.x, plane_height, crossing.z);
+        Some((
+            fraction,
+            RoadPoint {
+                sample,
+                index,
+                lateral: (contact - sample.pos).dot(sample.right),
+                plane_height,
+                swept_contact: false,
+            },
+        ))
+    })
+    .min_by(|a, b| a.0.total_cmp(&b.0))
+    .map(|(_, road)| road)
 }
 
 /// An endpoint outside every road footprint can still have crossed a rail.
@@ -1118,10 +1173,34 @@ fn road_entry_contact_before_exit(
             } else {
                 0.0
             };
+            // Curved cross-sections displace a shoulder triangle sideways.
+            // On a tall embankment even a small displacement becomes a large
+            // height error, so refine by the shoulder slope as the mesh does.
+            let shoulder_curve_error = if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
+                let slope = [a, b]
+                    .into_iter()
+                    .flat_map(|sample| {
+                        [-1.0, 1.0].map(|side| {
+                            let edge_height =
+                                sample.pos.y + sample.right.y * sample.width * 0.5 * side;
+                            (edge_height - ground_height).abs()
+                                / (SHOULDER_WIDTH * horizontal(sample.right).length())
+                        })
+                    })
+                    .fold(0.0_f32, f32::max);
+                frame_change
+                    * frame_change
+                    * (a.width.max(b.width) * 0.5 + SHOULDER_WIDTH)
+                    * 0.25
+                    * slope
+            } else {
+                0.0
+            };
             let steps = (twist / 0.01)
                 .ceil()
                 .max((frame_change / 0.05).ceil())
                 .max((shoulder_height_change / 0.04).ceil())
+                .max((shoulder_curve_error / 0.01).sqrt().ceil())
                 .max(1.0) as usize;
             let sample_at = |step| {
                 if step == 0 {
@@ -2638,6 +2717,60 @@ mod tests {
                     }
                     assert!(!car.grounded && car.offroad);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn landing_precedes_crossing_an_open_endpoint_deck_in_one_step() {
+        for direction in [-1.0, 1.0] {
+            let track = Track::parse(if direction > 0.0 {
+                "straight 1\ngap 10\nstraight 20"
+            } else {
+                "straight 20\ngap 1\nstraight 1"
+            })
+            .unwrap();
+            for clearance in [-0.05, 0.01, 0.05, 0.2] {
+                let mut car = Car::new(&track);
+                let edge = if direction > 0.0 { 0.0 } else { 22.0 };
+                car.position = vec3(0.0, RIDE_HEIGHT + clearance, edge - direction * 0.1);
+                car.distance = edge;
+                car.velocity = vec3(0.0, -5.0, direction * 40.0);
+                car.grounded = false;
+                car.update(&track, Control::default(), 1.0 / 30.0);
+                let crossed_top = clearance == 0.05;
+                assert_eq!(
+                    car.impact > 0.0,
+                    crossed_top,
+                    "direction {direction}, clearance {clearance}: {car:?}"
+                );
+                if crossed_top {
+                    assert!((car.position.y - RIDE_HEIGHT).abs() < 0.001, "{car:?}");
+                    assert!(car.velocity.y.abs() < 0.001);
+                } else {
+                    assert!(car.velocity.y < -5.0);
+                }
+                assert!(!car.grounded && car.offroad);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_falls_hit_open_bridge_corners_at_the_game_step() {
+        let track = Track::parse("bridge 100").unwrap();
+        for side in [-1.0, 1.0] {
+            for direction in [-1.0, 1.0] {
+                let mut car = Car::new(&track);
+                let edge = if direction > 0.0 { 0.0 } else { 100.0 };
+                car.position = vec3(side * 5.85, RIDE_HEIGHT + 0.6, edge - direction * 0.05);
+                car.distance = edge;
+                // A long fall crosses the deck and its edge within 1/120 s.
+                // Both endpoints also miss the guardrail's height interval.
+                car.velocity = vec3(side * 28.0, -160.0, direction * 28.0);
+                car.grounded = false;
+                car.update(&track, Control::default(), STEP);
+                assert!((car.position.y - RIDE_HEIGHT).abs() < 0.001, "{car:?}");
+                assert!(car.velocity.y.abs() < 0.001 && car.impact > 0.0, "{car:?}");
             }
         }
     }
