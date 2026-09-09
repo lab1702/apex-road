@@ -508,12 +508,20 @@ impl World {
             let c = Color::new(0.38 + 0.36 * t, 0.64 + 0.21 * t, 0.75 + 0.10 * t, 1.);
             draw_rectangle(0., h * i as f32 / 48., w, h / 48. + 1., c);
         }
-        draw_circle(
-            w * 0.76,
-            h * 0.20,
-            h * 0.053,
-            Color::new(0.97, 0.93, 0.73, 0.9),
-        );
+        // The sun has a fixed world direction; turning, climbing, and banking
+        // change its windshield position. Draw before scenery for occlusion.
+        if let Some((center, radius)) = camera.project_sky_disc(
+            vec3(0.45, 0.35, 1.).normalize(),
+            4_f32.to_radians(),
+            vec2(w, h),
+        ) {
+            draw_circle(
+                center.x,
+                center.y,
+                radius,
+                Color::new(0.97, 0.93, 0.73, 0.9),
+            );
+        }
         set_camera(camera);
         self.material.set_uniform("Eye", camera.position);
         gl_use_material(&self.material);
