@@ -1,0 +1,49 @@
+# A wide, flowing airfield sprint with three graduated runway jumps.
+# Distances are metres; angles are degrees. Jumps reward a straight approach.
+name "Airfield Run"
+description "Three runway jumps, a banked taxiway sweep, and a raised service bridge."
+width 16
+start 0 0 0
+
+# Runway one: build speed on the opening straight before a gentle launch.
+# The 14 m gap lands 2.5 m below its lip, back at runway elevation.
+straight 190
+ramp 24 rise 2.5
+gap 14 rise -2.5
+straight 105
+checkpoint
+
+# A broad taxiway bend narrows the road, then opens onto runway two.
+# Remove the bank well before launch so the car leaves a level road cross-section.
+width 14
+right 50 radius 120 bank -7
+width 18
+straight 80 bank 0
+
+# Runway two: a slightly taller ramp crosses a wider break in the tarmac.
+# A full 100 m of solid landing road precedes the next corner and checkpoint.
+ramp 24 rise 3
+gap 16 rise -3
+straight 100
+checkpoint
+
+# Climb the service-road sweep, then cross a narrower elevated bridge.
+# Width blends over the climb; the bridge eases the banking back to level.
+width 12
+left 70 radius 110 rise 4 bank 8
+bridge 100 rise 4 bank 0
+width 18
+straight 90
+
+# Runway three: a longer ramp and the widest gap, with a generous flat landing.
+# This jump stays at the bridge's elevated level; descend only after touchdown.
+ramp 28 rise 3
+gap 18 rise -3
+straight 110
+checkpoint
+
+# A final gentle turn descends to the main runway and a long finish straight.
+width 16
+right 30 radius 140 rise -4 bank -6
+straight 170 rise -4 bank 0
+finish

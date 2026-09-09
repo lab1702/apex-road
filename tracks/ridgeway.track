@@ -1,0 +1,41 @@
+# A flowing mountain sprint. Distances are metres; angles are degrees.
+name "Ridgeway Pass"
+description "Climb a broad ridge, thread narrowing switchbacks, and sweep back down to the valley."
+width 14
+
+# A heading of -40 points northwest instead of along the default +Z axis.
+start -180 12 80 -40
+kind road
+straight 150 rise 12
+
+# Split the corner so its bank builds, holds through the middle, then unwinds.
+right 20 radius 85 rise 3 bank -14
+right 60 radius 85 rise 12
+right 20 radius 85 rise 3 bank 0
+checkpoint
+
+# Width changes blend across the next command: the ascent tightens to 11 m.
+width 11
+straight 100 rise 20
+left 20 radius 75 rise 2 bank 16
+left 70 radius 75 rise 8
+left 20 radius 75 rise 2 bank 0
+straight 110 rise 8
+checkpoint
+
+# The summit is 70 m above the start. Negative rise begins the descent.
+# Widen through the first downhill corner to leave room for braking.
+width 13
+right 20 radius 90 rise -3 bank -14
+right 70 radius 90 rise -12
+right 20 radius 90 rise -3 bank 0
+straight 130 rise -20
+checkpoint
+
+# A final sweeping bend leads to a wide, level-bank run to the finish.
+left 20 radius 90 rise -3 bank 14
+left 60 radius 90 rise -12
+left 20 radius 90 rise -3 bank 0
+width 14
+straight 200 rise -14
+finish

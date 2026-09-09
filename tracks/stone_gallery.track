@@ -1,0 +1,51 @@
+# A gallery-and-viaduct sprint. All structures follow the same driving surface.
+name "Stone Gallery"
+description "Alternate cool mountain galleries and open viaducts along an undulating stone ridge."
+width 12
+
+# Negative world height is valid: terrain follows the course's lowest edge.
+# Heading 70 sends this route eastward; height zero has no special ground role.
+start 90 -24 -140 70
+straight 160 rise 5
+
+# A persistent kind covers every following straight and curve until changed.
+kind tunnel
+straight 90 rise 7
+left 15 radius 100 rise 1 bank 12
+left 35 radius 100 rise 3
+left 15 radius 100 rise 1 bank 0
+straight 70 rise 3
+kind road
+straight 75 rise 2
+checkpoint
+
+# The same persistent-kind pattern builds a viaduct with a curved middle.
+width 13
+kind bridge
+straight 100 rise 12
+right 15 radius 100 rise 1 bank -12
+right 45 radius 100 rise 4
+right 15 radius 100 rise 1 bank 0
+straight 70 rise -2
+kind road
+straight 100 rise -6
+checkpoint
+
+# A per-command override makes only this bend a tunnel. The next straight
+# returns to the persistent road kind without needing another kind command.
+width 12
+left 70 radius 90 rise -6 bank 12 kind tunnel
+straight 90 rise -3 bank 0
+
+# Named tunnel and bridge commands also apply to just their own segment.
+tunnel 100 rise -4
+straight 75 rise 2
+bridge 100 rise 4
+checkpoint
+
+# Daylight corner and a long finishing run give time to straighten and brake.
+right 15 radius 100 rise -1 bank -12
+right 25 radius 100 rise -2
+right 15 radius 100 rise -1 bank 0
+straight 170 rise -8
+finish

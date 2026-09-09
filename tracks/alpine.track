@@ -1,0 +1,39 @@
+# A point-to-point mountain road. Distances are metres; angles are degrees.
+name "Alpine Run"
+description "Climb the pass, cross the viaduct, and carry speed over the summit jump."
+width 12
+start 0 0 0
+
+# A friendly opening straight and a sweeping right into the hills.
+straight 180
+right 55 radius 120 rise 12 bank -12
+straight 110 rise 9 bank 0
+checkpoint
+
+# A left sweep opens onto an elevated bridge.
+left 70 radius 105 rise 5 bank 14
+bridge 160 rise 3 bank 0
+straight 80 rise -4
+checkpoint
+
+# The road curves through a covered mountain gallery.
+right 70 radius 100 rise 6 bank -10 kind tunnel
+tunnel 130 rise 4 bank 0
+left 45 radius 110 rise 4 bank 12
+straight 100 bank 0
+checkpoint
+
+# Gentle launch: the 14 m gap has no road or collision surface.
+# Arrive straight with speed. The landing is 2.5 m below the lip.
+straight 90
+ramp 24 rise 2.5
+gap 14 rise -2.5
+straight 100
+checkpoint
+
+# A downhill pair of bends leads into a broad finish straight.
+right 80 radius 95 rise -12 bank -14
+straight 100 rise -8 bank 0
+left 55 radius 110 rise -10 bank 12
+straight 200 rise -9 bank 0
+finish

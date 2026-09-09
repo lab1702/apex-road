@@ -1,0 +1,19 @@
+[package]
+name = "apex-road"
+version = "0.1.0"
+edition = "2024"
+description = "A windshield-view time trial racer with text-authored 3D tracks"
+license = "MIT"
+repository = "https://github.com/lab1702/apex-road"
+
+[dependencies]
+macroquad = "=0.4.16"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

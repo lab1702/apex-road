@@ -1,0 +1,41 @@
+# A rounded rectangle: opposite straights match, and four 90-degree corners close.
+name "Camber Loop"
+description "Wide banking, a rising causeway, and changing road widths on a flowing lap."
+width 16
+start 0 0 0 90
+
+# Width changes blend across the following command. Open the main straight out.
+straight 60
+width 18
+straight 120
+checkpoint
+
+# Split the corner into entry, held banking, and exit; climb onto the causeway.
+right 20 radius 85 rise 1 bank -14
+right 50 radius 85 rise 5 bank -14
+right 20 radius 85 bank 0
+width 15
+bridge 160
+checkpoint
+
+# Unwind the bank before each straight and return gently to the lower road.
+right 20 radius 85 bank -14
+right 50 radius 85 rise -5 bank -14
+right 20 radius 85 rise -1 bank 0
+width 14
+straight 180
+checkpoint
+
+# The narrower return side rewards a tidy line through the same-radius bends.
+right 20 radius 85 bank -10
+right 50 radius 85 bank -10
+right 20 radius 85 bank 0
+width 16
+straight 160
+checkpoint
+right 20 radius 85 bank -12
+right 50 radius 85 bank -12
+right 20 radius 85 bank 0
+
+# Exact position, heading, elevation, bank, and starting width meet at the seam.
+close

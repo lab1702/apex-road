@@ -1,0 +1,15 @@
+# Two straights and two semicircles create a geometrically closed oval.
+name "Club Circuit"
+description "A short, flowing oval for learning the grip limit and chasing laps."
+width 13
+start 0 0 0
+straight 140
+checkpoint
+right 90 radius 55 bank -14
+right 90 radius 55 bank 0
+checkpoint
+straight 140
+checkpoint
+right 90 radius 55 bank -14
+right 90 radius 55 bank 0
+close

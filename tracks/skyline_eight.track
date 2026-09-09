@@ -1,0 +1,31 @@
+# Two opposing 270-degree lobes joined by crossing tangents form a figure eight.
+name "Skyline Eight"
+description "Climb a sweeping lobe, cross a high viaduct, then loop beneath it."
+width 13
+start 0 0 0 45
+
+# The start line is on the lower passage. The upper crossing is 24 m overhead.
+straight 81
+checkpoint
+
+# Climb around the right-hand lobe, banking early and levelling before the span.
+right 30 radius 81 rise 2 bank -12
+right 210 radius 81 rise 20 bank -12
+kind bridge
+right 30 radius 81 rise 2 bank 0
+checkpoint
+
+# Persistent kind makes this straight and the next curved approach into a viaduct.
+# Its entire crossing stays level at +24 m; no raised earth shoulder blocks below.
+# Radius 81 also spaces the span's support columns clear of the lower carriageway.
+straight 162
+checkpoint
+
+# The opposite lobe unwinds down to the same low elevation as the starting road.
+left 30 radius 81 rise -2 bank 12
+kind road
+left 210 radius 81 rise -20 bank 12
+left 30 radius 81 rise -2 bank 0
+checkpoint
+straight 81
+close

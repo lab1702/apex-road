@@ -1,0 +1,6 @@
+/target/
+/.cargo-cache/
+/captures/
+/data/
+/.agents/
+/.codex/
