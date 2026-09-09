@@ -141,9 +141,12 @@ close
   limited to ±10000 m horizontally and ±1000 m vertically.
 - A track must be at least 20 m long, at most 50 km, with at most 25001 samples.
   Track files are limited to 1 MB; name and description each to 500 bytes.
-- Roads are sampled about every 2 m (more densely on elevation transitions).
+- Roads are sampled about every 2 m (more densely on elevation and banking
+  transitions).
   Even short elevation transitions include interior samples so their hills
   and incoming ramp slopes remain represented in the driving surface.
+  Short banking changes receive extra samples to keep the rendered edges close
+  to the full-width driving surface.
   Timing distances use the resulting **3D centerline distance**, so an uphill
   `straight 100` can contribute slightly more than 100 m to course length.
 - Put a straight after the final corner to allow braking before a sprint ends.

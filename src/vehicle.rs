@@ -18,6 +18,7 @@ const INERTIA_PER_MASS: f32 = 2.45;
 const CAR_HALF_WIDTH: f32 = 0.85;
 // Keep shared segment edges watertight despite rounded track coordinates.
 const SEGMENT_TOLERANCE: f32 = 0.01;
+const CONTACT_TOLERANCE: f32 = 0.30;
 const ROAD_FRICTION: f32 = 1.18;
 const FRONT_CORNERING_STIFFNESS: f32 = 56.0;
 const REAR_CORNERING_STIFFNESS: f32 = 62.0;
@@ -243,7 +244,8 @@ impl Car {
             support: old_road
                 .filter(|road| was_grounded && road_surface(*road, ground_height).is_some()),
         };
-        let max_surface_height = (before.y - RIDE_HEIGHT).max(self.position.y - RIDE_HEIGHT) + 0.30;
+        let max_surface_height =
+            (before.y - RIDE_HEIGHT).max(self.position.y - RIDE_HEIGHT) + CONTACT_TOLERANCE;
         let new_road = nearest_road(
             track,
             self.position,
@@ -278,7 +280,7 @@ impl Car {
         // use the ordinary clearance/velocity check and can launch the car.
         let on_same_surface = was_grounded
             && (new_road.is_some_and(|road| road.swept_contact)
-                || ((current_bottom - surface.height).abs() < 0.30
+                || ((current_bottom - surface.height).abs() < CONTACT_TOLERANCE
                     && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025));
         // A step can leave one supporting surface and strike another: a steep
         // downhill shoulder can cross the terrain before the car is airborne.
@@ -286,7 +288,22 @@ impl Car {
         let landed = !on_same_surface
             && current_bottom <= surface.height
             && previous_clearance >= -0.08
-            && self.velocity.y <= required_vertical + 0.3;
+            && self.velocity.y <= required_vertical + 0.3
+            // The height crossing must occur on the finite deck. A car can
+            // fall below a landing while over a gap, then reach the road's
+            // footprint later in this step without ever touching its top.
+            && (surface.offroad
+                || new_road.is_some_and(|road| {
+                    road.swept_contact
+                        || crosses_finite_deck(
+                            track,
+                            road,
+                            surface,
+                            before,
+                            self.position,
+                            ground_height,
+                        )
+                }));
 
         self.grounded = on_same_surface || landed;
         self.offroad = surface.offroad;
@@ -576,7 +593,9 @@ fn nearest_road(
         // Gap centerlines remain eligible: they only guide airborne progress.
         let surface = road_surface(point, ground_height);
         let surface_height = surface.map_or(plane_height, |surface| surface.height);
-        if !matches!(sample.kind, RoadKind::Gap) && surface_height > max_surface_height {
+        if !matches!(sample.kind, RoadKind::Gap)
+            && surface_height > max_surface_height.min(position.y - RIDE_HEIGHT + CONTACT_TOLERANCE)
+        {
             // A steep surface can rise past an airborne car in one step. Its
             // plane provides a one-sided sweep for both decks and shoulders.
             // Changing bank can also lift a surface beyond the height allowance,
@@ -608,7 +627,11 @@ fn nearest_road(
                             })
                     })
             });
-            if !point.swept_contact {
+            // Downward motion can exceed ordinary contact's current-position
+            // tolerance before exceeding the previous-position height bound.
+            // Run the sweep in that interval too, while keeping the same
+            // one-sided bound for route selection.
+            if !point.swept_contact && surface_height > max_surface_height {
                 continue;
             }
         }
@@ -1412,6 +1435,27 @@ mod tests {
         car.update(&track, Control::default(), 1.0 / 30.0);
         assert!(!car.grounded && car.offroad);
         assert!(car.position.y < before.y);
+    }
+
+    #[test]
+    fn falling_short_of_a_flat_landing_cannot_snap_up_through_its_edge() {
+        let track = Track::parse("straight 10\ngap 10\nbridge 100").unwrap();
+        for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+            let mut car = Car::new(&track);
+            // Cross deck height while still over the gap, then enter the
+            // landing's footprint from below during the same physics step.
+            car.position = vec3(0.0, RIDE_HEIGHT + 0.01, 20.0 - 45.0 * dt * 0.75);
+            car.velocity = vec3(0.0, -15.0, 45.0);
+            car.grounded = false;
+            car.distance = car.position.z;
+            car.update(&track, Control::default(), dt);
+            assert!(car.position.z > 20.0);
+            assert!(
+                !car.grounded,
+                "pulled through the landing edge at dt {dt}: {car:?}"
+            );
+            assert!(car.position.y < RIDE_HEIGHT);
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 const SAMPLE_SPACING: f32 = 2.0;
+const MAX_BANK_STEP: f32 = 5.0_f32.to_radians();
 const MAX_SAMPLES: usize = 25_001;
 const MAX_LENGTH: f32 = 50_000.0;
 const MAX_FILE_BYTES: usize = 1_000_000;
@@ -371,6 +372,12 @@ impl Builder {
         // including a level target that eases out of an incoming ramp slope.
         let elevation_transition = rise != 0.0 || self.grade != 0.0 || end_grade != 0.0;
         let steps = steps.max(if elevation_transition { 4 } else { 1 });
+        // Mesh edges interpolate linearly, while driving frames keep a unit
+        // right vector. Large bank changes between samples would pinch the
+        // rendered road far inside its collision surface. Smoothstep's maximum
+        // derivative is 1.5, so this bounds adjacent bank changes to five degrees.
+        let bank_steps = ((end_bank - start.bank).abs() * 1.5 / MAX_BANK_STEP).ceil() as usize;
+        let steps = steps.max(bank_steps);
         if self.track.samples.len() + steps > MAX_SAMPLES {
             return Err(format!(
                 "Track exceeds the {} sample limit; shorten the route",
@@ -976,6 +983,35 @@ mod tests {
             .unwrap();
         assert_eq!(end.pos.y, 1.0);
         assert_eq!(end.forward.y, 0.0);
+    }
+
+    #[test]
+    fn short_bank_reversals_keep_the_rendered_width_close_to_the_road_frame() {
+        let track =
+            Track::parse("width 40\nstraight 20 bank 60\nstraight 1 bank -60\nstraight 20 bank 0")
+                .unwrap();
+        let mut transitions = 0;
+        for pair in track.samples.windows(2) {
+            let [a, b] = [pair[0], pair[1]];
+            if a.pos.z < 20.0 || b.pos.z > 21.0 {
+                continue;
+            }
+            transitions += 1;
+            let middle = track.sample_at((a.distance + b.distance) * 0.5);
+            // The mesh joins sampled edges with straight lines, whereas
+            // sample_at and collision queries normalize the road frame.
+            // Sparse bank samples must not leave metres of invisible road
+            // outside those rendered edges.
+            let rendered_edge =
+                (a.pos + a.right * a.width * 0.5).lerp(b.pos + b.right * b.width * 0.5, 0.5);
+            let frame_edge = middle.pos + middle.right * middle.width * 0.5;
+            assert!(
+                rendered_edge.distance(frame_edge) < 0.02,
+                "rendered edge {rendered_edge:?} differs from road edge {frame_edge:?}"
+            );
+            assert!((b.bank - a.bank).abs() <= 5.0_f32.to_radians() + 0.0001);
+        }
+        assert!(transitions > 1);
     }
 
     #[test]

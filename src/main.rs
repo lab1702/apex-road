@@ -7,6 +7,7 @@ mod vehicle;
 mod view;
 mod world;
 
+use courses::resolve_track;
 use macroquad::prelude::*;
 use race::Race;
 use std::path::{Path, PathBuf};
@@ -92,13 +93,6 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         out.frames = Some(30);
     }
     Ok(out)
-}
-fn resolve_track(path: &Path) -> PathBuf {
-    if path.exists() {
-        path.into()
-    } else {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
-    }
 }
 fn config() -> macroquad::conf::Conf {
     macroquad::conf::Conf {

@@ -106,6 +106,57 @@ fn text_center(label: &str, center: f32, y: f32, size: f32, color: Color) {
     text(label, center - width * 0.5, y, size, color);
 }
 
+/// Wrap user-provided text at word boundaries, splitting long paths or words
+/// when needed. The final line uses an ellipsis if the available space is full.
+fn fit_lines(
+    label: &str,
+    width: f32,
+    max_lines: usize,
+    measure_width: impl Fn(&str) -> f32,
+) -> Vec<String> {
+    let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut remaining = normalized.as_str();
+    let mut lines = Vec::new();
+    if width <= 0.0 || measure_width("…") > width {
+        return lines;
+    }
+    while !remaining.is_empty() && lines.len() < max_lines {
+        if measure_width(remaining) <= width {
+            lines.push(remaining.to_owned());
+            break;
+        }
+        let last_line = lines.len() + 1 == max_lines;
+        let mut end = 0;
+        let mut word_break = None;
+        for (offset, character) in remaining.char_indices() {
+            let next = offset + character.len_utf8();
+            let candidate = &remaining[..next];
+            let candidate_width = if last_line {
+                measure_width(&format!("{candidate}…"))
+            } else {
+                measure_width(candidate)
+            };
+            if candidate_width > width {
+                break;
+            }
+            end = next;
+            if character.is_whitespace() {
+                word_break = Some(offset);
+            }
+        }
+        if last_line || end == 0 {
+            lines.push(format!("{}…", remaining[..end].trim_end()));
+            break;
+        }
+        if !remaining[end..].starts_with(char::is_whitespace) {
+            end = word_break.filter(|offset| *offset > 0).unwrap_or(end);
+        }
+        lines.push(remaining[..end].trim_end().to_owned());
+        remaining = remaining[end..].trim_start();
+    }
+    lines
+}
+
 fn tracking(label: &str, x: f32, y: f32, size: f32, spacing: f32, color: Color) {
     let size = size * 1.1;
     let mut cursor = x;
@@ -534,6 +585,7 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     let h = screen_height();
     let u = (w / 1440.0).min(h / 900.0).clamp(0.55, 1.75);
     let margin = 37.0 * u;
+    let timer_x = w - margin - 224.0 * u;
 
     // Soft edge shade keeps white UI legible against snow and sky without a cockpit frame.
     for i in 0..64 {
@@ -587,7 +639,19 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         2.3 * u,
         PAPER,
     );
-    text(state.track_name, margin, margin + 49.0 * u, 18.0 * u, PAPER);
+    let name_right = if w >= 800.0 && state.started {
+        timer_x.min((w - 248.0 * u) * 0.5)
+    } else {
+        timer_x
+    };
+    for name in fit_lines(
+        state.track_name,
+        name_right - margin - 16.0 * u,
+        1,
+        |label| measure(label, 18.0 * u).width,
+    ) {
+        text(&name, margin, margin + 49.0 * u, 18.0 * u, PAPER);
+    }
     panel(
         margin,
         margin + 63.0 * u,
@@ -605,7 +669,6 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         CYAN,
     );
 
-    let timer_x = w - margin - 224.0 * u;
     let timer_y = margin - 10.0 * u;
     panel(
         timer_x,
@@ -785,16 +848,33 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     }
     if let Some(notification) = state.notification {
         let size = 16.0 * u;
-        let notification_w = measure(notification, size).width + 42.0 * u;
-        panel(
-            (w - notification_w) * 0.5,
-            h * 0.24,
-            notification_w,
-            41.0 * u,
-            8.0 * u,
-            alpha(PANEL, 0.90),
-        );
-        text_center(notification, w * 0.5, h * 0.24 + 26.0 * u, size, PAPER);
+        let lines = fit_lines(notification, w - 2.0 * margin - 42.0 * u, 6, |label| {
+            measure(label, size).width
+        });
+        if !lines.is_empty() {
+            let notification_w = lines
+                .iter()
+                .map(|line| measure(line, size).width)
+                .fold(0.0, f32::max)
+                + 42.0 * u;
+            panel(
+                (w - notification_w) * 0.5,
+                h * 0.24,
+                notification_w,
+                (41.0 + (lines.len() - 1) as f32 * 22.0) * u,
+                8.0 * u,
+                alpha(PANEL, 0.90),
+            );
+            for (index, line) in lines.iter().enumerate() {
+                text_center(
+                    line,
+                    w * 0.5,
+                    h * 0.24 + (26.0 + index as f32 * 22.0) * u,
+                    size,
+                    PAPER,
+                );
+            }
+        }
     }
 
     if !state.started && !state.help {
@@ -883,5 +963,57 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     }
     if state.paused || state.help {
         controls_overlay(state, u);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_lines;
+
+    fn monospace_width(label: &str) -> f32 {
+        label.chars().count() as f32
+    }
+
+    #[test]
+    fn notifications_wrap_at_words_without_losing_the_error() {
+        assert_eq!(
+            fit_lines(
+                "Reload failed: invalid banking value",
+                15.0,
+                3,
+                monospace_width
+            ),
+            ["Reload failed:", "invalid banking", "value"]
+        );
+        assert_eq!(
+            fit_lines("NEW PERSONAL BEST", 24.0, 6, monospace_width),
+            ["NEW PERSONAL BEST"]
+        );
+    }
+
+    #[test]
+    fn long_unicode_names_and_paths_fit_without_splitting_utf8() {
+        assert_eq!(
+            fit_lines("東京東京東京東京", 3.0, 2, monospace_width),
+            ["東京東", "京東…"]
+        );
+        let lines = fit_lines(&"/very-long-path".repeat(100), 18.0, 6, monospace_width);
+        assert_eq!(lines.len(), 6);
+        assert!(lines.iter().all(|line| monospace_width(line) <= 18.0));
+        assert!(lines.last().unwrap().ends_with('…'));
+        assert_eq!(
+            fit_lines("A custom course with a long name", 18.0, 1, monospace_width),
+            ["A custom course w…"]
+        );
+    }
+
+    #[test]
+    fn fitting_handles_whitespace_and_insufficient_space() {
+        assert_eq!(
+            fit_lines("  Reload\n\tfailed  ", 15.0, 2, monospace_width),
+            ["Reload failed"]
+        );
+        assert!(fit_lines("Course", 0.5, 1, monospace_width).is_empty());
+        assert!(fit_lines("Course", 20.0, 0, monospace_width).is_empty());
     }
 }
