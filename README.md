@@ -1,5 +1,9 @@
 # APEX / ROAD
 
+![Skyline Eight gameplay showing an elevated bridge crossing, mountain scenery, and the floating gauge cluster](docs/images/skyline-eight.png)
+
+*Skyline Eight’s elevated crossing, viewed from the driver’s seat.*
+
 A single-player 3D time-trial racer written in Rust. The whole window is your
 windshield: a clean, stylized world ahead, with a floating gauge cluster at the
 bottom. Build your own roads with a text file, then chase a better time.
