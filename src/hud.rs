@@ -583,7 +583,8 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
 pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     let w = screen_width();
     let h = screen_height();
-    let u = (w / 1440.0).min(h / 900.0).clamp(0.55, 1.75);
+    // Keep the full layout inside small resizable windows as well as large ones.
+    let u = (w / 1440.0).min(h / 900.0).min(1.75);
     let margin = 37.0 * u;
     let timer_x = w - margin - 224.0 * u;
 

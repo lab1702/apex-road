@@ -365,6 +365,21 @@ impl Builder {
         } else {
             0.0
         };
+        // The cubic's slope is quadratic. Its interior extremum can lie
+        // between samples, so checking only generated frames can miss an
+        // over-limit slope (and even produce over-limit centerline chords).
+        let average_grade = rise / length;
+        let slope_a = 3.0 * (self.grade + end_grade) - 6.0 * average_grade;
+        let slope_b = 6.0 * average_grade - 4.0 * self.grade - 2.0 * end_grade;
+        if slope_a != 0.0 {
+            let extremum = -slope_b / (2.0 * slope_a);
+            if (0.0..1.0).contains(&extremum) {
+                let grade = (slope_a * extremum + slope_b) * extremum + self.grade;
+                if grade.abs() > 1.0 {
+                    return Err("Elevation transition is too steep (maximum slope 100%); use a longer segment".into());
+                }
+            }
+        }
         let steps =
             (length * (1.0 + self.grade.abs() + end_grade.abs()) / SAMPLE_SPACING).ceil() as usize;
         // Sampling only a short hill's level endpoints erases its slope from
@@ -1045,6 +1060,26 @@ mod tests {
             .unwrap();
         assert_eq!(end.pos.y, 1.0);
         assert_eq!(end.forward.y, 0.0);
+    }
+
+    #[test]
+    fn slope_limits_cover_extrema_between_generated_samples() {
+        // The six samples on this descent have grades no steeper than 99.9%,
+        // but the cubic reaches 103.4% between them. Even its sampled road
+        // contains a chord steeper than 102%, so checking samples alone lets
+        // an over-limit driving surface through validation.
+        let source = "straight 20\nramp 2 rise 1.2\nstraight 6 rise -3.096\nstraight 20";
+        let Err(error) = Track::parse(source) else {
+            panic!("a descent exceeding the slope limit must be rejected");
+        };
+        assert!(error.starts_with("Line 3:"), "{error}");
+        assert!(error.contains("maximum slope 100%"), "{error}");
+
+        // A gentler descent with the same incoming ramp grade remains legal.
+        assert!(
+            Track::parse("straight 20\nramp 2 rise 1.2\nstraight 6 rise -2.94\nstraight 20")
+                .is_ok()
+        );
     }
 
     #[test]

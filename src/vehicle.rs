@@ -539,13 +539,26 @@ fn nearest_road(
         if start_offset < -SEGMENT_TOLERANCE || end_offset > SEGMENT_TOLERANCE {
             continue;
         }
-        let projection = horizontal(position - a.pos).dot(chord) / chord_length_squared;
         let along = if start_offset.abs() <= SEGMENT_TOLERANCE {
             0.0
         } else if end_offset.abs() <= SEGMENT_TOLERANCE {
             1.0
         } else {
-            projection.clamp(0.0, 1.0)
+            // Interpolate the cross-section that contains the car. On a
+            // banked hill, the road's right vector has a longitudinal
+            // horizontal component, so projecting onto the centerline can
+            // move progress by metres just from steering across the deck.
+            // The interpolated cross-section gives a quadratic in `along`;
+            // this stable root crosses from the positive start half-plane to
+            // the negative end half-plane and also handles a linear segment.
+            let start_normal = horizontal(a.right).cross(Vec3::Y);
+            let normal_change = horizontal(b.right - a.right).cross(Vec3::Y);
+            let offset = horizontal(position - a.pos);
+            let quadratic = -chord.dot(normal_change);
+            let linear = offset.dot(normal_change) - chord.dot(start_normal);
+            let constant = offset.dot(start_normal);
+            let discriminant = (linear * linear - 4.0 * quadratic * constant).max(0.0);
+            (2.0 * constant / (-linear + discriminant.sqrt())).clamp(0.0, 1.0)
         };
         let pos = a.pos.lerp(b.pos, along);
         let forward = a.forward.lerp(b.forward, along).normalize_or_zero();
@@ -1171,6 +1184,43 @@ mod tests {
             assert!(car.velocity.z > 17.0);
             assert!(car.impact > 0.1);
             assert!((car.position.y - 8.0 - RIDE_HEIGHT).abs() < 0.03);
+        }
+    }
+
+    #[test]
+    fn banked_hill_progress_matches_its_cross_section() {
+        for bank in [-60, 60] {
+            for rise in [-100, 100] {
+                for heading in [0, 73] {
+                    for road in ["bridge 200", "right 140 radius 90", "left 140 radius 90"] {
+                        let track = Track::parse(&format!(
+                            "start 0 0 0 {heading}\nstraight 50 bank {bank}\n{road} rise {rise}"
+                        ))
+                        .unwrap();
+                        for distance in [120.2, 121.4, 130.5, track.samples[80].distance] {
+                            let sample = track.sample_at(distance);
+                            for lateral in [-5.0, 0.0, 5.0] {
+                                let position =
+                                    sample.pos + sample.right * lateral + Vec3::Y * RIDE_HEIGHT;
+                                let road = nearest_road(
+                                    &track,
+                                    position,
+                                    distance,
+                                    position.y,
+                                    track.ground_height(),
+                                    None,
+                                )
+                                .unwrap();
+                                assert!(
+                                    (road.sample.distance - distance).abs() < 0.03,
+                                    "bank {bank}, rise {rise}, heading {heading}, distance {distance}, lateral {lateral}, actual {}",
+                                    road.sample.distance
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

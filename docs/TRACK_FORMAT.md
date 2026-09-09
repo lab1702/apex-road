@@ -139,7 +139,8 @@ close
 - Radius is 8–5000 m and must exceed half the road width plus 1 m.
 - Width is 4–40 m; banking is between -60 and +60 degrees.
 - A rise is between -500 and +500 m and no more than 60% of horizontal length.
-  Generated slopes may not exceed 100%; use longer transitions if rejected.
+  Slopes throughout the cubic elevation profile may not exceed 100%, including
+  between generated samples; use longer transitions if rejected.
 - Road elevation stays between -1000 and +2000 m. Start coordinates are
   limited to ±10000 m horizontally and ±1000 m vertically.
 - A track must be at least 20 m long, at most 50 km, with at most 25001 samples.
