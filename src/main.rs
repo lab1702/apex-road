@@ -149,19 +149,59 @@ fn record_path(track: &Track) -> PathBuf {
     PathBuf::from(format!("data/{:016x}.best", track.source_hash()))
 }
 fn read_record(path: &Path) -> Option<f32> {
-    std::fs::read_to_string(path)
-        .ok()?
+    try_read_record(path).ok().flatten()
+}
+fn try_read_record(path: &Path) -> std::io::Result<Option<f32>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(text
         .trim()
         .parse::<f32>()
         .ok()
-        .filter(|x| x.is_finite() && *x > 0.)
+        .filter(|x| x.is_finite() && *x > 0.))
 }
-fn save_record(path: &Path, time: f32) -> std::io::Result<()> {
-    std::fs::create_dir_all("data")?;
-    let p = path;
-    let temp = p.with_extension("tmp");
-    std::fs::write(&temp, format!("{time:.6}\n"))?;
-    std::fs::rename(temp, p)
+#[derive(Debug)]
+struct SavedRecord {
+    best: f32,
+    improved: bool,
+}
+fn save_record(path: &Path, time: f32) -> std::io::Result<SavedRecord> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    // The record itself is replaced by rename. Keep a separate, stable lock
+    // file so every running game serializes its read/compare/write sequence.
+    // Never remove this sidecar: another process may already be waiting on it.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    if let Some(best) = try_read_record(path)?
+        && best <= time
+    {
+        return Ok(SavedRecord {
+            best,
+            improved: false,
+        });
+    }
+    // All writers for this record hold the same lock, including while using
+    // its temporary file. The same-directory rename keeps readers atomic.
+    let temp = path.with_extension("tmp");
+    std::fs::write(&temp, format!("{time}\n"))?;
+    std::fs::rename(temp, path)?;
+    Ok(SavedRecord {
+        best: time,
+        improved: true,
+    })
 }
 fn save_capture(path: &Path, screenshot: &Image) -> Result<(), image::ImageError> {
     let mut pixels = image::RgbaImage::from_raw(
@@ -259,6 +299,21 @@ impl RunRecords {
             self.best = Some(best);
         }
         candidate
+    }
+
+    fn save_candidate(
+        &mut self,
+        path: &Path,
+        race: &mut Race,
+        candidate: Option<f32>,
+    ) -> std::io::Result<Option<SavedRecord>> {
+        let Some(candidate) = self.accept(candidate) else {
+            return Ok(None);
+        };
+        let saved = save_record(path, candidate)?;
+        self.best = Some(saved.best);
+        race.best = Some(saved.best);
+        Ok(Some(saved))
     }
 }
 
@@ -447,14 +502,21 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
             while accumulator >= fixed {
                 car.update(&track, control, fixed);
                 let candidate = race.update(&track, fixed, car.distance, !car.offroad);
-                if let Some(best) = records.accept(candidate) {
-                    if let Err(e) = save_record(&record_file, best) {
+                match records.save_candidate(&record_file, &mut race, candidate) {
+                    Err(e) => {
                         note = format!("Record could not be saved: {e}");
                         note_time = 8.;
-                    } else {
-                        note = "NEW PERSONAL BEST".into();
+                    }
+                    Ok(Some(saved)) => {
+                        note = if saved.improved {
+                            "NEW PERSONAL BEST"
+                        } else {
+                            "PERSONAL BEST SYNCED"
+                        }
+                        .into();
                         note_time = 5.;
                     }
+                    Ok(None) => {}
                 }
                 if !car.position.is_finite() || car.position.y < track.ground_height() - 30. {
                     restart_run(&mut car, &track, &mut records, &mut race, autodrive);
@@ -608,6 +670,137 @@ mod driving_checks {
         #[cfg(target_os = "linux")]
         assert!(save_capture(Path::new("/dev/full"), &screenshot).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_session_cannot_replace_a_faster_saved_record() {
+        let directory =
+            std::env::temp_dir().join(format!("apex-stale-record-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("course.best");
+        let mut fast_records = RunRecords::new(None);
+        let mut slow_records = RunRecords::new(None);
+        let mut fast_race = fast_records.start_race(0.0, true);
+        let mut slow_race = slow_records.start_race(0.0, true);
+        assert!(
+            fast_records
+                .save_candidate(&path, &mut fast_race, Some(40.0))
+                .unwrap()
+                .unwrap()
+                .improved
+        );
+        let saved = slow_records
+            .save_candidate(&path, &mut slow_race, Some(60.0))
+            .unwrap()
+            .unwrap();
+        assert!(!saved.improved);
+        assert_eq!(saved.best, 40.0);
+        assert_eq!(slow_race.best, Some(40.0));
+        assert_eq!(slow_records.start_race(0.0, true).best, Some(40.0));
+        assert_eq!(read_record(&path), Some(40.0));
+        assert!(!save_record(&path, 40.0).unwrap().improved);
+
+        let saved = slow_records
+            .save_candidate(&path, &mut slow_race, Some(35.0))
+            .unwrap()
+            .unwrap();
+        assert!(saved.improved);
+        assert_eq!(saved.best, 35.0);
+        assert_eq!(slow_race.best, Some(35.0));
+        assert_eq!(slow_records.best, Some(35.0));
+        assert_eq!(read_record(&path), Some(35.0));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn record_writers_share_one_lock_across_processes() {
+        const CHILD: &str = "APEX_RECORD_PROCESS_TEST";
+        const WRITER: &str = "APEX_RECORD_PROCESS_WRITER";
+        fn wait_for_files(paths: &[PathBuf]) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !paths.iter().all(|path| path.exists()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "record writer timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if let Some(directory) = std::env::var_os(CHILD) {
+            let directory = PathBuf::from(directory);
+            let writer: u32 = std::env::var(WRITER).unwrap().parse().unwrap();
+            std::fs::write(directory.join(format!("ready-{writer}")), []).unwrap();
+            wait_for_files(&[directory.join("go")]);
+            for step in 0..32 {
+                let time = (1000 - step * 4 - writer) as f32;
+                let saved = save_record(&directory.join("course.best"), time).unwrap();
+                assert!(saved.best <= time);
+                std::thread::yield_now();
+            }
+            return;
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "apex-concurrent-record-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let children: Vec<_> = (0..4)
+            .map(|writer| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "driving_checks::record_writers_share_one_lock_across_processes",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, &directory)
+                    .env(WRITER, writer.to_string())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let ready: Vec<_> = (0..4)
+            .map(|writer| directory.join(format!("ready-{writer}")))
+            .collect();
+        wait_for_files(&ready);
+        std::fs::write(directory.join("go"), []).unwrap();
+        let outputs: Vec<_> = children
+            .into_iter()
+            .map(|child| child.wait_with_output().unwrap())
+            .collect();
+        let best = read_record(&directory.join("course.best"));
+        assert!(directory.join("course.lock").is_file());
+        assert!(!directory.join("course.tmp").exists());
+        std::fs::remove_dir_all(directory).unwrap();
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "record writer failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(best, Some(873.0));
+    }
+
+    #[test]
+    fn record_saving_preserves_read_errors_and_recovers_invalid_numbers() {
+        let directory =
+            std::env::temp_dir().join(format!("apex-record-errors-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("course.best");
+        std::fs::create_dir(&path).unwrap();
+        assert!(save_record(&path, 60.0).is_err());
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "NaN\n").unwrap();
+        let saved = save_record(&path, 60.0).unwrap();
+        assert!(saved.improved);
+        assert_eq!(saved.best, 60.0);
+        assert_eq!(read_record(&path), Some(60.0));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

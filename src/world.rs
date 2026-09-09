@@ -382,10 +382,11 @@ impl World {
                     continue;
                 }
                 let shade = if i % 2 == 0 { 1.0 } else { 1.015 };
-                // Refine the road edges and markings with the changing frame
-                // so they follow steep banked hills instead of cutting across
-                // the asphalt. Collision architecture keeps its source quads.
-                let steps = frame_steps(a, z);
+                // Share the asphalt's twist and frame refinement with its
+                // markings. Frame refinement alone can bury edge stripes in
+                // widening banked hills. Collision architecture keeps its
+                // source quads.
+                let steps = surface_steps(a, z);
                 for step in 0..steps {
                     let start = surface_sample(track, a, z, step as f32 / steps as f32);
                     let end = surface_sample(track, a, z, (step + 1) as f32 / steps as f32);
@@ -1013,6 +1014,52 @@ mod tests {
         for mesh in checkerboard(&track, 0.0) {
             assert!(mesh.vertices.iter().all(|v| v.position.z <= 1.0));
         }
+    }
+
+    #[test]
+    fn lane_markings_remain_above_widening_banked_hills() {
+        let track = Track::parse(
+            "width 12\nstraight 20\nwidth 40\nstraight 10 rise 1 bank 60\nstraight 20",
+        )
+        .unwrap();
+        let chunks = World::build_chunks(&track);
+        let asphalt_colors: [[u8; 4]; 2] = [ASPHALT.into(), tint(ASPHALT, 1.015).into()];
+        let marking_color: [u8; 4] = CREAM.into();
+        let mut road = Builder::new();
+        let mut markings = Vec::new();
+        for chunk in chunks.iter().filter(|chunk| !chunk.distant) {
+            for indices in chunk.mesh.indices.as_chunks::<3>().0 {
+                let vertices = indices.map(|i| chunk.mesh.vertices[i as usize]);
+                if asphalt_colors.contains(&vertices[0].color) {
+                    road.tri(
+                        vertices[0].position,
+                        vertices[1].position,
+                        vertices[2].position,
+                        ASPHALT,
+                    );
+                }
+                // Lane stripes are the cream quads with 16 cm cross edges;
+                // this excludes curbs, roadside furniture and distant gates.
+                if vertices.iter().all(|v| v.color == marking_color)
+                    && [(0, 1), (1, 2)].iter().any(|&(a, b)| {
+                        (vertices[a].position.distance(vertices[b].position) - 0.16).abs() < 0.001
+                    })
+                {
+                    markings.push(vertices.iter().map(|v| v.position).sum::<Vec3>() / 3.0);
+                }
+            }
+        }
+        let road = road.finish();
+        let mut checked = 0;
+        for point in markings {
+            let height = triangle_height(&road, point).expect("stripe lies over the asphalt");
+            assert!(
+                point.y > height,
+                "lane marking buried at {point:?}, road height {height}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 100);
     }
 
     #[test]
