@@ -120,7 +120,15 @@ fn surface_steps(a: RoadSample, b: RoadSample) -> usize {
     let normal = (a.up + b.up).normalize();
     let span_change = b.right * b.width - a.right * a.width;
     let twist = span_change.dot(normal).abs() * 0.25;
-    (twist / 0.02).ceil().max(1.0) as usize
+    ((twist / 0.02).ceil().max(1.0) as usize).max(frame_steps(a, b))
+}
+
+fn frame_steps(a: RoadSample, b: RoadSample) -> usize {
+    // A banked hill can curve the road edges without twisting them relative
+    // to the average normal. Bound frame changes too: otherwise a straight
+    // chord cuts far inside the unit frame used by the driving surface.
+    let change = a.forward.distance(b.forward).max(a.right.distance(b.right));
+    (change / 0.05).ceil().max(1.0) as usize
 }
 
 fn surface_sample(track: &Track, a: RoadSample, b: RoadSample, t: f32) -> RoadSample {
@@ -312,48 +320,71 @@ impl World {
                     continue;
                 }
                 let shade = if i % 2 == 0 { 1.0 } else { 1.015 };
-                road_segment(&mut b, track, a, z, tint(ASPHALT, shade));
-                for side in [-1., 1.] {
-                    // A generous shoulder matches the off-road contact surface.
-                    if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
-                        shoulder_segment(
-                            &mut b,
-                            track,
-                            [a, z],
-                            ground_y,
-                            side,
-                            tint(GRASS, 0.96 + noise(i as u32) * 0.07),
-                        );
-                    } else {
-                        // Deep fascia makes the bridge read as a solid structure from below.
+                // Refine the road edges and markings with the changing frame
+                // so they follow steep banked hills instead of cutting across
+                // the asphalt. Collision architecture keeps its source quads.
+                let steps = frame_steps(a, z);
+                for step in 0..steps {
+                    let start = surface_sample(track, a, z, step as f32 / steps as f32);
+                    let end = surface_sample(track, a, z, (step + 1) as f32 / steps as f32);
+                    let [a, z] = [start, end];
+                    let w = a.width * 0.5;
+                    let wz = z.width * 0.5;
+                    road_segment(&mut b, track, a, z, tint(ASPHALT, shade));
+                    for side in [-1., 1.] {
+                        // A generous shoulder matches the off-road contact surface.
+                        if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
+                            shoulder_segment(
+                                &mut b,
+                                track,
+                                [a, z],
+                                ground_y,
+                                side,
+                                tint(GRASS, 0.96 + noise(i as u32) * 0.07),
+                            );
+                        } else {
+                            // Deep fascia makes the bridge read as a solid structure from below.
+                            b.quad(
+                                edge(a, side * w, 0.),
+                                edge(a, side * w, -0.85),
+                                edge(z, side * wz, -0.85),
+                                edge(z, side * wz, 0.),
+                                Color::new(0.45, 0.51, 0.49, 1.),
+                            );
+                        }
                         b.quad(
-                            edge(a, side * w, 0.),
-                            edge(a, side * w, -0.85),
-                            edge(z, side * wz, -0.85),
-                            edge(z, side * wz, 0.),
-                            Color::new(0.45, 0.51, 0.49, 1.),
+                            edge(a, side * (w - 0.34), 0.024),
+                            edge(a, side * (w - 0.18), 0.024),
+                            edge(z, side * (wz - 0.18), 0.024),
+                            edge(z, side * (wz - 0.34), 0.024),
+                            CREAM,
+                        );
+                        let curb = if (a.distance / 4.).floor() as i32 % 2 == 0 {
+                            CREAM
+                        } else {
+                            RED
+                        };
+                        b.quad(
+                            edge(a, side * w, 0.035),
+                            edge(a, side * (w + 0.43), 0.035),
+                            edge(z, side * (wz + 0.43), 0.035),
+                            edge(z, side * wz, 0.035),
+                            curb,
                         );
                     }
-                    b.quad(
-                        edge(a, side * (w - 0.34), 0.024),
-                        edge(a, side * (w - 0.18), 0.024),
-                        edge(z, side * (wz - 0.18), 0.024),
-                        edge(z, side * (wz - 0.34), 0.024),
-                        CREAM,
-                    );
-                    let curb = if (a.distance / 4.).floor() as i32 % 2 == 0 {
-                        CREAM
-                    } else {
-                        RED
-                    };
-                    b.quad(
-                        edge(a, side * w, 0.035),
-                        edge(a, side * (w + 0.43), 0.035),
-                        edge(z, side * (wz + 0.43), 0.035),
-                        edge(z, side * wz, 0.035),
-                        curb,
-                    );
-                    if matches!(a.kind, RoadKind::Bridge | RoadKind::Tunnel) {
+                    // Subtle dashed road centerline.
+                    if (a.distance / 6.).floor() as i32 % 2 == 0 {
+                        b.quad(
+                            edge(a, -0.075, 0.027),
+                            edge(a, 0.075, 0.027),
+                            edge(z, 0.075, 0.027),
+                            edge(z, -0.075, 0.027),
+                            tint(CREAM, 0.77),
+                        );
+                    }
+                }
+                if matches!(a.kind, RoadKind::Bridge | RoadKind::Tunnel) {
+                    for side in [-1., 1.] {
                         b.quad(
                             edge(a, side * (w + 0.25), 0.2),
                             edge(a, side * (w + 0.25), 1.0),
@@ -369,16 +400,6 @@ impl World {
                             CREAM,
                         );
                     }
-                }
-                // Subtle dashed road centerline.
-                if (a.distance / 6.).floor() as i32 % 2 == 0 {
-                    b.quad(
-                        edge(a, -0.075, 0.027),
-                        edge(a, 0.075, 0.027),
-                        edge(z, 0.075, 0.027),
-                        edge(z, -0.075, 0.027),
-                        tint(CREAM, 0.77),
-                    );
                 }
                 if a.kind == RoadKind::Tunnel {
                     for j in 0..10 {
@@ -856,6 +877,39 @@ mod tests {
     }
 
     #[test]
+    fn short_banked_hills_keep_the_full_rendered_road_width() {
+        for bank in [-60, 60] {
+            for rise in [-0.6, 0.6] {
+                let track = Track::parse(&format!(
+                    "width 40\nstraight 20 bank {bank}\nstraight 1 rise {rise}\nstraight 20"
+                ))
+                .unwrap();
+                for pair in track.samples.windows(2) {
+                    let [a, b] = [pair[0], pair[1]];
+                    let mut builder = Builder::new();
+                    road_segment(&mut builder, &track, a, b, ASPHALT);
+                    let mesh = builder.finish();
+                    let quads = mesh.vertices.as_chunks::<4>().0;
+                    for (index, quad) in quads.iter().enumerate() {
+                        let distance = a.distance
+                            + (b.distance - a.distance) * (index as f32 + 0.5) / quads.len() as f32;
+                        let middle = track.sample_at(distance);
+                        for (first, last, side) in [(0, 3, -1.0), (1, 2, 1.0)] {
+                            let rendered = (quad[first].position + quad[last].position) * 0.5;
+                            let expected = edge(middle, side * middle.width * 0.5, 0.0);
+                            assert!(
+                                rendered.distance(expected) < 0.025,
+                                "road edge departs from driving width by {} m at {distance}, bank {bank}, rise {rise}",
+                                rendered.distance(expected)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn checkerboards_follow_rendered_hills_banks_and_gap_boundaries() {
         for source in [
             "straight 2 rise 1\nstraight 40",
@@ -926,12 +980,8 @@ mod tests {
 
     #[test]
     fn rapid_bank_markings_and_road_chunks_fit_renderer_limits() {
-        for kind in ["road", "tunnel"] {
-            let track = Track::parse(&format!(
-                "width 40\nkind {kind}\nstraight 1 bank 60\nstraight 1 bank -60\nstraight 30\nstraight 1 bank 60\nstraight 1 bank -60\nstraight 2",
-            ))
-            .unwrap();
-            for chunk in World::build_chunks(&track) {
+        let check_chunks = |track: &Track| {
+            for chunk in World::build_chunks(track) {
                 assert!(chunk.mesh.vertices.len() <= 60_000);
                 assert!(chunk.mesh.indices.len() <= 120_000);
                 assert!(
@@ -942,21 +992,27 @@ mod tests {
                         .all(|i| (*i as usize) < chunk.mesh.vertices.len())
                 );
             }
+        };
+        for kind in ["road", "tunnel"] {
+            let track = Track::parse(&format!(
+                "width 40\nkind {kind}\nstraight 1 bank 60\nstraight 1 bank -60\nstraight 30\nstraight 1 bank 60\nstraight 1 bank -60\nstraight 2",
+            ))
+            .unwrap();
+            check_chunks(&track);
+
+            // Frame refinement adds slices to steep banked hills even when
+            // the bank stays constant. Exercise those alongside the widest
+            // legal width changes and repeated shoulder height transitions.
+            let mut source = format!("width 40\nkind {kind}\nstraight 20 bank 60\n");
+            source.push_str(
+                &"width 4\nstraight 1 rise 0.6\nwidth 40\nstraight 1 rise -0.6\n".repeat(80),
+            );
+            check_chunks(&Track::parse(&source).unwrap());
         }
         let mut source = String::from("width 40\nstraight 20 bank 60\n");
         source.push_str(&"width 4\nstraight 1\nwidth 40\nstraight 1\n".repeat(40));
         let track = Track::parse(&source).unwrap();
-        for chunk in World::build_chunks(&track) {
-            assert!(chunk.mesh.vertices.len() <= 60_000);
-            assert!(chunk.mesh.indices.len() <= 120_000);
-            assert!(
-                chunk
-                    .mesh
-                    .indices
-                    .iter()
-                    .all(|i| (*i as usize) < chunk.mesh.vertices.len())
-            );
-        }
+        check_chunks(&track);
     }
 
     #[test]

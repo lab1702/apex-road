@@ -358,17 +358,28 @@ impl Car {
 
         // The tunnel roof is also a physical boundary; falling onto a roof
         // from outside is intentionally not treated as driving on its deck.
-        if let Some(road) = new_road
-            && let Some(roof_height) = tunnel_roof_height(road.sample, self.position)
-            && let Some(previous_roof) = old_road
-                .and_then(|road| tunnel_roof_height(road.sample, before))
-                .or_else(|| tunnel_roof_height(road.sample, before))
-            && before.y + 0.7 <= previous_roof + 0.001
-            && self.position.y + 0.7 > roof_height
-        {
-            self.position.y = roof_height - 0.7;
+        if let Some((hit, normal)) = tunnel_roof_sweep(track, before, self.position) {
+            self.position = hit - Vec3::Y * 0.7 - normal * 0.0001;
+            self.velocity -= normal * self.velocity.dot(normal).max(0.0);
             self.velocity.y = self.velocity.y.min(0.0);
             self.impact = 0.6;
+            // The sweep can stop before a gate that the unconstrained step
+            // crossed. Timing and surface state must follow the corrected car.
+            let road = nearest_road(
+                track,
+                self.position,
+                self.distance,
+                max_surface_height,
+                ground_height,
+                None,
+            );
+            if let Some(road) = road {
+                self.road_index = road.index;
+                self.distance = road.sample.distance;
+            }
+            let surface = contact_surface(road, max_surface_height, ground_height);
+            self.offroad = surface.offroad;
+            self.grounded &= (self.position.y - RIDE_HEIGHT - surface.height).abs() < 0.55;
         }
     }
 
@@ -725,7 +736,10 @@ fn nearest_road(
         let pos = a.pos.lerp(b.pos, along);
         let forward = a.forward.lerp(b.forward, along).normalize_or_zero();
         let right = a.right.lerp(b.right, along).normalize_or_zero();
-        let up = a.up.lerp(b.up, along).normalize_or_zero();
+        // Interpolated frame axes need not remain orthogonal. In particular,
+        // independently blending up on a short banked hill tilts its plane
+        // away from this cross-section and shifts the tire contact height.
+        let up = forward.cross(right).normalize_or_zero();
         let width = a.width + (b.width - a.width) * along;
         let distance = a.distance + (b.distance - a.distance) * along;
         let sample = RoadSample {
@@ -992,34 +1006,75 @@ fn plane_height_at(surface: Surface, origin: Vec3, point: Vec3) -> f32 {
     surface.height - horizontal(point - origin).dot(surface.normal) / surface.normal.y.max(0.15)
 }
 
-/// Intersect a vertical line with the same ten arch panels drawn by the world.
-/// Working in the road frame keeps roof clearance correct on banks and hills.
-fn tunnel_roof_height(sample: RoadSample, position: Vec3) -> Option<f32> {
-    if sample.kind != RoadKind::Tunnel {
-        return None;
-    }
-    let mut height: Option<f32> = None;
-    let arch = |index: usize| {
-        let angle = index as f32 / 10.0 * std::f32::consts::PI;
-        sample.pos
-            + sample.right * angle.cos() * (sample.width * 0.5 + 0.65)
-            + sample.up * (1.0 + angle.sin() * 5.2)
-    };
-    for index in 0..10 {
-        let a = arch(index);
-        let tangent = arch(index + 1) - a;
-        let normal = tangent.cross(sample.forward);
-        if normal.y <= 0.0001 {
+/// Check the finite roof panels crossed by the chassis top. A lookup at only
+/// the destination misses a roof impact followed by an exit in the same step.
+/// Triangles also retain the tunnel's actual opening instead of extending its
+/// ceiling beyond the final cross-section.
+fn tunnel_roof_sweep(track: &Track, before: Vec3, after: Vec3) -> Option<(Vec3, Vec3)> {
+    let before = before + Vec3::Y * 0.7;
+    let after = after + Vec3::Y * 0.7;
+    let path_min = before.min(after);
+    let path_max = before.max(after);
+    let mut hit: Option<(f32, Vec3)> = None;
+    for pair in track.samples.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        if a.kind != RoadKind::Tunnel {
             continue;
         }
-        let panel_height = a.y - horizontal(position - a).dot(normal) / normal.y;
-        let hit = vec3(position.x, panel_height, position.z);
-        let fraction = (hit - a).dot(tangent) / tangent.length_squared();
-        if (-0.0001..=1.0001).contains(&fraction) {
-            height = Some(height.map_or(panel_height, |height| height.max(panel_height)));
+        // A conservative bound is cheap even for a long, densely sampled route.
+        let radius = a.width.max(b.width) * 0.5 + 6.85;
+        let bounds_min = a.pos.min(b.pos) - Vec3::splat(radius);
+        let bounds_max = a.pos.max(b.pos) + Vec3::splat(radius);
+        if path_max.cmplt(bounds_min).any() || path_min.cmpgt(bounds_max).any() {
+            continue;
+        }
+        let arch = |sample: RoadSample, index: usize| {
+            let angle = index as f32 / 10.0 * std::f32::consts::PI;
+            sample.pos
+                + sample.right * angle.cos() * (sample.width * 0.5 + 0.65)
+                + sample.up * (1.0 + angle.sin() * 5.2)
+        };
+        for index in 0..10 {
+            let aa = arch(a, index);
+            let ab = arch(a, index + 1);
+            let ba = arch(b, index);
+            let bb = arch(b, index + 1);
+            for [origin, second, third] in [[aa, ab, bb], [aa, bb, ba]] {
+                let u = second - origin;
+                let v = third - origin;
+                let normal = u.cross(v).normalize_or_zero();
+                // Match the upper arch's one-sided boundary. Falling from
+                // outside onto the roof must not pull the car into the tunnel.
+                if normal.y <= 0.0001 {
+                    continue;
+                }
+                let start = (before - origin).dot(normal);
+                let end = (after - origin).dot(normal);
+                if start > 0.001 || end <= 0.0 || end <= start {
+                    continue;
+                }
+                let fraction = (-start / (end - start)).max(0.0);
+                if hit.is_some_and(|(best, _)| fraction >= best) {
+                    continue;
+                }
+                let crossing = before.lerp(after, fraction) - origin;
+                let uu = u.length_squared();
+                let vv = v.length_squared();
+                let uv = u.dot(v);
+                let denominator = uu * vv - uv * uv;
+                if denominator <= 0.0000001 {
+                    continue;
+                }
+                let along_u = (crossing.dot(u) * vv - crossing.dot(v) * uv) / denominator;
+                let along_v = (crossing.dot(v) * uu - crossing.dot(u) * uv) / denominator;
+                if along_u >= -0.0001 && along_v >= -0.0001 && along_u + along_v <= 1.0001 {
+                    hit = Some((fraction, normal));
+                }
+            }
         }
     }
-    height
+    hit.map(|(fraction, normal)| (before.lerp(after, fraction), normal))
 }
 
 fn surface_vertical_speed(velocity: Vec3, normal: Vec3) -> f32 {
@@ -1598,6 +1653,45 @@ mod tests {
     }
 
     #[test]
+    fn short_banked_hill_contact_matches_its_cross_section() {
+        for bank in [-60, 60] {
+            let track = Track::parse(&format!(
+                "width 40\nstraight 20 bank {bank}\nstraight 1 rise 0.6\nstraight 20"
+            ))
+            .unwrap();
+            for pair in track.samples.windows(2) {
+                for fraction in [0.25, 0.5, 0.75] {
+                    let distance =
+                        pair[0].distance + (pair[1].distance - pair[0].distance) * fraction;
+                    let sample = track.sample_at(distance);
+                    // Stay close to the centerline so neighboring road
+                    // cross-sections cannot overlap this query's footprint.
+                    for lateral in [-0.1, 0.1] {
+                        let contact = sample.pos + sample.right * lateral;
+                        let road = nearest_road(
+                            &track,
+                            contact + Vec3::Y * RIDE_HEIGHT,
+                            distance,
+                            contact.y + CONTACT_TOLERANCE,
+                            track.ground_height(),
+                            None,
+                        )
+                        .unwrap();
+                        assert!((road.sample.distance - distance).abs() < 0.01);
+                        assert!(
+                            (road.plane_height - contact.y).abs() < 0.001,
+                            "contact differs at bank {bank}, distance {distance}, lateral {lateral}: {} versus {}",
+                            road.plane_height,
+                            contact.y
+                        );
+                        assert!(road.sample.up.dot(road.sample.right).abs() < 0.0001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn banked_guardrail_impacts_preserve_ground_contact_on_both_sides_and_slopes() {
         for kind in ["bridge", "tunnel"] {
             for bank in [-60, -30, -14, 14, 30, 60] {
@@ -1690,18 +1784,21 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_roof_query_matches_arch_vertices_on_hills() {
+    fn tunnel_roof_sweep_matches_arch_vertices_on_hills() {
         for bank in [-60, -30, 0, 30, 60] {
             for rise in [-60, 60] {
                 let track =
                     Track::parse(&format!("straight 50 bank {bank}\ntunnel 100 rise {rise}"))
                         .unwrap();
-                let sample = track.sample_at(80.0);
+                let sample = track.samples[40];
                 let roof = sample.pos + sample.up * 6.2;
-                let height = tunnel_roof_height(sample, roof).unwrap();
+                let (hit, _) =
+                    tunnel_roof_sweep(&track, roof - Vec3::Y * 0.75, roof - Vec3::Y * 0.65)
+                        .unwrap();
                 assert!(
-                    (height - roof.y).abs() < 0.001,
-                    "wrong arch height on bank {bank}, rise {rise}: {height}, expected {}",
+                    (hit.y - roof.y).abs() < 0.001,
+                    "wrong arch height on bank {bank}, rise {rise}: {}, expected {}",
+                    hit.y,
                     roof.y
                 );
             }
@@ -1719,6 +1816,68 @@ mod tests {
         assert_eq!(car.impact, 0.0);
         assert!(!car.grounded);
         assert!(car.position.y > 5.8);
+    }
+
+    #[test]
+    fn tunnel_roof_contact_precedes_leaving_its_final_segment() {
+        for source in [
+            "tunnel 100",
+            "tunnel 100\nstraight 50",
+            "tunnel 100\ngap 10\nstraight 50",
+        ] {
+            let track = Track::parse(source).unwrap();
+            for direction in [-1.0, 1.0] {
+                let mut car = Car::new(&track);
+                car.reset(&track, if direction > 0.0 { 99.8 } else { 0.2 });
+                car.position.y = 5.49;
+                car.velocity = vec3(0.0, 20.0, 40.0 * direction);
+                car.grounded = false;
+                car.update(&track, Control::default(), STEP);
+                assert!(
+                    car.position.y + 0.7 <= 6.2 + 0.001,
+                    "missed roof on exit: {car:?}"
+                );
+                assert!(car.velocity.y <= 0.0 && car.impact > 0.0);
+                assert!((car.distance - car.position.z).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn tunnel_roof_does_not_extend_past_its_open_ends() {
+        let track = Track::parse("tunnel 100").unwrap();
+        for direction in [-1.0, 1.0] {
+            let mut car = Car::new(&track);
+            car.reset(&track, if direction > 0.0 { 99.99 } else { 0.01 });
+            car.position.y = 5.4;
+            car.velocity = vec3(0.0, 20.0, 40.0 * direction);
+            car.grounded = false;
+            car.update(&track, Control::default(), STEP);
+            assert!(car.position.y + 0.7 > 6.2);
+            assert_eq!(car.impact, 0.0);
+        }
+    }
+
+    #[test]
+    fn tunnel_roof_impact_cannot_award_an_unreached_finish() {
+        let track = Track::parse("tunnel 100").unwrap();
+        let mut car = Car::new(&track);
+        car.reset(&track, track.finish_distance() - 0.1);
+        car.position.y = 5.49;
+        car.velocity = vec3(0.0, 20.0, 40.0);
+        car.grounded = false;
+        let mut race = crate::race::Race::new(None, car.distance);
+        race.started = true;
+        race.next_checkpoint = track.checkpoints.len();
+        car.update(&track, Control::default(), STEP);
+        assert!(car.impact > 0.0);
+        assert!(car.position.z < track.finish_distance());
+        assert!((car.distance - car.position.z).abs() < 0.001);
+        assert!(
+            race.update(&track, STEP, car.distance, !car.offroad)
+                .is_none()
+        );
+        assert!(!race.finished);
     }
 
     #[test]

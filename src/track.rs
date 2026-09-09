@@ -531,6 +531,9 @@ impl Builder {
                     .into(),
             );
         }
+        if length > MAX_LENGTH {
+            return Err("Track exceeds the 50 km length limit after closing the seam".into());
+        }
         self.track.length = length;
         self.track.samples[index] = RoadSample {
             distance: self.track.length,
@@ -924,6 +927,21 @@ mod tests {
         let closing_chord =
             safe.samples.last().unwrap().pos - safe.samples[safe.samples.len() - 2].pos;
         assert!(closing_chord.y.abs() <= closing_chord.xz().length());
+    }
+
+    #[test]
+    fn close_keeps_the_snapped_course_within_the_length_limit() {
+        // The road ends 20 cm before the start. Its accumulated length is
+        // legal until closing that remaining drift adds the missing distance.
+        let source = "straight 5000 rise 491.875\nstraight 5000 rise -491.875\nright 180 radius 1582.1\nstraight 5000\nstraight 5000\nstraight 5000\nstraight 5000\nright 180 radius 1582.1\nstraight 5000\nstraight 4999.8";
+        let open = Track::parse(source).unwrap();
+        let previous = open.samples[open.samples.len() - 2];
+        let snapped_length = previous.distance + previous.pos.distance(open.samples[0].pos);
+        assert!(open.length <= MAX_LENGTH);
+        assert!(snapped_length > MAX_LENGTH);
+        let error = Track::parse(&format!("{source}\nclose")).unwrap_err();
+        assert!(error.starts_with("Line 11:"), "{error}");
+        assert!(error.contains("50 km length limit"), "{error}");
     }
 
     #[test]
