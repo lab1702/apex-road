@@ -343,7 +343,7 @@ async fn game(opts: Options, mut track: Track) {
             match Track::load(resolve_track(&next)) {
                 Ok(new_track) => {
                     track = new_track;
-                    world = world::World::new(&track);
+                    world.rebuild(&track);
                     path = next;
                     car = Car::new(&track);
                     record_file = record_path(&path);

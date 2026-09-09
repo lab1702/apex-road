@@ -16,6 +16,8 @@ const FRONT_ARM: f32 = 1.36;
 const REAR_ARM: f32 = 1.29;
 const INERTIA_PER_MASS: f32 = 2.45;
 const CAR_HALF_WIDTH: f32 = 0.85;
+// Keep shared segment edges watertight despite rounded track coordinates.
+const SEGMENT_TOLERANCE: f32 = 0.01;
 const ROAD_FRICTION: f32 = 1.18;
 const FRONT_CORNERING_STIFFNESS: f32 = 56.0;
 const REAR_CORNERING_STIFFNESS: f32 = 62.0;
@@ -68,7 +70,6 @@ struct RoadPoint {
     lateral: f32,
     plane_height: f32,
     horizontal_right: Vec3,
-    beyond_endpoint: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -481,8 +482,24 @@ fn nearest_road(
         if chord_length_squared < 0.00001 {
             continue;
         }
+        // Bound every segment by its rendered cross-sections, including the
+        // edges of gaps. Chord projections alone leave holes on the outside
+        // of bends; the banked right vectors also account for sloped joins.
+        let start_normal = horizontal(a.right).cross(Vec3::Y).normalize();
+        let end_normal = horizontal(b.right).cross(Vec3::Y).normalize();
+        let start_offset = horizontal(position - a.pos).dot(start_normal);
+        let end_offset = horizontal(position - b.pos).dot(end_normal);
+        if start_offset < -SEGMENT_TOLERANCE || end_offset > SEGMENT_TOLERANCE {
+            continue;
+        }
         let projection = horizontal(position - a.pos).dot(chord) / chord_length_squared;
-        let along = projection.clamp(0.0, 1.0);
+        let along = if start_offset.abs() <= SEGMENT_TOLERANCE {
+            0.0
+        } else if end_offset.abs() <= SEGMENT_TOLERANCE {
+            1.0
+        } else {
+            projection.clamp(0.0, 1.0)
+        };
         let pos = a.pos.lerp(b.pos, along);
         let forward = a.forward.lerp(b.forward, along).normalize_or_zero();
         let right = a.right.lerp(b.right, along).normalize_or_zero();
@@ -497,7 +514,11 @@ fn nearest_road(
             width,
             bank: a.bank + (b.bank - a.bank) * along,
             distance,
-            kind: if along == 1.0 { b.kind } else { a.kind },
+            kind: if end_offset >= -SEGMENT_TOLERANCE {
+                b.kind
+            } else {
+                a.kind
+            },
         };
         let horizontal_right = horizontal(right).normalize_or_zero();
         let plane_height = pos.y - horizontal(position - pos).dot(up) / up.y.max(0.15);
@@ -522,9 +543,6 @@ fn nearest_road(
             lateral,
             plane_height,
             horizontal_right,
-            beyond_endpoint: !track.closed
-                && ((index == 0 && projection < -0.001)
-                    || (index + 2 == track.samples.len() && projection > 1.001)),
         };
         // An overhead deck cannot become the route merely because the car
         // rises closer to it during a jump. Use the same swept height bound as
@@ -561,7 +579,7 @@ fn contact_surface(
 }
 
 fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
-    if road.beyond_endpoint || matches!(road.sample.kind, RoadKind::Gap) {
+    if matches!(road.sample.kind, RoadKind::Gap) {
         return None;
     }
     let half_width = road.sample.width * 0.5;
@@ -959,6 +977,80 @@ mod tests {
         assert!(!car.grounded);
         assert!(car.position.z > 40.0);
         assert!(car.position.y < RIDE_HEIGHT - 0.2);
+    }
+
+    #[test]
+    fn falling_short_of_a_gap_lands_on_terrain_before_the_landing_road() {
+        let track =
+            Track::parse("start 0 12 0\nstraight 40\ngap 20 rise -12\nstraight 100").unwrap();
+        let mut car = Car::new(&track);
+        car.reset(&track, 38.0);
+        car.velocity = Vec3::Z * 3.0;
+        let mut airborne = false;
+        for _ in 0..600 {
+            let previous_distance = car.distance;
+            car.update(&track, Control::default(), STEP);
+            assert!(
+                (car.distance - previous_distance).abs() < 1.0,
+                "progress jumped to a distant segment: {car:?}"
+            );
+            airborne |= !car.grounded;
+            if airborne && car.grounded {
+                break;
+            }
+        }
+        assert!(airborne && car.grounded);
+        assert!(car.position.z > 40.0 && car.position.z < 60.0);
+        assert!(
+            car.offroad,
+            "landed on invisible road inside the gap: {car:?}"
+        );
+        assert!((car.position.y - track.ground_height() - RIDE_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn curved_and_banked_gap_edges_follow_the_rendered_cross_section() {
+        for source in [
+            "right 45 radius 30\nright 45 radius 30 kind gap\nright 45 radius 30",
+            "straight 30\nramp 30 rise 9 bank 35\nright 45 radius 30 rise -9 bank -20 kind gap\nright 45 radius 30 bank 0",
+        ] {
+            let track = Track::parse(source).unwrap();
+            for pair in track
+                .samples
+                .windows(2)
+                .filter(|pair| (pair[0].kind == RoadKind::Gap) != (pair[1].kind == RoadKind::Gap))
+            {
+                let gate = pair[1];
+                let normal = horizontal(gate.right).cross(Vec3::Y).normalize();
+                for side in [-4.5, 0.0, 4.5] {
+                    for offset in [-0.1, 0.0, 0.1] {
+                        let position =
+                            gate.pos + gate.right * side + normal * offset + Vec3::Y * RIDE_HEIGHT;
+                        let road = nearest_road(
+                            &track,
+                            position,
+                            gate.distance,
+                            position.y + 1.0,
+                            track.ground_height(),
+                        )
+                        .expect("shared cross-section must not leave a contact hole");
+                        let expected = if offset < 0.0 {
+                            pair[0].kind
+                        } else {
+                            gate.kind
+                        };
+                        assert_eq!(
+                            road.sample.kind, expected,
+                            "wrong surface at distance {}, side {side}, offset {offset}",
+                            gate.distance,
+                        );
+                        if offset == 0.0 {
+                            assert!((road.sample.distance - gate.distance).abs() < 0.01);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

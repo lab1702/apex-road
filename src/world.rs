@@ -124,7 +124,6 @@ pub struct World {
 }
 impl World {
     pub fn new(track: &Track) -> Self {
-        let ground_y = track.ground_height();
         let material = load_material(
             ShaderSource::Glsl {
                 vertex: VERTEX,
@@ -142,6 +141,19 @@ impl World {
             },
         )
         .expect("OpenGL 2.1 world shader should compile");
+        Self {
+            chunks: Self::build_chunks(track),
+            material,
+        }
+    }
+
+    /// Course changes only replace geometry; the shared shader lives for the game.
+    pub fn rebuild(&mut self, track: &Track) {
+        self.chunks = Self::build_chunks(track);
+    }
+
+    fn build_chunks(track: &Track) -> Vec<Chunk> {
+        let ground_y = track.ground_height();
         let mut chunks = vec![];
         // Road, shoulders and architecture are spatially batched for cheap distance culling.
         for (chunk_index, points) in track
@@ -497,7 +509,7 @@ impl World {
                 distant: true,
             });
         }
-        Self { chunks, material }
+        chunks
     }
     pub fn draw(&self, camera: &crate::view::DriverCamera) {
         clear_background(SKY);
