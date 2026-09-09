@@ -14,7 +14,21 @@ pub const BUNDLED_PATHS: &[&str] = &[
 /// Select a source once, retaining its lexical absolute path for later reloads.
 /// Do not canonicalize: an editor may replace a file or retarget its symlink.
 pub fn resolve_track(path: &Path) -> Result<PathBuf, String> {
-    let selected = if path.exists() {
+    // Keep an existing directory entry selected even when it is a symlink
+    // whose target has gone missing. Following it here would silently replace
+    // an unavailable local override with the bundled namesake. Likewise, an
+    // inspection error must not make the requested file look absent.
+    let local_exists = match path.symlink_metadata() {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect track '{}': {error}",
+                path.display()
+            ));
+        }
+    };
+    let selected = if local_exists {
         path.to_owned()
     } else {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
@@ -186,6 +200,17 @@ mod tests {
             std::os::unix::fs::symlink(requested, alias).unwrap();
             let selected_alias = resolve_track(alias).unwrap();
             assert_eq!(selected_alias, std::env::current_dir().unwrap().join(alias));
+
+            // A dangling local symlink is still an explicit override. Report
+            // its load error instead of silently choosing the bundled file.
+            std::fs::remove_file(requested).unwrap();
+            std::os::unix::fs::symlink("missing.track", requested).unwrap();
+            assert_eq!(resolve_track(requested).unwrap(), selected);
+            assert!(crate::track::Track::load(resolve_track(requested).unwrap()).is_err());
+            assert_eq!(
+                next_path(&selected).unwrap(),
+                PathBuf::from(BUNDLED_PATHS[1])
+            );
         }
     }
 }

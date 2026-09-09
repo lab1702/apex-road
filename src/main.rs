@@ -262,11 +262,18 @@ impl RunRecords {
     }
 }
 
-fn restart_run(car: &mut Car, track: &Track, records: &mut RunRecords, autodrive: bool) -> Race {
+fn restart_run(
+    car: &mut Car,
+    track: &Track,
+    records: &mut RunRecords,
+    race: &mut Race,
+    autodrive: bool,
+) {
+    let last = race.last;
     car.reset_to_grid(track);
-    let mut race = records.start_race(car.distance, !autodrive);
+    *race = records.start_race(car.distance, !autodrive);
+    race.last = last;
     race.started = true;
-    race
 }
 
 async fn game(opts: Options, mut track: Track) -> Result<(), String> {
@@ -339,7 +346,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
         }
         if is_key_pressed(KeyCode::Enter) {
             if race.finished {
-                race = restart_run(&mut car, &track, &mut records, autodrive);
+                restart_run(&mut car, &track, &mut records, &mut race, autodrive);
                 mouse.reset();
             }
             race.started = true;
@@ -347,9 +354,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
             help = false;
         }
         if is_key_pressed(KeyCode::R) {
-            let last = race.last;
-            race = restart_run(&mut car, &track, &mut records, autodrive);
-            race.last = last;
+            restart_run(&mut car, &track, &mut records, &mut race, autodrive);
             accumulator = 0.;
             respawn_timer = 0.;
             mouse.reset();
@@ -448,7 +453,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
                     }
                 }
                 if !car.position.is_finite() || car.position.y < track.ground_height() - 30. {
-                    race = restart_run(&mut car, &track, &mut records, autodrive);
+                    restart_run(&mut car, &track, &mut records, &mut race, autodrive);
                     mouse.reset();
                     note = "BACK ON THE GRID".into();
                     note_time = 3.;
@@ -668,16 +673,42 @@ mod driving_checks {
 
                 // Taking over does not retroactively make the mixed run eligible.
                 assert_eq!(records.accept(Some(preview_best)), None);
-                race = restart_run(&mut car, &track, &mut records, false);
+                restart_run(&mut car, &track, &mut records, &mut race, false);
                 assert_eq!(race.best, persisted_best);
                 let manual_best =
                     finish_straight_run(&track, &mut car, &mut race, &mut records, 0.7).unwrap();
                 assert!(manual_best > preview_best);
                 assert_eq!(records.best, Some(manual_best));
 
-                race = restart_run(&mut car, &track, &mut records, false);
+                restart_run(&mut car, &track, &mut records, &mut race, false);
                 assert_eq!(race.best, Some(manual_best));
             }
+        }
+    }
+
+    #[test]
+    fn restarting_a_finished_sprint_preserves_its_last_time() {
+        let track = Track::parse("straight 40").unwrap();
+        let mut car = Car::new(&track);
+        let mut records = RunRecords::new(None);
+        let mut race = records.start_race(car.distance, true);
+        race.started = true;
+        let completed = finish_straight_run(&track, &mut car, &mut race, &mut records, 0.7);
+        assert!(completed.is_some());
+        assert_eq!(race.last, completed);
+
+        // Enter after finishing, R, and automatic recovery share this reset.
+        // A second reset before finishing must retain the same completed time.
+        for _ in 0..2 {
+            restart_run(&mut car, &track, &mut records, &mut race, false);
+            assert!(race.started && !race.finished && !race.invalid);
+            assert_eq!(race.last, completed);
+            assert_eq!(race.best, completed);
+            assert_eq!(race.elapsed, 0.);
+            assert_eq!(race.completed_runs, 0);
+            assert_eq!(race.next_checkpoint, 0);
+            assert_eq!(car.distance, Car::new(&track).distance);
+            race.update(&track, 1. / 120., car.distance, true);
         }
     }
 
@@ -686,8 +717,9 @@ mod driving_checks {
         let track = Track::parse("straight 40").unwrap();
         let mut car = Car::new(&track);
         let mut records = RunRecords::new(Some(60.));
+        let mut race = records.start_race(car.distance, false);
         for _ in 0..2 {
-            let mut race = restart_run(&mut car, &track, &mut records, true);
+            restart_run(&mut car, &track, &mut records, &mut race, true);
             assert_eq!(
                 finish_straight_run(&track, &mut car, &mut race, &mut records, 1.),
                 None
