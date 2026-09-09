@@ -301,22 +301,28 @@ impl Car {
                         .map(|contact| (contact, true))
                     })
                 })
-                .or_else(|| {
-                    // Outside an open start or finish there is no preceding
-                    // road to seed the sweep. The crossed endpoint only
-                    // bounds the search; finite triangles still prove a hit.
-                    open_track_entry_road(track, before, self.position).and_then(|from| {
-                        road_entry_contact_before_exit(
-                            track,
-                            from,
-                            new_road,
-                            before,
-                            self.position,
-                            ground_height,
-                        )
-                        .map(|contact| (contact, true))
-                    })
-                })
+                .into_iter()
+                .chain(
+                    open_track_entry_roads(track, before, self.position)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|from| {
+                            // Outside an open start or finish there is no preceding
+                            // road to seed the sweep. Either endpoint plane may be
+                            // crossed away from its road, so select the earliest
+                            // proven finite contact among both candidates.
+                            road_entry_contact_before_exit(
+                                track,
+                                from,
+                                new_road,
+                                before,
+                                self.position,
+                                ground_height,
+                            )
+                            .map(|contact| (contact, true))
+                        }),
+                )
+                .min_by(|a, b| a.0.2.total_cmp(&b.0.2))
         {
             self.resolve_landing(surface);
             if entering {
@@ -607,13 +613,22 @@ impl Car {
         // An inward path can traverse a short endpoint deck and its rail in
         // one step while neither endpoint has a road contact. Seed that sweep
         // from the crossed open endpoint, as for finite road-surface landings.
-        let previous_road =
-            previous_road.or_else(|| open_track_entry_road(track, before, self.position));
-        let swept_hit = previous_road.and_then(|prior| {
-            let destination =
-                road.unwrap_or_else(|| guardrail_exit_road(track, prior, before, self.position));
-            guardrail_sweep(track, prior, destination, before, self.position)
-        });
+        let swept_hit = previous_road
+            .into_iter()
+            .chain(
+                open_track_entry_roads(track, before, self.position)
+                    .into_iter()
+                    .flatten(),
+            )
+            .filter_map(|prior| {
+                let destination = road
+                    .unwrap_or_else(|| guardrail_exit_road(track, prior, before, self.position));
+                guardrail_sweep(track, prior, destination, before, self.position)
+            })
+            .min_by(|a, b| {
+                a.0.distance_squared(before)
+                    .total_cmp(&b.0.distance_squared(before))
+            });
         let (normal, outward) = if let Some((hit, normal, outward)) = swept_hit {
             // Stop at the wall that was crossed. On a taper, shunting all
             // the way to the final narrow cross-section would teleport
@@ -669,19 +684,19 @@ impl Car {
     }
 }
 
-/// Seed an inward sweep at an open endpoint even when the preceding position
-/// has no road lookup. This does not extend the endpoint's collision footprint.
-fn open_track_entry_road(track: &Track, before: Vec3, after: Vec3) -> Option<RoadPoint> {
+/// Seed inward sweeps at open endpoints even when the preceding position has
+/// no road lookup. Both candidates need finite collision tests: an unrelated
+/// endpoint's infinite plane may be crossed first, away from its actual road.
+fn open_track_entry_roads(track: &Track, before: Vec3, after: Vec3) -> [Option<RoadPoint>; 2] {
     if track.closed || track.samples.len() < 2 {
-        return None;
+        return [None, None];
     }
     let last = track.samples.len() - 1;
     [
         (0, track.samples[0], 1.0),
         (last - 1, track.samples[last], -1.0),
     ]
-    .into_iter()
-    .filter_map(|(index, sample, direction)| {
+    .map(|(index, sample, direction)| {
         let normal = horizontal(sample.right).cross(Vec3::Y).normalize() * direction;
         let start = horizontal(before - sample.pos).dot(normal);
         let end = horizontal(after - sample.pos).dot(normal);
@@ -693,19 +708,14 @@ fn open_track_entry_road(track: &Track, before: Vec3, after: Vec3) -> Option<Roa
         let plane_height =
             sample.pos.y - horizontal(crossing - sample.pos).dot(sample.up) / sample.up.y.max(0.15);
         let contact = vec3(crossing.x, plane_height, crossing.z);
-        Some((
-            fraction,
-            RoadPoint {
-                sample,
-                index,
-                lateral: (contact - sample.pos).dot(sample.right),
-                plane_height,
-                swept_contact: false,
-            },
-        ))
+        Some(RoadPoint {
+            sample,
+            index,
+            lateral: (contact - sample.pos).dot(sample.right),
+            plane_height,
+            swept_contact: false,
+        })
     })
-    .min_by(|a, b| a.0.total_cmp(&b.0))
-    .map(|(_, road)| road)
 }
 
 /// An endpoint outside every road footprint can still have crossed a rail.
@@ -2919,6 +2929,78 @@ mod tests {
                 car.update(&track, Control::default(), STEP);
                 assert!((car.position.y - RIDE_HEIGHT).abs() < 0.001, "{car:?}");
                 assert!(car.velocity.y.abs() < 0.001 && car.impact > 0.0, "{car:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelated_endpoint_plane_cannot_hide_a_bridge_corner_landing() {
+        for (turn, side) in [("left", -1.0), ("right", 1.0)] {
+            for entering_finish in [false, true] {
+                let final_length = if entering_finish { 99.95 } else { 100.05 };
+                let track = Track::parse(&format!(
+                    "bridge 100\n{turn} 180 radius 30 kind bridge\nbridge {final_length}"
+                ))
+                .unwrap();
+                let endpoint = if entering_finish {
+                    *track.samples.last().unwrap()
+                } else {
+                    track.samples[0]
+                };
+                let mut car = Car::new(&track);
+                car.position = endpoint.pos + vec3(side * 5.85, RIDE_HEIGHT + 0.6, -0.1);
+                car.distance = endpoint.distance;
+                car.velocity = vec3(side * 28.0, -160.0, 28.0);
+                car.grounded = false;
+                car.update(&track, Control::default(), STEP);
+                assert!((car.position.y - RIDE_HEIGHT).abs() < 0.001, "{car:?}");
+                assert!(car.velocity.y.abs() < 0.001 && car.impact > 0.0, "{car:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_overhead_endpoint_plane_cannot_hide_a_lower_bridge_corner_landing() {
+        let track = Track::parse(
+            "start 0 20 0\nbridge 20\nright 180 radius 8 kind bridge\nbridge 20\nright 180 radius 16 rise -20 kind bridge\nbridge 20\nright 180 radius 8 kind bridge\nbridge 19.95",
+        ).unwrap();
+        let endpoint = *track.samples.last().unwrap();
+        let mut car = Car::new(&track);
+        car.position = endpoint.pos + vec3(5.85, RIDE_HEIGHT + 0.6, -0.1);
+        car.distance = endpoint.distance;
+        car.velocity = vec3(28.0, -160.0, 28.0);
+        car.grounded = false;
+        car.update(&track, Control::default(), STEP);
+        assert!((car.position.y - RIDE_HEIGHT).abs() < 0.01, "{car:?}");
+        assert!(car.velocity.y.abs() < 0.01 && car.impact > 0.0, "{car:?}");
+    }
+
+    #[test]
+    fn an_unrelated_endpoint_plane_cannot_hide_a_guardrail_impact() {
+        for kind in ["bridge", "tunnel"] {
+            for (turn, side) in [("left", -1.0), ("right", 1.0)] {
+                for entering_finish in [false, true] {
+                    let final_length = if entering_finish { 99.95 } else { 100.05 };
+                    let track = Track::parse(&format!(
+                        "{kind} 100\n{turn} 180 radius 30 kind {kind}\n{kind} {final_length}"
+                    ))
+                    .unwrap();
+                    let endpoint = if entering_finish {
+                        *track.samples.last().unwrap()
+                    } else {
+                        track.samples[0]
+                    };
+                    let mut car = Car::new(&track);
+                    car.position = endpoint.pos + vec3(side * 5.05, RIDE_HEIGHT + 0.2, -0.09);
+                    car.distance = endpoint.distance;
+                    car.velocity = vec3(side * 28.0, 0.0, 28.0);
+                    car.grounded = false;
+                    car.update(&track, Control::default(), STEP);
+                    assert!(car.velocity.x * side < 0.0 && car.impact > 0.0, "{car:?}");
+                    // Stop forward progress at the wall crossing; a local
+                    // correction at the endpoint leaves the car past it.
+                    assert!(car.position.z < endpoint.pos.z + 0.05, "{car:?}");
+                }
             }
         }
     }
