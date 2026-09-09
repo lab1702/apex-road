@@ -108,8 +108,9 @@ overlap; the parser does not check all-world intersections.
 
 Checkpoints must be driven in order. Start and finish are implicit; place
 interior checkpoints at useful road boundaries. They must be at least 10 m
-from the start, finish, and one another. Do not place a checkpoint at the end
-of a gap. When none are supplied, the parser inserts gates at one-quarter,
+from the start, finish, and one another. Do not place a checkpoint at the start
+or end of a gap; put it on solid road before the launch or after a landing road.
+When none are supplied, the parser inserts gates at one-quarter,
 one-half and three-quarters of the route, skipping positions inside gaps.
 
 `close` does **not** invent a connector or teleport the road. Before it, build
@@ -136,6 +137,8 @@ close
 - A track must be at least 20 m long, at most 50 km, with at most 25001 samples.
   Track files are limited to 1 MB; name and description each to 500 bytes.
 - Roads are sampled about every 2 m (more densely on elevation transitions).
+  Even short elevation transitions include interior samples so their hills
+  and incoming ramp slopes remain represented in the driving surface.
   Timing distances use the resulting **3D centerline distance**, so an uphill
   `straight 100` can contribute slightly more than 100 m to course length.
 - Put a straight after the final corner to allow braking before a sprint ends.

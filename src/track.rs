@@ -61,7 +61,7 @@ impl Track {
                 continue;
             }
             builder
-                .command(&tokens)
+                .command(&tokens, line_number)
                 .map_err(|e| format!("Line {line_number}: {e}"))?;
         }
         builder.finish()
@@ -121,6 +121,7 @@ struct Builder {
     grade: f32,
     target_width: f32,
     default_kind: RoadKind,
+    checkpoint_lines: Vec<usize>,
     ended: bool,
 }
 
@@ -147,11 +148,12 @@ impl Builder {
             grade: 0.0,
             target_width: 12.0,
             default_kind: RoadKind::Road,
+            checkpoint_lines: Vec::new(),
             ended: false,
         }
     }
 
-    fn command(&mut self, tokens: &[String]) -> Result<(), String> {
+    fn command(&mut self, tokens: &[String], line_number: usize) -> Result<(), String> {
         let cmd = tokens[0].as_str();
         let args = &tokens[1..];
         if self.ended {
@@ -226,6 +228,7 @@ impl Builder {
                     return Err("Place a checkpoint after a landing road, not inside or at the end of a gap".into());
                 }
                 self.track.checkpoints.push(d);
+                self.checkpoint_lines.push(line_number);
             }
             "finish" | "close" => {
                 exact_args(cmd, args, 0)?;
@@ -330,7 +333,11 @@ impl Builder {
         };
         let steps =
             (length * (1.0 + self.grade.abs() + end_grade.abs()) / SAMPLE_SPACING).ceil() as usize;
-        let steps = steps.max(1);
+        // Sampling only a short hill's level endpoints erases its slope from
+        // the road frame. Capture the interior of every elevation transition,
+        // including a level target that eases out of an incoming ramp slope.
+        let elevation_transition = rise != 0.0 || self.grade != 0.0 || end_grade != 0.0;
+        let steps = steps.max(if elevation_transition { 4 } else { 1 });
         if self.track.samples.len() + steps > MAX_SAMPLES {
             return Err(format!(
                 "Track exceeds the {} sample limit; shorten the route",
@@ -434,6 +441,15 @@ impl Builder {
         }
         if self.track.samples[self.track.samples.len() - 2].kind == RoadKind::Gap {
             return Err("Track must finish on a drivable road, not a gap".into());
+        }
+        // A later road command sets the outgoing kind at an existing gate, so
+        // its launch-side validation must wait until the route is complete.
+        for (&distance, &line_number) in self.track.checkpoints.iter().zip(&self.checkpoint_lines) {
+            if self.track.sample_at(distance).kind == RoadKind::Gap {
+                return Err(format!(
+                    "Line {line_number}: Place a checkpoint on solid road before the launch or after a landing road, not at the start of a gap"
+                ));
+            }
         }
         if self
             .track
@@ -708,6 +724,67 @@ mod tests {
         assert!(Track::parse("gap 30\nstraight 40").is_err());
         assert!(Track::parse("straight 40\ngap 20").is_err());
         assert!(Track::parse("straight 40\nstart 0 0 0").is_err());
+    }
+
+    #[test]
+    fn checkpoints_are_validated_after_the_following_road_kind_is_known() {
+        for gap_command in ["gap 14 rise -2.5", "straight 14 rise -2.5 kind gap"] {
+            let text =
+                format!("straight 100\nramp 24 rise 2.5\ncheckpoint\n{gap_command}\nstraight 100");
+            let error = Track::parse(&text).unwrap_err();
+            assert!(error.starts_with("Line 3:"), "{error}");
+            assert!(error.contains("at the start of a gap"), "{error}");
+        }
+        assert!(
+            Track::parse(
+                "straight 100\ncheckpoint\nramp 24 rise 2.5\ngap 14 rise -2.5\nstraight 20\ncheckpoint\nstraight 100"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn short_hills_retain_their_surface_slope_and_downhill_gravity() {
+        let track = Track::parse("straight 20\nstraight 2 rise 1\nstraight 20").unwrap();
+        let interior: Vec<_> = track
+            .samples
+            .windows(3)
+            .filter(|samples| samples[1].pos.z > 20.0 && samples[1].pos.z < 22.0)
+            .collect();
+        assert!(interior.len() >= 3);
+        for samples in &interior {
+            let geometric_forward = (samples[2].pos - samples[0].pos).normalize();
+            assert!(samples[1].forward.y > 0.4);
+            assert!(samples[1].forward.distance(geometric_forward) < 0.07);
+        }
+        let middle = interior[interior.len() / 2][1];
+        let mut car = crate::vehicle::Car::new(&track);
+        car.reset(&track, middle.distance);
+        for _ in 0..30 {
+            car.update(&track, crate::vehicle::Control::default(), 1.0 / 120.0);
+        }
+        assert!(car.position.z < middle.pos.z - 0.02);
+        assert!(car.velocity.z < -0.2);
+    }
+
+    #[test]
+    fn short_level_target_retains_its_incoming_ramp_transition() {
+        let track = Track::parse("straight 20\nramp 2 rise 1\nstraight 1\nstraight 20").unwrap();
+        let transition: Vec<_> = track
+            .samples
+            .iter()
+            .filter(|sample| sample.pos.z > 22.0 && sample.pos.z < 23.0)
+            .collect();
+        assert!(transition.len() >= 3);
+        assert!(transition.iter().any(|sample| sample.pos.y > 1.05));
+        assert!(transition.iter().any(|sample| sample.forward.y < -0.1));
+        let end = track
+            .samples
+            .iter()
+            .find(|sample| sample.pos.z == 23.0)
+            .unwrap();
+        assert_eq!(end.pos.y, 1.0);
+        assert_eq!(end.forward.y, 0.0);
     }
 
     #[test]

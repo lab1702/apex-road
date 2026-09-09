@@ -201,8 +201,41 @@ fn demo_control(car: &Car, track: &Track) -> Control {
         handbrake: false,
     }
 }
-fn grid_distance(track: &Track) -> f32 {
-    if track.closed { 0. } else { 5. }
+/// Keep legitimate records separate from the best time displayed during a preview.
+struct RunRecords {
+    best: Option<f32>,
+    eligible: bool,
+}
+
+impl RunRecords {
+    fn new(best: Option<f32>) -> Self {
+        Self {
+            best,
+            eligible: false,
+        }
+    }
+
+    fn start_race(&mut self, distance: f32, eligible: bool) -> Race {
+        self.eligible = eligible;
+        Race::new(self.best, distance)
+    }
+
+    fn accept(&mut self, candidate: Option<f32>) -> Option<f32> {
+        if !self.eligible {
+            return None;
+        }
+        if let Some(best) = candidate {
+            self.best = Some(best);
+        }
+        candidate
+    }
+}
+
+fn restart_run(car: &mut Car, track: &Track, records: &mut RunRecords, autodrive: bool) -> Race {
+    car.reset_to_grid(track);
+    let mut race = records.start_race(car.distance, !autodrive);
+    race.started = true;
+    race
 }
 
 async fn game(opts: Options, mut track: Track) {
@@ -215,7 +248,8 @@ async fn game(opts: Options, mut track: Track) {
         car.reset(&track, at.min(track.length - 5.));
     }
     let mut record_file = record_path(&path);
-    let mut race = Race::new(read_record(&record_file), car.distance);
+    let mut records = RunRecords::new(read_record(&record_file));
+    let mut race = records.start_race(car.distance, !opts.autodrive && opts.at.is_none());
     race.started = opts.autodrive;
     let mut paused = false;
     let mut help = false;
@@ -232,7 +266,6 @@ async fn game(opts: Options, mut track: Track) {
     let mut focus = input::WindowFocus::new();
     let input_subscriber = macroquad::input::utils::register_input_subscriber();
     let mut autodrive = opts.autodrive;
-    let preview = opts.at.is_some() || opts.autodrive;
     let fixed = 1. / 120.;
     loop {
         if is_quit_requested() {
@@ -271,8 +304,7 @@ async fn game(opts: Options, mut track: Track) {
         }
         if is_key_pressed(KeyCode::Enter) {
             if race.finished {
-                car.reset(&track, grid_distance(&track));
-                race = Race::new(race.best, car.distance);
+                race = restart_run(&mut car, &track, &mut records, autodrive);
                 mouse.reset();
             }
             race.started = true;
@@ -280,11 +312,9 @@ async fn game(opts: Options, mut track: Track) {
             help = false;
         }
         if is_key_pressed(KeyCode::R) {
-            car.reset(&track, grid_distance(&track));
             let last = race.last;
-            race = Race::new(race.best, car.distance);
+            race = restart_run(&mut car, &track, &mut records, autodrive);
             race.last = last;
-            race.started = true;
             accumulator = 0.;
             respawn_timer = 0.;
             mouse.reset();
@@ -306,7 +336,8 @@ async fn game(opts: Options, mut track: Track) {
                     path = next;
                     car = Car::new(&track);
                     record_file = record_path(&path);
-                    race = Race::new(read_record(&record_file), car.distance);
+                    records = RunRecords::new(read_record(&record_file));
+                    race = records.start_race(car.distance, !autodrive);
                     race.started = autodrive;
                     camera_pitch = car.pitch;
                     camera_roll = car.roll;
@@ -355,9 +386,8 @@ async fn game(opts: Options, mut track: Track) {
             };
             while accumulator >= fixed {
                 car.update(&track, control, fixed);
-                if let Some(best) = race.update(&track, fixed, car.distance, !car.offroad)
-                    && !preview
-                {
+                let candidate = race.update(&track, fixed, car.distance, !car.offroad);
+                if let Some(best) = records.accept(candidate) {
                     if let Err(e) = save_record(&record_file, best) {
                         note = format!("Record could not be saved: {e}");
                         note_time = 8.;
@@ -367,9 +397,7 @@ async fn game(opts: Options, mut track: Track) {
                     }
                 }
                 if !car.position.is_finite() || car.position.y < track.ground_height() - 30. {
-                    car.reset(&track, grid_distance(&track));
-                    race = Race::new(race.best, car.distance);
-                    race.started = true;
+                    race = restart_run(&mut car, &track, &mut records, autodrive);
                     mouse.reset();
                     note = "BACK ON THE GRID".into();
                     note_time = 3.;
@@ -477,6 +505,82 @@ async fn game(opts: Options, mut track: Track) {
 mod driving_checks {
     use super::*;
     use macroquad::camera::Camera;
+
+    fn finish_straight_run(
+        track: &Track,
+        car: &mut Car,
+        race: &mut Race,
+        records: &mut RunRecords,
+        throttle: f32,
+    ) -> Option<f32> {
+        let mut accepted = None;
+        for _ in 0..1200 {
+            car.update(
+                track,
+                Control {
+                    throttle,
+                    ..Control::default()
+                },
+                1. / 120.,
+            );
+            let candidate = race.update(track, 1. / 120., car.distance, !car.offroad);
+            accepted = records.accept(candidate).or(accepted);
+            if race.finished {
+                break;
+            }
+        }
+        assert!(race.finished && !race.invalid);
+        accepted
+    }
+
+    #[test]
+    fn fresh_manual_runs_can_record_after_autodrive_or_position_previews() {
+        let track = Track::parse("straight 40").unwrap();
+        for (autodrive, at) in [(true, None), (false, Some(6.))] {
+            for persisted_best in [None, Some(60.)] {
+                let mut car = Car::new(&track);
+                if let Some(at) = at {
+                    car.reset(&track, at);
+                }
+                let mut records = RunRecords::new(persisted_best);
+                let mut race = records.start_race(car.distance, !autodrive && at.is_none());
+                race.started = true;
+                assert_eq!(
+                    finish_straight_run(&track, &mut car, &mut race, &mut records, 1.),
+                    None
+                );
+                let preview_best = race.best.unwrap();
+                assert_eq!(records.best, persisted_best);
+
+                // Taking over does not retroactively make the mixed run eligible.
+                assert_eq!(records.accept(Some(preview_best)), None);
+                race = restart_run(&mut car, &track, &mut records, false);
+                assert_eq!(race.best, persisted_best);
+                let manual_best =
+                    finish_straight_run(&track, &mut car, &mut race, &mut records, 0.7).unwrap();
+                assert!(manual_best > preview_best);
+                assert_eq!(records.best, Some(manual_best));
+
+                race = restart_run(&mut car, &track, &mut records, false);
+                assert_eq!(race.best, Some(manual_best));
+            }
+        }
+    }
+
+    #[test]
+    fn restarting_an_active_demonstration_keeps_records_ineligible() {
+        let track = Track::parse("straight 40").unwrap();
+        let mut car = Car::new(&track);
+        let mut records = RunRecords::new(Some(60.));
+        for _ in 0..2 {
+            let mut race = restart_run(&mut car, &track, &mut records, true);
+            assert_eq!(
+                finish_straight_run(&track, &mut car, &mut race, &mut records, 1.),
+                None
+            );
+            assert_eq!(records.best, Some(60.));
+        }
+    }
 
     #[test]
     fn arrow_and_letter_keys_steer_in_their_screen_direction() {

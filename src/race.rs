@@ -56,6 +56,9 @@ impl Race {
             }
             if delta > track.length * 0.5 {
                 delta -= track.length;
+                // Returning across the start backwards cannot complete the
+                // current lap by immediately crossing forwards again.
+                self.invalid = true;
             }
         }
         if delta.abs() > 12. {
@@ -198,8 +201,10 @@ mod tests {
         race.started = true;
         race.update(&track, 0.1, gate - 2.0, true);
         assert_eq!(race.next_checkpoint, 0);
+        assert!(!race.invalid);
         race.update(&track, 0.1, gate + 2.0, true);
         assert_eq!(race.next_checkpoint, 1);
+        assert!(!race.invalid);
 
         let mut race = Race::new(None, 2.0);
         race.started = true;
@@ -207,7 +212,37 @@ mod tests {
         race.update(&track, 0.1, track.length - 2.0, true);
         assert!(race.last.is_none());
         assert!(race.best.is_none());
+        assert!(race.invalid);
         assert_eq!(race.next_checkpoint, track.checkpoints.len());
+    }
+
+    #[test]
+    fn reversing_over_start_cannot_finish_a_shortcut_but_next_full_lap_can() {
+        let track = Track::parse(
+            "straight 20\ncheckpoint\nstraight 180\nright 180 radius 20\nstraight 200\nright 180 radius 20\nclose",
+        )
+        .unwrap();
+        let mut race = Race::new(Some(100.0), 0.0);
+        race.started = true;
+        assert!(advance(&mut race, &track, 0.0, 22.0, 10.0).is_empty());
+        assert_eq!(race.next_checkpoint, track.checkpoints.len());
+
+        // Each step is small and on course, so only the backwards start-line
+        // crossing distinguishes this shortcut from an ordinary valid lap.
+        for distance in (-1..=21).rev() {
+            assert!(race.update(&track, 0.1, distance as f32, true).is_none());
+        }
+        assert!(race.invalid);
+        assert!(race.update(&track, 0.1, 0.0, true).is_none());
+        assert_eq!(race.best, Some(100.0));
+        assert!(race.last.is_none());
+        assert!(!race.invalid);
+        assert_eq!(race.next_checkpoint, 0);
+
+        let records = advance(&mut race, &track, 0.0, track.length, 10.0);
+        assert_eq!(records.len(), 1);
+        assert!((records[0] - track.length / 10.0).abs() < 0.001);
+        assert_eq!(race.last, race.best);
     }
 
     #[test]

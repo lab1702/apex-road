@@ -116,6 +116,9 @@ Auto-drive starts immediately and stays enabled when switching tracks with
 the finish. Press **R** to run a sprint again. Auto-drive does not save records.
 Right click to take manual control with the mouse; this turns off the auto
 driver for the rest of the session. Right click again to switch to keyboard.
+After taking control, press **R** to start a fresh run that can save records.
+Restarting after a `--at` preview also restores record saving. Switching or
+reloading courses uses the current driving mode to determine record eligibility.
 
 ## Build a track in text
 

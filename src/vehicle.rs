@@ -100,15 +100,18 @@ impl Car {
             longitudinal_acceleration: 0.0,
             reverse_hold: 0.0,
         };
-        car.reset(
-            track,
-            if track.closed {
-                0.0
-            } else {
-                5.0_f32.min(track.length * 0.1)
-            },
-        );
+        car.reset_to_grid(track);
         car
+    }
+
+    /// Use the same starting grid for the first run, restarts, and track changes.
+    pub fn reset_to_grid(&mut self, track: &Track) {
+        let distance = if track.closed {
+            0.0
+        } else {
+            5.0_f32.min(track.length * 0.1)
+        };
+        self.reset(track, distance);
     }
 
     pub fn reset(&mut self, track: &Track, distance: f32) {
@@ -223,7 +226,7 @@ impl Car {
         if let Some(road) = new_road {
             self.road_index = road.index;
             self.distance = road.sample.distance;
-            self.resolve_guardrail(road, before, was_grounded);
+            self.resolve_guardrail(road, before);
         }
         // Do not attach to an overpass that is above the car. The preceding
         // position provides a swept, one-sided contact test at landings.
@@ -402,12 +405,14 @@ impl Car {
         self.slip += (sliding - self.slip) * (1.0 - (-8.0 * dt).exp());
     }
 
-    fn resolve_guardrail(&mut self, road: RoadPoint, before: Vec3, was_grounded: bool) {
+    fn resolve_guardrail(&mut self, road: RoadPoint, before: Vec3) {
         if !matches!(road.sample.kind, RoadKind::Bridge | RoadKind::Tunnel) {
             return;
         }
         let clearance = self.position.y - RIDE_HEIGHT - road.plane_height;
-        if !(was_grounded || (-0.45..0.85).contains(&clearance)) {
+        // Ground contact may belong to terrain beneath an overpass; only a
+        // car at the deck's height can hit its guardrails.
+        if !(-0.45..0.85).contains(&clearance) {
             return;
         }
         let limit = (road.sample.width * 0.5 - CAR_HALF_WIDTH).max(0.5);
@@ -596,6 +601,44 @@ mod tests {
 
     fn wide_straight() -> Track {
         Track::parse("width 40\nstraight 1000").unwrap()
+    }
+
+    #[test]
+    fn grid_restart_matches_initial_run_on_short_sprints_and_circuits() {
+        for (source, expected_distance) in [
+            ("straight 20", 2.0),
+            ("straight 40", 4.0),
+            ("straight 100", 5.0),
+            (include_str!("../tracks/club.track"), 0.0),
+        ] {
+            let track = Track::parse(source).unwrap();
+            let mut initial = Car::new(&track);
+            let mut restarted = initial.clone();
+            advance(
+                &mut restarted,
+                &track,
+                Control {
+                    throttle: 1.0,
+                    steer: 0.7,
+                    ..Control::default()
+                },
+                1.0,
+            );
+            restarted.reset_to_grid(&track);
+            assert_eq!(initial.distance, expected_distance);
+            assert_eq!(restarted.distance, expected_distance);
+            for _ in 0..120 {
+                let control = Control {
+                    throttle: 1.0,
+                    ..Control::default()
+                };
+                initial.update(&track, control, STEP);
+                restarted.update(&track, control, STEP);
+                assert_eq!(restarted.position, initial.position);
+                assert_eq!(restarted.velocity, initial.velocity);
+                assert_eq!(restarted.distance, initial.distance);
+            }
+        }
     }
 
     #[test]
@@ -842,18 +885,37 @@ mod tests {
     }
 
     #[test]
-    fn bridge_guardrail_rebounds_without_teleporting_or_stopping_forward_motion() {
-        let track = Track::parse("start 0 8 0\nbridge 160").unwrap();
-        let mut car = Car::new(&track);
-        car.reset(&track, 20.0);
-        car.position.x = 4.9;
-        car.velocity = vec3(8.0, 0.0, 22.0);
-        advance(&mut car, &track, Control::default(), 0.15);
-        assert!(car.position.x <= 6.0 - CAR_HALF_WIDTH + 0.01);
-        assert!(car.velocity.x < 0.0);
-        assert!(car.velocity.z > 17.0);
-        assert!(car.impact > 0.1);
-        assert!((car.position.y - 8.0 - RIDE_HEIGHT).abs() < 0.03);
+    fn bridge_and_tunnel_guardrails_rebound_without_teleporting_or_stopping_forward_motion() {
+        for kind in ["bridge", "tunnel"] {
+            let track = Track::parse(&format!("start 0 8 0\n{kind} 160")).unwrap();
+            let mut car = Car::new(&track);
+            car.reset(&track, 20.0);
+            car.position.x = 4.9;
+            car.velocity = vec3(8.0, 0.0, 22.0);
+            advance(&mut car, &track, Control::default(), 0.15);
+            assert!(car.position.x <= 6.0 - CAR_HALF_WIDTH + 0.01);
+            assert!(car.velocity.x < 0.0);
+            assert!(car.velocity.z > 17.0);
+            assert!(car.impact > 0.1);
+            assert!((car.position.y - 8.0 - RIDE_HEIGHT).abs() < 0.03);
+        }
+    }
+
+    #[test]
+    fn car_on_terrain_passes_under_bridge_and_tunnel_guardrails() {
+        for kind in ["bridge", "tunnel"] {
+            let track = Track::parse(&format!("start 0 8 0\n{kind} 160")).unwrap();
+            let mut car = Car::new(&track);
+            car.reset(&track, 20.0);
+            car.position = vec3(4.9, track.ground_height() + RIDE_HEIGHT, 20.0);
+            car.velocity = vec3(8.0, 0.0, 22.0);
+            advance(&mut car, &track, Control::default(), 0.25);
+            assert!(car.position.x > 6.0, "blocked below {kind}: {car:?}");
+            assert!(car.velocity.x > 0.0);
+            assert_eq!(car.impact, 0.0);
+            assert!(car.grounded && car.offroad);
+            assert!((car.position.y - track.ground_height() - RIDE_HEIGHT).abs() < 0.01);
+        }
     }
 
     #[test]
