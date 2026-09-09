@@ -761,7 +761,7 @@ fn nearest_road(
             // banked hill, the road's right vector has a longitudinal
             // horizontal component, so projecting onto the centerline can
             // move progress by metres just from steering across the deck.
-            // The interpolated cross-section gives a quadratic in `along`;
+            // The interpolated raw frame gives a quadratic in `along`;
             // this stable root crosses from the positive start half-plane to
             // the negative end half-plane and also handles a linear segment.
             let start_normal = horizontal(a.right).cross(Vec3::Y);
@@ -771,14 +771,42 @@ fn nearest_road(
             let linear = offset.dot(normal_change) - chord.dot(start_normal);
             let constant = offset.dot(start_normal);
             let discriminant = (linear * linear - 4.0 * quadratic * constant).max(0.0);
-            (2.0 * constant / (-linear + discriminant.sqrt())).clamp(0.0, 1.0)
+            let along = (2.0 * constant / (-linear + discriminant.sqrt())).clamp(0.0, 1.0);
+            let forward = a.forward.lerp(b.forward, along);
+            let right = a.right.lerp(b.right, along);
+            if forward.dot(right).abs() <= 0.000001 {
+                along
+            } else {
+                // sample_at removes the interpolated right axis's forward
+                // component. On banked hills that changes the cross-section
+                // direction, so the raw-axis quadratic is only an estimate.
+                // Solve the same orthogonalized frame used by the renderer;
+                // otherwise lateral motion alone changes timing progress.
+                let mut lower = 0.0;
+                let mut upper = 1.0;
+                for _ in 0..16 {
+                    let middle = (lower + upper) * 0.5;
+                    let forward = a.forward.lerp(b.forward, middle);
+                    let right = a.right.lerp(b.right, middle);
+                    let right = right - forward * (forward.dot(right) / forward.length_squared());
+                    let normal = horizontal(right).cross(Vec3::Y);
+                    let offset = horizontal(position - a.pos.lerp(b.pos, middle));
+                    if offset.dot(normal) > 0.0 {
+                        lower = middle;
+                    } else {
+                        upper = middle;
+                    }
+                }
+                (lower + upper) * 0.5
+            }
         };
         let pos = a.pos.lerp(b.pos, along);
         let forward = a.forward.lerp(b.forward, along).normalize_or_zero();
-        let right = a.right.lerp(b.right, along).normalize_or_zero();
-        // Interpolated frame axes need not remain orthogonal. In particular,
-        // independently blending up on a short banked hill tilts its plane
-        // away from this cross-section and shifts the tire contact height.
+        let right = a.right.lerp(b.right, along);
+        let right = (right - forward * right.dot(forward)).normalize_or_zero();
+        // Use the same orthonormal frame as sample_at. Independently
+        // blending up on a short banked hill would tilt the contact plane
+        // away from the rendered cross-section.
         let up = forward.cross(right).normalize_or_zero();
         let width = a.width + (b.width - a.width) * along;
         let distance = a.distance + (b.distance - a.distance) * along;
@@ -1196,6 +1224,49 @@ mod tests {
 
     fn wide_straight() -> Track {
         Track::parse("width 40\nstraight 1000").unwrap()
+    }
+
+    #[test]
+    fn banking_hill_turns_match_rendered_cross_sections_across_the_deck() {
+        for turn in ["right", "left"] {
+            for rise in [-26.87807, 26.87807] {
+                for bank in [-60, 60] {
+                    let track = Track::parse(&format!(
+                        "width 40\nstraight 20 bank {}\n{turn} 140 radius 22 rise {rise} bank {bank}\nstraight 20",
+                        -bank
+                    ))
+                    .unwrap();
+                    // This interior cross-section changes heading, grade,
+                    // and bank together, well away from a segment boundary.
+                    let distance = (track.samples[46].distance + track.samples[47].distance) * 0.5;
+                    let sample = track.sample_at(distance);
+                    for lateral in [-16.0, 0.0, 16.0] {
+                        let contact = sample.pos + sample.right * lateral;
+                        let road = nearest_road(
+                            &track,
+                            contact + Vec3::Y * RIDE_HEIGHT,
+                            distance,
+                            contact.y + CONTACT_TOLERANCE,
+                            track.ground_height(),
+                            None,
+                        )
+                        .unwrap();
+                        assert!(
+                            (road.sample.distance - distance).abs() < 0.001,
+                            "lateral position changed progress on {turn}, rise {rise}, bank {bank}, lateral {lateral}: {} versus {distance}",
+                            road.sample.distance
+                        );
+                        assert!(
+                            (road.plane_height - contact.y).abs() < 0.001,
+                            "contact differs from rendered deck on {turn}, rise {rise}, bank {bank}, lateral {lateral}: {} versus {}",
+                            road.plane_height,
+                            contact.y
+                        );
+                        assert!(road.sample.forward.dot(road.sample.right).abs() < 0.00001);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

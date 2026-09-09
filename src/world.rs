@@ -550,32 +550,7 @@ impl World {
                 }
                 if i % 40 == 0 && a.kind == RoadKind::Road {
                     let side = if i % 80 == 0 { 1. } else { -1. };
-                    let mut p = edge(a, side * (w + 9.), 0.);
-                    p.y -= 1.8;
-                    b.block(
-                        p + Vec3::Y * 0.65,
-                        a.right,
-                        Vec3::Y,
-                        a.forward,
-                        vec3(3., 1.3, 0.16),
-                        Color::new(0.12, 0.27, 0.28, 1.),
-                    );
-                    b.block(
-                        p - Vec3::Y * 0.4,
-                        a.right,
-                        Vec3::Y,
-                        a.forward,
-                        vec3(0.12, 1.5, 0.14),
-                        CREAM,
-                    );
-                    b.block(
-                        p + Vec3::Y * 0.65 - a.forward * 0.1,
-                        a.right,
-                        Vec3::Y,
-                        a.forward,
-                        vec3(2.45, 0.16, 0.03),
-                        TEAL,
-                    );
+                    roadside_sign(&mut b, a, ground_y, side);
                 }
                 // Width changes on a bank can require many shoulder slices.
                 // Split those dense runs before adding another source segment.
@@ -726,6 +701,38 @@ impl World {
         gl_use_default_material();
         set_default_camera();
     }
+}
+fn roadside_sign(b: &mut Builder, s: RoadSample, ground_y: f32, side: f32) {
+    let mut p = edge(s, side * (s.width * 0.5 + 9.), 0.);
+    // Signs stand three quarters of the way across the 12 m shoulder.
+    // Its surface descends to terrain, even when the road climbs or banks;
+    // a fixed offset from the road plane would leave the sign floating.
+    let road_edge_y = edge(s, side * s.width * 0.5, 0.).y;
+    p.y = road_edge_y + (ground_y - road_edge_y) * 0.75 + 0.45;
+    b.block(
+        p + Vec3::Y * 0.65,
+        s.right,
+        Vec3::Y,
+        s.forward,
+        vec3(3., 1.3, 0.16),
+        Color::new(0.12, 0.27, 0.28, 1.),
+    );
+    b.block(
+        p - Vec3::Y * 0.4,
+        s.right,
+        Vec3::Y,
+        s.forward,
+        vec3(0.12, 1.5, 0.14),
+        CREAM,
+    );
+    b.block(
+        p + Vec3::Y * 0.65 - s.forward * 0.1,
+        s.right,
+        Vec3::Y,
+        s.forward,
+        vec3(2.45, 0.16, 0.03),
+        TEAL,
+    );
 }
 fn tree(b: &mut Builder, p: Vec3, h: f32, seed: u32) {
     let leaf = Color::new(
@@ -1090,6 +1097,39 @@ mod tests {
         for chunk in nearby_supports {
             assert!(chunk.visible_from(eye), "nearby bridge support was culled");
             assert!(!chunk.visible_from(eye + Vec3::X * 10_000.));
+        }
+    }
+
+    #[test]
+    fn roadside_signs_stand_on_the_rendered_shoulders_of_banked_hills() {
+        for bank in [-45, 0, 45] {
+            let track = Track::parse(&format!(
+                "straight 100\nstraight 1000 rise 500 bank {bank}\nstraight 100"
+            ))
+            .unwrap();
+            let pair = &track.samples[300..302];
+            let sample = surface_sample(&track, pair[0], pair[1], 0.5);
+            for side in [-1., 1.] {
+                let mut shoulder = Builder::new();
+                shoulder_segment(
+                    &mut shoulder,
+                    &track,
+                    [pair[0], pair[1]],
+                    track.ground_height(),
+                    side,
+                    GRASS,
+                );
+                let mut sign = Builder::new();
+                roadside_sign(&mut sign, sample, track.ground_height(), side);
+                let sign = sign.finish();
+                let board_top = sign.vertices[..4].iter().map(|v| v.position).sum::<Vec3>() * 0.25;
+                let shoulder_y = triangle_height(&shoulder.finish(), board_top).unwrap();
+                assert!(
+                    (board_top.y - shoulder_y - 1.75).abs() < 0.05,
+                    "sign floats above its shoulder at bank {bank}, side {side}: top {}, shoulder {shoulder_y}",
+                    board_top.y
+                );
+            }
         }
     }
 
