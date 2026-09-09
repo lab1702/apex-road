@@ -69,8 +69,15 @@ struct RoadPoint {
     index: usize,
     lateral: f32,
     plane_height: f32,
-    /// The motion crossed a rising shoulder from above during this step.
-    crossed_shoulder: bool,
+    /// The motion crossed a rising surface from above during this step.
+    swept_contact: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RoadSweep {
+    before: Vec3,
+    /// A deck actually supporting the car before the move, never an overpass.
+    support: Option<RoadPoint>,
 }
 
 #[derive(Clone, Copy)]
@@ -231,6 +238,10 @@ impl Car {
         self.heading = wrap_angle(self.heading + self.yaw_rate * dt);
         self.position += self.velocity * dt;
 
+        let sweep = RoadSweep {
+            before,
+            support: old_road.filter(|_| was_grounded && !old_surface.offroad),
+        };
         let max_surface_height = (before.y - RIDE_HEIGHT).max(self.position.y - RIDE_HEIGHT) + 0.30;
         let new_road = nearest_road(
             track,
@@ -238,7 +249,7 @@ impl Car {
             self.distance,
             max_surface_height,
             ground_height,
-            Some(before),
+            Some(sweep),
         );
         if let Some(road) = new_road {
             self.road_index = road.index;
@@ -253,17 +264,21 @@ impl Car {
             self.distance,
             max_surface_height,
             ground_height,
-            Some(before),
+            Some(sweep),
         );
         let surface = contact_surface(new_road, max_surface_height, ground_height);
         let required_vertical = surface_vertical_speed(self.velocity, surface.normal);
         let current_bottom = self.position.y - RIDE_HEIGHT;
         let previous_clearance =
             before.y - RIDE_HEIGHT - plane_height_at(surface, self.position, before);
+        // A proven sweep has penetrated a rising surface. Its recovery takes
+        // precedence over the cross-section velocity test, which does not
+        // include longitudinal changes in bank. Falling-away surfaces still
+        // use the ordinary clearance/velocity check and can launch the car.
         let on_same_surface = was_grounded
-            && ((current_bottom - surface.height).abs() < 0.30
-                || new_road.is_some_and(|road| road.crossed_shoulder))
-            && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025;
+            && (new_road.is_some_and(|road| road.swept_contact)
+                || ((current_bottom - surface.height).abs() < 0.30
+                    && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025));
         let landed = !was_grounded
             && current_bottom <= surface.height
             && previous_clearance >= -0.08
@@ -483,7 +498,7 @@ fn nearest_road(
     previous_distance: f32,
     max_surface_height: f32,
     ground_height: f32,
-    sweep_start: Option<Vec3>,
+    sweep: Option<RoadSweep>,
 ) -> Option<RoadPoint> {
     let mut best: Option<(f32, RoadPoint)> = None;
     for (index, pair) in track.samples.windows(2).enumerate() {
@@ -553,7 +568,7 @@ fn nearest_road(
             index,
             lateral,
             plane_height,
-            crossed_shoulder: false,
+            swept_contact: false,
         };
         // An overhead deck cannot become the route merely because the car
         // rises closer to it during a jump. Use the same swept height bound as
@@ -562,17 +577,30 @@ fn nearest_road(
         let surface = road_surface(point, ground_height);
         let surface_height = surface.map_or(plane_height, |surface| surface.height);
         if !matches!(sample.kind, RoadKind::Gap) && surface_height > max_surface_height {
-            // A fast approach can penetrate a rising shoulder farther than the
-            // height allowance in one step. Accept that swept crossing only
-            // from above its plane; cars already under a deck stay underneath.
-            point.crossed_shoulder = surface.is_some_and(|surface| {
-                surface.offroad
-                    && position.y - RIDE_HEIGHT <= surface.height
-                    && sweep_start.is_some_and(|before| {
-                        before.y - RIDE_HEIGHT >= plane_height_at(surface, position, before) - 0.08
+            // Shoulders use their plane for one-sided swept contact. Changing
+            // bank can also lift a deck beyond the height allowance, but its
+            // cross-section normal omits that longitudinal rise. Recover only
+            // from a supported deck through connected, solid cross-sections.
+            point.swept_contact = surface.is_some_and(|surface| {
+                position.y - RIDE_HEIGHT <= surface.height
+                    && sweep.is_some_and(|sweep| {
+                        if surface.offroad {
+                            sweep.before.y - RIDE_HEIGHT
+                                >= plane_height_at(surface, position, sweep.before) - 0.08
+                        } else {
+                            sweep.support.is_some_and(|support| {
+                                crosses_connected_deck(
+                                    track,
+                                    support,
+                                    point,
+                                    sweep.before,
+                                    position,
+                                )
+                            })
+                        }
                     })
             });
-            if !point.crossed_shoulder {
+            if !point.swept_contact {
                 continue;
             }
         }
@@ -584,6 +612,61 @@ fn nearest_road(
         }
     }
     best.map(|(_, point)| point)
+}
+
+/// Check the actual swept path through intervening road cross-sections, rather
+/// than treating proximity in world space as evidence of a connected deck.
+fn crosses_connected_deck(
+    track: &Track,
+    from: RoadPoint,
+    to: RoadPoint,
+    before: Vec3,
+    after: Vec3,
+) -> bool {
+    let mut delta = to.sample.distance - from.sample.distance;
+    if track.closed {
+        if delta > track.length * 0.5 {
+            delta -= track.length;
+        } else if delta < -track.length * 0.5 {
+            delta += track.length;
+        }
+    }
+    let forward = delta >= 0.0;
+    let direction = if forward { 1.0 } else { -1.0 };
+    let segments = track.samples.len() - 1;
+    let mut index = from.index;
+    while index != to.index {
+        let boundary = track.samples[index + usize::from(forward)];
+        // At a shared endpoint, the preceding segment can have zero length
+        // in this sweep (for example immediately after landing over a gap).
+        let starts_at_boundary = index == from.index
+            && (from.sample.distance - boundary.distance).abs() <= SEGMENT_TOLERANCE;
+        if track.samples[index].kind == RoadKind::Gap && !starts_at_boundary {
+            return false;
+        }
+        let normal = horizontal(boundary.right).cross(Vec3::Y).normalize();
+        let start = horizontal(before - boundary.pos).dot(normal);
+        let end = horizontal(after - boundary.pos).dot(normal);
+        if direction * start > SEGMENT_TOLERANCE
+            || direction * end < -SEGMENT_TOLERANCE
+            || direction * (end - start) <= 0.0
+        {
+            return false;
+        }
+        let crossing = before.lerp(after, (start / (start - end)).clamp(0.0, 1.0));
+        let right = horizontal(boundary.right);
+        let lateral = horizontal(crossing - boundary.pos).dot(right) / right.length_squared();
+        if lateral.abs() > boundary.width * 0.5 + SEGMENT_TOLERANCE {
+            return false;
+        }
+        index = if forward {
+            (index + 1) % segments
+        } else {
+            (index + segments - 1) % segments
+        };
+    }
+    // A sweep may not recover onto a gap, including its exact starting edge.
+    to.sample.kind != RoadKind::Gap
 }
 
 fn contact_surface(
@@ -598,7 +681,7 @@ fn contact_surface(
     };
     road.and_then(|road| {
         road_surface(road, ground_height)
-            .filter(|surface| surface.height <= max_surface_height || road.crossed_shoulder)
+            .filter(|surface| surface.height <= max_surface_height || road.swept_contact)
     })
     .unwrap_or(ground)
 }
@@ -1201,6 +1284,121 @@ mod tests {
         assert!(car.roll > 0.2);
         let expected = car.position.x * 15.0_f32.to_radians().tan() + RIDE_HEIGHT;
         assert!((car.position.y - expected).abs() < 0.03);
+    }
+
+    #[test]
+    fn rapid_banking_transitions_cannot_swallow_a_supported_car() {
+        for bank in [-30.0_f32, 30.0] {
+            for length in [1.0, 2.0, 4.0] {
+                let track = Track::parse(&format!(
+                    "width 20\nstraight 100\nstraight {length} bank {bank}\nstraight 100"
+                ))
+                .unwrap();
+                for direction in [-1.0, 1.0] {
+                    for speed in [20.0, 40.0] {
+                        for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                            let mut car = Car::new(&track);
+                            let start = if direction > 0.0 {
+                                99.0
+                            } else {
+                                101.0 + length
+                            };
+                            car.reset(&track, start);
+                            let sample = track.sample_at(start);
+                            car.position += sample.right * (5.0 * bank.signum() * direction);
+                            car.heading = if direction > 0.0 {
+                                0.0
+                            } else {
+                                std::f32::consts::PI
+                            };
+                            car.velocity = Vec3::Z * speed * direction;
+                            for _ in 0..(0.5 / dt).ceil() as usize {
+                                car.update(&track, Control::default(), dt);
+                                let sample = track.sample_at(car.position.z);
+                                let deck = sample.pos.y
+                                    - horizontal(car.position - sample.pos).dot(sample.up)
+                                        / sample.up.y;
+                                assert!(
+                                    car.position.y - RIDE_HEIGHT >= deck - 0.05,
+                                    "penetrated bank {bank}, length {length}, direction {direction}, speed {speed}, dt {dt}: {car:?}"
+                                );
+                                assert!(car.grounded && !car.offroad);
+                            }
+                            assert!((car.distance - start) * direction > length + 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changing_bank_does_not_pull_a_car_up_from_beneath_the_deck() {
+        for bank in [-30, 30] {
+            let track = Track::parse(&format!(
+                "width 20\nstraight 100\nstraight 2 bank {bank}\nstraight 100"
+            ))
+            .unwrap();
+            let mut car = Car::new(&track);
+            car.reset(&track, 99.0);
+            car.position = vec3(
+                5.0 * (bank as f32).signum(),
+                track.ground_height() + RIDE_HEIGHT,
+                99.0,
+            );
+            car.velocity = Vec3::Z * 40.0;
+            for _ in 0..60 {
+                car.update(&track, Control::default(), STEP);
+                assert!((car.position.y - track.ground_height() - RIDE_HEIGHT).abs() < 0.01);
+                assert!(car.grounded && car.offroad);
+            }
+            assert!(car.position.z > 102.0);
+        }
+    }
+
+    #[test]
+    fn bank_contact_recovery_crosses_the_circuit_seam_in_both_directions() {
+        for bank in [-30.0_f32, 30.0] {
+            let track = Track::parse(&format!(
+                "width 20\nstraight 100\nright 180 radius 30\nstraight 100\nright 177 radius 30 bank {bank}\nright 3 radius 30 bank 0\nclose"
+            ))
+            .unwrap();
+            for direction in [-1.0, 1.0] {
+                let start = if direction > 0.0 {
+                    track.length - 0.2
+                } else {
+                    0.1
+                };
+                let mut car = Car::new(&track);
+                car.reset(&track, start);
+                let sample = track.sample_at(start);
+                car.position += sample.right * (-5.0 * bank.signum() * direction);
+                car.velocity = sample.forward * (40.0 * direction);
+                car.heading = car.velocity.x.atan2(car.velocity.z);
+                car.update(&track, Control::default(), 1.0 / 30.0);
+                assert!(
+                    car.grounded && !car.offroad,
+                    "lost contact across the seam: {car:?}"
+                );
+                if direction > 0.0 {
+                    assert!(car.distance < 5.0);
+                } else {
+                    assert!(car.distance > track.length - 5.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deck_recovery_cannot_snap_across_a_gap_to_a_higher_landing() {
+        let track = Track::parse("straight 100\ngap 1 rise 0.6\nstraight 100").unwrap();
+        let mut car = Car::new(&track);
+        car.reset(&track, 99.9);
+        car.velocity = Vec3::Z * 40.0;
+        car.update(&track, Control::default(), 1.0 / 30.0);
+        assert!(car.position.z > 101.0, "the step must cross the whole gap");
+        assert!(!car.grounded && car.offroad);
+        assert!((car.position.y - RIDE_HEIGHT).abs() < 0.01);
     }
 
     #[test]
