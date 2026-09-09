@@ -3,8 +3,8 @@ use crate::vehicle::Control;
 use macroquad::prelude::*;
 
 // Logical pixels from neutral to full steering or full throttle/brake.
-const STEERING_TRAVEL: f32 = 300.;
-const PEDAL_TRAVEL: f32 = 250.;
+const STEERING_TRAVEL: f32 = 1200.;
+const PEDAL_TRAVEL: f32 = 1000.;
 
 #[derive(Default)]
 pub struct MouseDriving {
@@ -104,11 +104,11 @@ mod tests {
     fn horizontal_motion_steers_and_holds_until_moved_back() {
         let mut mouse = active_mouse();
         mouse.update(vec2(150., 0.), true);
-        assert_eq!(mouse.control(false).steer, 0.5);
+        assert_eq!(mouse.control(false).steer, 0.125);
         mouse.update(vec2(150., 0.), true);
-        assert_eq!(mouse.control(false).steer, 0.5);
+        assert_eq!(mouse.control(false).steer, 0.125);
         mouse.update(vec2(-150., 0.), true);
-        assert_eq!(mouse.control(false).steer, -0.5);
+        assert_eq!(mouse.control(false).steer, -0.125);
         assert!(mouse.control(true).handbrake);
     }
 
@@ -116,14 +116,14 @@ mod tests {
     fn vertical_motion_crosses_coasting_between_throttle_and_brake() {
         let mut mouse = active_mouse();
         for (y, throttle, brake) in [
-            (-250., 1., 0.),
-            (-125., 0.5, 0.),
+            (-250., 0.25, 0.),
+            (-125., 0.125, 0.),
             (0., 0., 0.),
-            (125., 0., 0.5),
-            (250., 0., 1.),
-            (125., 0., 0.5),
+            (125., 0., 0.125),
+            (250., 0., 0.25),
+            (125., 0., 0.125),
             (0., 0., 0.),
-            (-125., 0.5, 0.),
+            (-125., 0.125, 0.),
         ] {
             mouse.update(vec2(0., y), true);
             let control = mouse.control(false);
@@ -134,10 +134,10 @@ mod tests {
     #[test]
     fn limits_do_not_accumulate_hidden_travel() {
         let mut mouse = active_mouse();
-        mouse.update(vec2(900., -750.), true);
+        mouse.update(vec2(3600., -3000.), true);
         assert_eq!(mouse.control(false).steer, 1.);
         assert_eq!(mouse.control(false).throttle, 1.);
-        mouse.update(vec2(750., -625.), true);
+        mouse.update(vec2(3000., -2500.), true);
         assert_eq!(mouse.control(false).steer, 0.5);
         assert_eq!(mouse.control(false).throttle, 0.5);
     }
