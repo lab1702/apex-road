@@ -65,6 +65,8 @@ pub struct HudState<'a> {
     pub invalid: bool,
     pub airborne: bool,
     pub offroad: bool,
+    pub mouse_enabled: bool,
+    pub autodrive: bool,
     pub help: bool,
     pub notification: Option<&'a str>,
     pub fps: i32,
@@ -352,7 +354,7 @@ fn gauges(state: &HudState<'_>, u: f32) {
             ORANGE,
         );
     }
-    // Steering is a tiny center-zero indicator, making keyboard smoothing visible.
+    // Steering is a tiny center-zero indicator for either input method.
     draw_line(
         tx,
         y + 114.0 * u,
@@ -420,6 +422,7 @@ fn gauges(state: &HudState<'_>, u: f32) {
 }
 
 fn controls_overlay(state: &HudState<'_>, u: f32) {
+    let u = u.min(screen_width() / 650.0).min(screen_height() / 750.0);
     draw_rectangle(
         0.0,
         0.0,
@@ -427,8 +430,8 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
         screen_height(),
         alpha(PANEL, 0.73),
     );
-    let width = 500.0 * u;
-    let height = 565.0 * u;
+    let width = 610.0 * u;
+    let height = 710.0 * u;
     let x = (screen_width() - width) * 0.5;
     let y = (screen_height() - height) * 0.5;
     panel(x, y, width, height, 20.0 * u, alpha(PANEL, 0.97));
@@ -453,7 +456,7 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
     );
     text(
         if state.help {
-            "KEYBOARD CONTROLS"
+            "DRIVING CONTROLS"
         } else {
             "TIME TRIAL PAUSED"
         },
@@ -465,7 +468,11 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
     let bindings = [
         ("W / UP", "Accelerate"),
         ("S / DOWN", "Brake / hold to reverse"),
-        ("A / D", "Steer left / right"),
+        ("A D / ← →", "Steer left / right"),
+        ("RIGHT CLICK", "Toggle mouse driving anywhere"),
+        ("MOUSE L / R", "Steer left / right"),
+        ("MOUSE UP", "More throttle / less brake"),
+        ("MOUSE DOWN", "Less throttle / more brake"),
         ("SPACE", "Handbrake"),
         ("R", "Restart time trial"),
         ("TAB", "Next track"),
@@ -475,15 +482,29 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
         ("Q", "Quit while paused"),
     ];
     for (i, (button, description)) in bindings.iter().enumerate() {
-        let row = y + (141.0 + i as f32 * 33.0) * u;
-        key(button, x + 32.0 * u, row, 91.0 * u, u);
-        text(description, x + 143.0 * u, row + 17.0 * u, 16.0 * u, PAPER);
+        let row = y + (141.0 + i as f32 * 30.0) * u;
+        key(button, x + 32.0 * u, row, 130.0 * u, u);
+        text(description, x + 182.0 * u, row + 17.0 * u, 16.0 * u, PAPER);
     }
+    text(
+        "Hold the mouse still to keep inputs; move back to ease them off.",
+        x + 32.0 * u,
+        y + 584.0 * u,
+        13.0 * u,
+        MUTED,
+    );
+    text(
+        "Pausing clears mouse inputs. Resume with neutral controls.",
+        x + 32.0 * u,
+        y + 607.0 * u,
+        13.0 * u,
+        MUTED,
+    );
     draw_line(
         x + 32.0 * u,
-        y + 489.0 * u,
+        y + 633.0 * u,
         x + width - 32.0 * u,
-        y + 489.0 * u,
+        y + 633.0 * u,
         u,
         alpha(PAPER, 0.12),
     );
@@ -494,14 +515,14 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
             "ESC / ENTER   RESUME"
         },
         x + 32.0 * u,
-        y + 525.0 * u,
+        y + 674.0 * u,
         14.0 * u,
         CYAN,
     );
     text_right(
         &format!("{} FPS", state.fps),
         x + width - 32.0 * u,
-        y + 525.0 * u,
+        y + 674.0 * u,
         11.0 * u,
         MUTED,
     );
@@ -698,9 +719,39 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
 
     gauges(state, u);
 
+    text_center(
+        if state.autodrive {
+            "AUTO DRIVER  ·  RIGHT CLICK TO TAKE CONTROL"
+        } else if state.mouse_enabled {
+            "MOUSE  ·  RIGHT CLICK FOR KEYBOARD"
+        } else {
+            "KEYBOARD  ·  RIGHT CLICK FOR MOUSE"
+        },
+        w * 0.5,
+        h - 12.0 * u,
+        10.0 * u,
+        if state.mouse_enabled || state.autodrive {
+            CYAN
+        } else {
+            MUTED
+        },
+    );
+
     if w > 1050.0 {
         let hint_y = h - 50.0 * u;
-        key("W A S D", margin, hint_y - 26.0 * u, 76.0 * u, u);
+        key(
+            if state.autodrive {
+                "AUTO"
+            } else if state.mouse_enabled {
+                "MOUSE"
+            } else {
+                "W A S D"
+            },
+            margin,
+            hint_y - 26.0 * u,
+            76.0 * u,
+            u,
+        );
         text(
             "DRIVE",
             margin + 88.0 * u,

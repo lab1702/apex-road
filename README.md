@@ -8,7 +8,7 @@ A single-player 3D time-trial racer written in Rust. The whole window is your
 windshield: a clean, stylized world ahead, with a floating gauge cluster at the
 bottom. Build your own roads with a text file, then chase a better time.
 
-The handling sits between arcade and simulation. Keyboard inputs are smoothed
+The handling sits between arcade and simulation. Driving inputs are smoothed
 so the car is approachable, while acceleration, braking, and cornering share a
 limited amount of tire grip. Enter a corner too quickly, brake too hard, or
 apply too much throttle while turning and the tires start to slide. Hills,
@@ -38,12 +38,16 @@ the game can find the bundled `tracks/` folder.
 
 ## Drive
 
-| Key | Action |
+| Input | Action |
 | --- | --- |
 | Enter | Start a run; resume when paused |
 | W / Up | Accelerate |
 | S / Down | Brake; hold for 0.5 seconds when stopped to reverse |
 | A / D or Left / Right | Steer |
+| Right click anywhere | Toggle mouse driving on / off |
+| Mouse left / right | Steer left / right while mouse driving is enabled |
+| Mouse up | Increase throttle / decrease braking |
+| Mouse down | Decrease throttle / increase braking |
 | Space | Handbrake |
 | R | Restart the current time trial |
 | Esc | Pause / resume |
@@ -52,6 +56,20 @@ the game can find the bundled `tracks/` folder.
 | Tab | Switch to the next bundled track |
 | F11 | Toggle fullscreen |
 | Q, while paused | Quit |
+
+Mouse driving uses relative movement: move the mouse to adjust steering and
+pedal pressure, then hold it still to keep those inputs. Move back in the
+opposite direction to straighten the wheel or ease off a pedal. Throttle and
+braking share one range, passing through neutral before the other pedal
+engages. The gauge cluster shows the current steering, throttle, and brake.
+
+Right click switches between mouse and keyboard driving. Mouse mode replaces
+the keyboard steering and pedals; **Space** and the other shortcuts still
+work. Toggling modes, restarting, changing tracks, or pausing clears mouse
+inputs. The cursor is released while paused, in the control guide, or at the
+finish; resume with neutral controls. Switching away from the game also pauses
+mouse driving and releases the cursor. The active input method and right-click
+hint stay below the gauges.
 
 Brake before a tight corner, ease off as you turn, and feed the throttle back
 in on the exit. The orange traction indicator shows when the car is losing
@@ -96,6 +114,8 @@ cargo run --release -- --track tracks/skyline_eight.track --autodrive
 Auto-drive starts immediately and stays enabled when switching tracks with
 **Tab** or reloading with **F5**. Circuits run consecutive laps; sprints stop at
 the finish. Press **R** to run a sprint again. Auto-drive does not save records.
+Right click to take manual control with the mouse; this turns off the auto
+driver for the rest of the session. Right click again to switch to keyboard.
 
 ## Build a track in text
 

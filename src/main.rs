@@ -1,5 +1,6 @@
 mod courses;
 mod hud;
+mod input;
 mod race;
 mod track;
 mod vehicle;
@@ -65,7 +66,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
+                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nRight click toggles mouse driving: left/right steer, up adds throttle, down adds brake\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
                 );
                 std::process::exit(0);
             }
@@ -226,11 +227,21 @@ async fn game(opts: Options, mut track: Track) {
     let mut camera_pitch = car.pitch;
     let mut camera_roll = car.roll;
     let mut respawn_timer = 0.;
+    let mut mouse = input::MouseDriving::default();
+    let mut cursor_grabbed = false;
+    let mut focus = input::WindowFocus::new();
+    let input_subscriber = macroquad::input::utils::register_input_subscriber();
+    let mut autodrive = opts.autodrive;
     let preview = opts.at.is_some() || opts.autodrive;
     let fixed = 1. / 120.;
     loop {
         if is_quit_requested() {
             break;
+        }
+        macroquad::input::utils::repeat_all_miniquad_input(&mut focus, input_subscriber);
+        if focus.take_loss() && mouse.enabled() {
+            paused = true;
+            mouse.reset();
         }
         let dt = get_frame_time().clamp(0., 0.1);
         frames += 1;
@@ -238,6 +249,7 @@ async fn game(opts: Options, mut track: Track) {
         if is_key_pressed(KeyCode::F11) {
             fullscreen = !fullscreen;
             set_fullscreen(fullscreen);
+            mouse.reset();
         }
         if is_key_pressed(KeyCode::F1) {
             help = !help;
@@ -252,10 +264,16 @@ async fn game(opts: Options, mut track: Track) {
         if paused && is_key_pressed(KeyCode::Q) {
             break;
         }
+        if focus.focused && is_mouse_button_pressed(MouseButton::Right) {
+            mouse.toggle();
+            // A manual takeover ends the demonstration for this session.
+            autodrive = false;
+        }
         if is_key_pressed(KeyCode::Enter) {
             if race.finished {
                 car.reset(&track, grid_distance(&track));
                 race = Race::new(race.best, car.distance);
+                mouse.reset();
             }
             race.started = true;
             paused = false;
@@ -269,6 +287,7 @@ async fn game(opts: Options, mut track: Track) {
             race.started = true;
             accumulator = 0.;
             respawn_timer = 0.;
+            mouse.reset();
             note = "NEW RUN".into();
             note_time = 2.;
         }
@@ -288,12 +307,13 @@ async fn game(opts: Options, mut track: Track) {
                     car = Car::new(&track);
                     record_file = record_path(&path);
                     race = Race::new(read_record(&record_file), car.distance);
-                    race.started = opts.autodrive;
+                    race.started = autodrive;
                     camera_pitch = car.pitch;
                     camera_roll = car.roll;
                     accumulator = 0.;
                     paused = false;
                     respawn_timer = 0.;
+                    mouse.reset();
                     note = if reload {
                         "TRACK RELOADED"
                     } else {
@@ -309,13 +329,26 @@ async fn game(opts: Options, mut track: Track) {
                 }
             }
         }
-        let control = if opts.autodrive {
+        let driving =
+            race.started && !paused && !help && !race.finished && (focus.focused || autodrive);
+        let capture_mouse = mouse.enabled() && driving;
+        if capture_mouse != cursor_grabbed {
+            set_cursor_grab(capture_mouse);
+            show_mouse(!capture_mouse);
+            cursor_grabbed = capture_mouse;
+            mouse.reset();
+        }
+        let (mouse_x, mouse_y) = mouse_position();
+        mouse.update(vec2(mouse_x, mouse_y), capture_mouse);
+        let control = if autodrive {
             demo_control(&car, &track)
+        } else if mouse.enabled() {
+            mouse.control(is_key_down(KeyCode::Space))
         } else {
             input()
         };
-        if race.started && !paused && !help && !race.finished {
-            accumulator += if opts.frames.is_some() && opts.autodrive {
+        if driving {
+            accumulator += if opts.frames.is_some() && autodrive {
                 1. / 60.
             } else {
                 dt
@@ -337,10 +370,17 @@ async fn game(opts: Options, mut track: Track) {
                     car.reset(&track, grid_distance(&track));
                     race = Race::new(race.best, car.distance);
                     race.started = true;
+                    mouse.reset();
                     note = "BACK ON THE GRID".into();
                     note_time = 3.;
+                    accumulator = 0.;
+                    break;
                 }
                 accumulator -= fixed;
+                if race.finished {
+                    accumulator = 0.;
+                    break;
+                }
             }
             if car.offroad && car.speed_kmh() < 4. {
                 respawn_timer += dt;
@@ -401,6 +441,8 @@ async fn game(opts: Options, mut track: Track) {
                 airborne: !car.grounded,
                 offroad: car.offroad,
                 help,
+                mouse_enabled: mouse.enabled(),
+                autodrive,
                 notification: if note_time > 0. { Some(&note) } else { None },
                 fps: get_fps(),
             },
@@ -426,6 +468,8 @@ async fn game(opts: Options, mut track: Track) {
         }
         next_frame().await;
     }
+    set_cursor_grab(false);
+    show_mouse(true);
     hud::shutdown();
 }
 
@@ -457,6 +501,26 @@ mod driving_checks {
             );
         }
     }
+
+    #[test]
+    fn mouse_motion_steers_the_car_in_its_screen_direction() {
+        let track = Track::parse("width 40\nstraight 200").unwrap();
+        for direction in [-1., 1.] {
+            let mut mouse = input::MouseDriving::default();
+            mouse.toggle();
+            mouse.update(Vec2::ZERO, true);
+            mouse.update(vec2(150. * direction, 0.), true);
+            let mut car = Car::new(&track);
+            car.velocity = Vec3::Z * 15.;
+            let camera = view::DriverCamera::new(car.position, 0., 0., 0., 54., 16. / 9.);
+            for _ in 0..60 {
+                car.update(&track, mouse.control(false), 1. / 120.);
+            }
+            assert!(car.heading * direction > 0.01);
+            assert!(camera.matrix().project_point3(car.position).x * direction > 0.01);
+        }
+    }
+
     #[test]
     fn demonstration_driver_completes_every_bundled_course() {
         for path in courses::BUNDLED_PATHS {
