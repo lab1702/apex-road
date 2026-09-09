@@ -24,16 +24,19 @@ pub fn resolve_track(path: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn next_path(current: &Path) -> Result<PathBuf, String> {
-    // Compare the files that loading resolves, including aliases. A custom
-    // course may have the same trailing filename as a bundled course.
+    // Compare file identities, including aliases. Prefer the actual bundled
+    // files so adding a local override cannot hide a loaded bundled course.
+    // A custom course may have the same trailing filename as a bundled course.
     let identity = |path: &Path| -> Result<PathBuf, String> {
         let resolved = resolve_track(path)?;
         Ok(resolved.canonicalize().unwrap_or(resolved))
     };
     let current = identity(current)?;
-    for (index, path) in BUNDLED_PATHS.iter().enumerate() {
-        if current == identity(Path::new(path))? {
-            return Ok(BUNDLED_PATHS[(index + 1) % BUNDLED_PATHS.len()].into());
+    for directory in [Path::new(env!("CARGO_MANIFEST_DIR")), Path::new(".")] {
+        for (index, path) in BUNDLED_PATHS.iter().enumerate() {
+            if current == identity(&directory.join(path))? {
+                return Ok(BUNDLED_PATHS[(index + 1) % BUNDLED_PATHS.len()].into());
+            }
         }
     }
     Ok(BUNDLED_PATHS[0].into())
@@ -138,6 +141,11 @@ mod tests {
         let selected = resolve_track(requested).unwrap();
         assert_eq!(selected, std::env::current_dir().unwrap().join(requested));
         assert_eq!(crate::track::Track::load(&selected).unwrap().name, "Custom");
+        assert_eq!(
+            next_path(&selected).unwrap(),
+            PathBuf::from(BUNDLED_PATHS[1]),
+            "local overrides must retain their place in the course cycle"
+        );
 
         // Renaming an authored file should report a reload error, preserving
         // the active world, rather than silently loading the bundled namesake.
@@ -156,6 +164,11 @@ mod tests {
             original.source_hash()
         );
         assert_ne!(resolve_track(requested).unwrap(), bundled);
+        assert_eq!(
+            next_path(&bundled).unwrap(),
+            PathBuf::from(BUNDLED_PATHS[1]),
+            "a newly created local override must not hide the loaded bundled course"
+        );
 
         #[cfg(unix)]
         {

@@ -113,6 +113,118 @@ fn edge(s: RoadSample, x: f32, h: f32) -> Vec3 {
     s.pos + s.right * x + s.up * h
 }
 
+// A single diagonal across a changing bank can lift the middle of a wide
+// road far above its driving surface. Refine only twisted sections until the
+// diagonal's departure from the interpolated cross-section is below 2 cm.
+fn surface_steps(a: RoadSample, b: RoadSample) -> usize {
+    let normal = (a.up + b.up).normalize();
+    let span_change = b.right * b.width - a.right * a.width;
+    let twist = span_change.dot(normal).abs() * 0.25;
+    (twist / 0.02).ceil().max(1.0) as usize
+}
+
+fn surface_sample(track: &Track, a: RoadSample, b: RoadSample, t: f32) -> RoadSample {
+    if t == 0.0 {
+        a
+    } else if t == 1.0 {
+        b
+    } else {
+        track.sample_at(a.distance + (b.distance - a.distance) * t)
+    }
+}
+
+fn road_segment(builder: &mut Builder, track: &Track, a: RoadSample, b: RoadSample, color: Color) {
+    let steps = surface_steps(a, b);
+    for step in 0..steps {
+        let start = surface_sample(track, a, b, step as f32 / steps as f32);
+        let end = surface_sample(track, a, b, (step + 1) as f32 / steps as f32);
+        builder.quad(
+            edge(start, -start.width * 0.5, 0.),
+            edge(start, start.width * 0.5, 0.),
+            edge(end, end.width * 0.5, 0.),
+            edge(end, -end.width * 0.5, 0.),
+            color,
+        );
+    }
+}
+
+fn shoulder_segment(
+    builder: &mut Builder,
+    track: &Track,
+    samples: [RoadSample; 2],
+    ground: f32,
+    side: f32,
+    color: Color,
+) {
+    let [a, b] = samples;
+    // Even an unbanked hill twists a shoulder: its inner edge climbs while
+    // its outer edge stays on the terrain. Bound that vertical error as well.
+    let height_change =
+        (edge(b, side * b.width * 0.5, 0.).y - edge(a, side * a.width * 0.5, 0.).y).abs();
+    let steps = surface_steps(a, b).max((height_change / 0.08).ceil() as usize);
+    for step in 0..steps {
+        let start = surface_sample(track, a, b, step as f32 / steps as f32);
+        let end = surface_sample(track, a, b, (step + 1) as f32 / steps as f32);
+        let mut far_start = edge(start, side * (start.width * 0.5 + 12.), 0.);
+        let mut far_end = edge(end, side * (end.width * 0.5 + 12.), 0.);
+        far_start.y = ground;
+        far_end.y = ground;
+        builder.quad(
+            edge(start, side * start.width * 0.5, 0.) - Vec3::Y * 0.025,
+            far_start,
+            far_end,
+            edge(end, side * end.width * 0.5, 0.) - Vec3::Y * 0.025,
+            color,
+        );
+    }
+}
+
+fn checkerboard(track: &Track, distance: f32) -> Vec<Mesh> {
+    let mut meshes = Vec::new();
+    let mut builder = Builder::new();
+    for pair in track.samples.windows(2) {
+        let [a, b] = [pair[0], pair[1]];
+        if b.distance <= distance || a.distance >= distance + 1.4 || a.kind == RoadKind::Gap {
+            continue;
+        }
+        let steps = surface_steps(a, b);
+        for step in 0..steps {
+            let start = a.distance + (b.distance - a.distance) * step as f32 / steps as f32;
+            let end = a.distance + (b.distance - a.distance) * (step + 1) as f32 / steps as f32;
+            for row in 0..2 {
+                let front = start.max(distance + row as f32 * 0.7);
+                let back = end.min(distance + (row + 1) as f32 * 0.7);
+                if back <= front {
+                    continue;
+                }
+                let front = track.sample_at(front);
+                let back = track.sample_at(back);
+                // Rapid banks can require thousands of small squares. Keep
+                // each mesh below both the u16 index and renderer batch limits.
+                if builder.vertices.len() + 64 > 16_000 {
+                    meshes.push(std::mem::replace(&mut builder, Builder::new()).finish());
+                }
+                for x in 0..16 {
+                    let left = x as f32 / 16.0 - 0.5;
+                    let right = (x + 1) as f32 / 16.0 - 0.5;
+                    let color = if (x + row) % 2 == 0 { CREAM } else { ASPHALT };
+                    builder.quad(
+                        edge(front, left * front.width, 0.04),
+                        edge(front, right * front.width, 0.04),
+                        edge(back, right * back.width, 0.04),
+                        edge(back, left * back.width, 0.04),
+                        color,
+                    );
+                }
+            }
+        }
+    }
+    if !builder.vertices.is_empty() {
+        meshes.push(builder.finish());
+    }
+    meshes
+}
+
 struct Chunk {
     min: Vec3,
     max: Vec3,
@@ -200,25 +312,16 @@ impl World {
                     continue;
                 }
                 let shade = if i % 2 == 0 { 1.0 } else { 1.015 };
-                b.quad(
-                    edge(a, -w, 0.),
-                    edge(a, w, 0.),
-                    edge(z, wz, 0.),
-                    edge(z, -wz, 0.),
-                    tint(ASPHALT, shade),
-                );
+                road_segment(&mut b, track, a, z, tint(ASPHALT, shade));
                 for side in [-1., 1.] {
                     // A generous shoulder matches the off-road contact surface.
                     if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
-                        let mut far_a = edge(a, side * (w + 12.), 0.);
-                        far_a.y = ground_y;
-                        let mut far_z = edge(z, side * (wz + 12.), 0.);
-                        far_z.y = ground_y;
-                        b.quad(
-                            edge(a, side * w, -0.025),
-                            far_a,
-                            far_z,
-                            edge(z, side * wz, -0.025),
+                        shoulder_segment(
+                            &mut b,
+                            track,
+                            [a, z],
+                            ground_y,
+                            side,
                             tint(GRASS, 0.96 + noise(i as u32) * 0.07),
                         );
                     } else {
@@ -402,6 +505,14 @@ impl World {
                         TEAL,
                     );
                 }
+                // Width changes on a bank can require many shoulder slices.
+                // Split those dense runs before adding another source segment.
+                if b.vertices.len() >= 16_000 {
+                    chunks.push(Chunk::new(
+                        std::mem::replace(&mut b, Builder::new()).finish(),
+                        false,
+                    ));
+                }
             }
             chunks.push(Chunk::new(b.finish(), false));
         }
@@ -446,20 +557,11 @@ impl World {
                 color,
             );
             if idx == 0 || d == track.finish_distance() {
-                for x in 0..16 {
-                    for row in 0..2 {
-                        let c = if (x + row) % 2 == 0 { CREAM } else { ASPHALT };
-                        let left = -s.width * 0.5 + x as f32 * s.width / 16.;
-                        let front = row as f32 * 0.7;
-                        gates.quad(
-                            edge(s, left, 0.04) + s.forward * front,
-                            edge(s, left + s.width / 16., 0.04) + s.forward * front,
-                            edge(s, left + s.width / 16., 0.04) + s.forward * (front + 0.7),
-                            edge(s, left, 0.04) + s.forward * (front + 0.7),
-                            c,
-                        );
-                    }
-                }
+                chunks.extend(
+                    checkerboard(track, d)
+                        .into_iter()
+                        .map(|mesh| Chunk::new(mesh, true)),
+                );
             }
             if idx % 32 == 31 {
                 chunks.push(Chunk::new(gates.finish(), true));
@@ -671,6 +773,191 @@ void main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn road_mesh(track: &Track) -> Mesh {
+        let mut builder = Builder::new();
+        for pair in track.samples.windows(2) {
+            if pair[0].kind != RoadKind::Gap {
+                road_segment(&mut builder, track, pair[0], pair[1], ASPHALT);
+            }
+        }
+        builder.finish()
+    }
+
+    fn triangle_height(mesh: &Mesh, point: Vec3) -> Option<f32> {
+        mesh.indices.as_chunks::<3>().0.iter().find_map(|indices| {
+            let [a, b, c] =
+                [indices[0], indices[1], indices[2]].map(|i| mesh.vertices[i as usize].position);
+            let ab = (b - a).xz();
+            let ac = (c - a).xz();
+            let ap = (point - a).xz();
+            let determinant = ab.perp_dot(ac);
+            if determinant.abs() < 0.0000001 {
+                return None;
+            }
+            let u = ap.perp_dot(ac) / determinant;
+            let v = ab.perp_dot(ap) / determinant;
+            (u >= -0.00001 && v >= -0.00001 && u + v <= 1.00001)
+                .then_some(a.y + (b.y - a.y) * u + (c.y - a.y) * v)
+        })
+    }
+
+    #[test]
+    fn changing_banks_keep_asphalt_close_to_the_driving_plane() {
+        let track =
+            Track::parse("width 40\nstraight 20 bank 60\nstraight 1 bank -60\nstraight 20 bank 0")
+                .unwrap();
+        let mut coarse = Builder::new();
+        for pair in track.samples.windows(2) {
+            let [a, b] = [pair[0], pair[1]];
+            coarse.quad(
+                edge(a, -a.width * 0.5, 0.),
+                edge(a, a.width * 0.5, 0.),
+                edge(b, b.width * 0.5, 0.),
+                edge(b, -b.width * 0.5, 0.),
+                ASPHALT,
+            );
+        }
+        let deviation = |mesh: &Mesh| {
+            mesh.indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|indices| {
+                    let [a, b, c] = [indices[0], indices[1], indices[2]]
+                        .map(|i| mesh.vertices[i as usize].position);
+                    [
+                        (a + b + c) / 3.0,
+                        (a + b) * 0.5,
+                        (b + c) * 0.5,
+                        (c + a) * 0.5,
+                    ]
+                })
+                .map(|point| {
+                    // On this straight, level centerline, z is route distance.
+                    // The interpolated normal is also the vehicle contact plane.
+                    let sample = track.sample_at(point.z);
+                    (point - sample.pos).dot(sample.up).abs()
+                })
+                .fold(0.0_f32, f32::max)
+        };
+        assert!(deviation(&coarse.finish()) > 0.5);
+        let refined = deviation(&road_mesh(&track));
+        assert!(
+            refined < 0.025,
+            "road departs from driving plane by {refined} m"
+        );
+        let flat = Track::parse("straight 40").unwrap();
+        assert!(
+            flat.samples
+                .windows(2)
+                .all(|pair| surface_steps(pair[0], pair[1]) == 1)
+        );
+    }
+
+    #[test]
+    fn checkerboards_follow_rendered_hills_banks_and_gap_boundaries() {
+        for source in [
+            "straight 2 rise 1\nstraight 40",
+            "width 40\nstraight 1 bank 60\nstraight 40",
+        ] {
+            let track = Track::parse(source).unwrap();
+            let road = road_mesh(&track);
+            for mesh in checkerboard(&track, 0.0) {
+                for indices in mesh.indices.as_chunks::<3>().0.iter().step_by(7) {
+                    let center = indices
+                        .iter()
+                        .map(|i| mesh.vertices[*i as usize].position)
+                        .sum::<Vec3>()
+                        / 3.0;
+                    let road_y =
+                        triangle_height(&road, center).expect("marking is over solid road");
+                    assert!(
+                        center.y > road_y,
+                        "marking buried in road: {source}, {center:?}, {road_y}"
+                    );
+                    assert!(
+                        center.y - road_y < 0.1,
+                        "marking floats above road: {source}"
+                    );
+                }
+            }
+        }
+        let track = Track::parse("straight 1\ngap 10\nstraight 40").unwrap();
+        for mesh in checkerboard(&track, 0.0) {
+            assert!(mesh.vertices.iter().all(|v| v.position.z <= 1.0));
+        }
+    }
+
+    #[test]
+    fn banked_shoulders_follow_the_contact_surface_between_samples() {
+        let track = Track::parse("width 40\nstraight 20\nstraight 1 bank 60\nstraight 20").unwrap();
+        let ground = track.ground_height();
+        let mut builder = Builder::new();
+        for pair in track.samples.windows(2) {
+            for side in [-1.0, 1.0] {
+                shoulder_segment(
+                    &mut builder,
+                    &track,
+                    [pair[0], pair[1]],
+                    ground,
+                    side,
+                    GRASS,
+                );
+            }
+        }
+        let mesh = builder.finish();
+        for step in 1..40 {
+            let sample = track.sample_at(20.0 + step as f32 / 40.0);
+            for side in [-1.0, 1.0] {
+                for fraction in [0.2, 0.5, 0.8] {
+                    let point = edge(sample, side * (sample.width * 0.5 + 12.0 * fraction), 0.0);
+                    let road_edge = edge(sample, side * sample.width * 0.5, 0.0);
+                    let contact_y = road_edge.y + (ground - road_edge.y) * fraction;
+                    let rendered_y = triangle_height(&mesh, point).unwrap();
+                    assert!(
+                        (rendered_y - contact_y).abs() < 0.05,
+                        "shoulder differs from contact: {point:?}, rendered {rendered_y}, contact {contact_y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rapid_bank_markings_and_road_chunks_fit_renderer_limits() {
+        for kind in ["road", "tunnel"] {
+            let track = Track::parse(&format!(
+                "width 40\nkind {kind}\nstraight 1 bank 60\nstraight 1 bank -60\nstraight 30\nstraight 1 bank 60\nstraight 1 bank -60\nstraight 2",
+            ))
+            .unwrap();
+            for chunk in World::build_chunks(&track) {
+                assert!(chunk.mesh.vertices.len() <= 60_000);
+                assert!(chunk.mesh.indices.len() <= 120_000);
+                assert!(
+                    chunk
+                        .mesh
+                        .indices
+                        .iter()
+                        .all(|i| (*i as usize) < chunk.mesh.vertices.len())
+                );
+            }
+        }
+        let mut source = String::from("width 40\nstraight 20 bank 60\n");
+        source.push_str(&"width 4\nstraight 1\nwidth 40\nstraight 1\n".repeat(40));
+        let track = Track::parse(&source).unwrap();
+        for chunk in World::build_chunks(&track) {
+            assert!(chunk.mesh.vertices.len() <= 60_000);
+            assert!(chunk.mesh.indices.len() <= 120_000);
+            assert!(
+                chunk
+                    .mesh
+                    .indices
+                    .iter()
+                    .all(|i| (*i as usize) < chunk.mesh.vertices.len())
+            );
+        }
+    }
 
     #[test]
     fn nearby_bridge_supports_remain_visible_below_a_distant_deck() {

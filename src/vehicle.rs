@@ -245,7 +245,7 @@ impl Car {
             before,
             support: old_road.filter(|road| {
                 road_surface(*road, ground_height)
-                    .is_some_and(|surface| before.y - RIDE_HEIGHT >= surface.height - 0.08)
+                    .is_some_and(|surface| before.y - RIDE_HEIGHT >= surface.height - 0.001)
             }),
         };
         let max_surface_height =
@@ -289,7 +289,21 @@ impl Car {
         let on_same_surface = was_grounded
             && (new_road.is_some_and(|road| road.swept_contact)
                 || ((current_bottom - surface.height).abs() < CONTACT_TOLERANCE
-                    && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025));
+                    && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025
+                    // Even a small height correction must follow a solid
+                    // surface. A short gap can be crossed in a single step,
+                    // and its landing can lie within the contact tolerance.
+                    && (!surface.finite
+                        || (old_surface.finite
+                            && old_road.zip(new_road).is_some_and(|(from, to)| {
+                                crosses_connected_surface(
+                                    track,
+                                    from,
+                                    to,
+                                    before,
+                                    self.position,
+                                )
+                            })))));
         // A step can leave one supporting surface and strike another: a steep
         // downhill shoulder can cross the terrain before the car is airborne.
         // Keep the one-sided sweep valid for those transitions as well.
@@ -792,6 +806,11 @@ fn crosses_finite_road_surface(
 ) -> bool {
     let start_clearance = before.y - RIDE_HEIGHT - plane_height_at(surface, after, before);
     let end_clearance = after.y - RIDE_HEIGHT - surface.height;
+    // Clamping an intersection behind the motion to its starting point can
+    // turn an approach already beneath the deck into a landing on its top.
+    if start_clearance < -0.001 || end_clearance > 0.001 {
+        return false;
+    }
     let fraction = (start_clearance / (start_clearance - end_clearance)).clamp(0.0, 1.0);
     let crossing = before.lerp(after, fraction);
     nearest_road(
@@ -2132,6 +2151,29 @@ mod tests {
                 } else {
                     assert!(car.distance > track.length - 5.0);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_contact_cannot_step_up_across_a_short_gap() {
+        for rise in [0.05, 0.2] {
+            let track =
+                Track::parse(&format!("straight 100\ngap 1 rise {rise}\nstraight 100")).unwrap();
+            for dt in [STEP, 1.0 / 30.0] {
+                let mut car = Car::new(&track);
+                car.reset(&track, 99.9);
+                let initial_height = car.position.y;
+                car.velocity = Vec3::Z * 40.0;
+                for _ in 0..(0.3 / dt) as usize {
+                    car.update(&track, Control::default(), dt);
+                    assert!(
+                        !car.grounded,
+                        "stepped up {rise} m through the landing at dt {dt}: {car:?}"
+                    );
+                    assert!(car.position.y <= initial_height + 0.001);
+                }
+                assert!(car.position.z > 101.0, "the car must reach the landing");
             }
         }
     }
