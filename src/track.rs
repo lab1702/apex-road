@@ -502,9 +502,18 @@ impl Builder {
             // A few implicit gates prevent shortcuts in even the simplest file.
             for fraction in [0.25, 0.5, 0.75] {
                 let candidate = self.track.length * fraction;
+                // An exact landing boundary has a solid outgoing sample but
+                // still touches the preceding gap. Apply the same restriction
+                // as an authored checkpoint, which needs road on both sides.
+                let incoming = self
+                    .track
+                    .samples
+                    .partition_point(|sample| sample.distance < candidate)
+                    .saturating_sub(1);
                 if candidate >= 10.0
                     && finish - candidate >= 10.0
                     && self.track.sample_at(candidate).kind != RoadKind::Gap
+                    && self.track.samples[incoming].kind != RoadKind::Gap
                 {
                     self.track.checkpoints.push(candidate);
                 }
@@ -912,6 +921,9 @@ mod tests {
             ("straight 40", vec![10.0, 20.0]),
             ("straight 52", vec![13.0, 26.0, 39.0]),
             ("straight 20\ngap 50\nstraight 50", vec![90.0]),
+            ("straight 20\ngap 10\nstraight 90", vec![60.0, 90.0]),
+            ("straight 30\ngap 30\nstraight 60", vec![90.0]),
+            ("straight 20\ngap 70\nstraight 30", vec![]),
         ] {
             let track = Track::parse(source).unwrap();
             assert_eq!(track.checkpoints, expected, "{source}");

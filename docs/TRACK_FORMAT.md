@@ -115,7 +115,8 @@ interior checkpoints at useful road boundaries. They must be at least 10 m
 from the start, finish, and one another. Do not place a checkpoint at the start
 or end of a gap; put it on solid road before the launch or after a landing road.
 When none are supplied, the parser inserts gates at one-quarter,
-one-half and three-quarters of the route, skipping positions inside gaps.
+one-half and three-quarters of the route, skipping gaps and their boundaries
+and keeping the same 10 m clearance from the start and finish.
 
 `close` does **not** invent a connector or teleport the road. Before it, build
 back to within 0.25 m of the start with matching heading, slope, bank and width.

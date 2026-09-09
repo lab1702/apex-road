@@ -279,7 +279,10 @@ impl Car {
             && (new_road.is_some_and(|road| road.swept_contact)
                 || ((current_bottom - surface.height).abs() < 0.30
                     && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025));
-        let landed = !was_grounded
+        // A step can leave one supporting surface and strike another: a steep
+        // downhill shoulder can cross the terrain before the car is airborne.
+        // Keep the one-sided sweep valid for those transitions as well.
+        let landed = !on_same_surface
             && current_bottom <= surface.height
             && previous_clearance >= -0.08
             && self.velocity.y <= required_vertical + 0.3;
@@ -1758,6 +1761,30 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn descending_a_steep_shoulder_lands_on_terrain_without_falling_through() {
+        let track = Track::parse("straight 50 rise 20\nstraight 200").unwrap();
+        let ground = track.ground_height();
+        for side in [-1.0, 1.0] {
+            for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                let mut car = Car::new(&track);
+                car.reset(&track, 70.0);
+                car.position.x = side * 17.9;
+                car.position.y = ground + 23.0 * (18.0 - 17.9) / 12.0 + RIDE_HEIGHT;
+                car.heading = side * std::f32::consts::FRAC_PI_2;
+                car.velocity = Vec3::X * side * 40.0;
+                for _ in 0..10 {
+                    car.update(&track, Control::default(), dt);
+                    assert!(
+                        car.position.y >= ground + RIDE_HEIGHT - 0.01,
+                        "fell below terrain at side {side}, dt {dt}: {car:?}"
+                    );
+                }
+                assert!(car.grounded && car.offroad);
             }
         }
     }
