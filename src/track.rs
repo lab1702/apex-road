@@ -1,10 +1,12 @@
 //! A small, validated road-building language. See `docs/TRACK_FORMAT.md`.
 use macroquad::prelude::*;
+use std::io::Read;
 use std::path::Path;
 
 const SAMPLE_SPACING: f32 = 2.0;
 const MAX_SAMPLES: usize = 25_001;
 const MAX_LENGTH: f32 = 50_000.0;
+const MAX_FILE_BYTES: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoadKind {
@@ -39,18 +41,29 @@ pub struct Track {
     pub closed: bool,
     /// Ordered interior checkpoint distances; start and finish are implicit.
     pub checkpoints: Vec<f32>,
+    source_hash: u64,
 }
 
 impl Track {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes))
+            .map_err(|e| format!("Cannot read track '{}': {e}", path.display()))?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(format!(
+                "{}: Track file exceeds the 1 MB limit",
+                path.display()
+            ));
+        }
+        let text = String::from_utf8(bytes)
             .map_err(|e| format!("Cannot read track '{}': {e}", path.display()))?;
         Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        if text.len() > 1_000_000 {
+        if text.len() > MAX_FILE_BYTES {
             return Err("Track file exceeds the 1 MB limit".into());
         }
         let mut builder = Builder::new();
@@ -64,7 +77,17 @@ impl Track {
                 .command(&tokens, line_number)
                 .map_err(|e| format!("Line {line_number}: {e}"))?;
         }
-        builder.finish()
+        let mut track = builder.finish()?;
+        track.source_hash = text.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        });
+        Ok(track)
+    }
+
+    /// Stable identity of the source that produced this loaded route. Records
+    /// keep using this version even if its file changes before the next reload.
+    pub fn source_hash(&self) -> u64 {
+        self.source_hash
     }
 
     /// Timing and gate location: the circuit seam or 3 m before a sprint's end.
@@ -152,6 +175,7 @@ impl Builder {
                 length: 0.0,
                 closed: false,
                 checkpoints: Vec::new(),
+                source_hash: 0,
             },
             heading: 0.0,
             grade: 0.0,
@@ -603,6 +627,76 @@ fn tokenize(line: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TrackFile(std::path::PathBuf);
+
+    impl TrackFile {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "apex-road-track-test-{}-{id}.track",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TrackFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn source_identity_belongs_to_the_loaded_version() {
+        let file = TrackFile::new();
+        std::fs::write(&file.0, "straight 40\n").unwrap();
+        let loaded = Track::load(&file.0).unwrap();
+        let original_hash = loaded.source_hash();
+        assert_eq!(original_hash, 0x64633c68e54952d9);
+        assert_eq!(
+            original_hash,
+            Track::parse("straight 40\n").unwrap().source_hash()
+        );
+
+        std::fs::write(&file.0, "straight 80\n").unwrap();
+        let reloaded = Track::load(&file.0).unwrap();
+        assert_ne!(original_hash, reloaded.source_hash());
+        assert_eq!(loaded.source_hash(), original_hash);
+        assert_eq!(loaded.length, 40.0);
+        assert_eq!(reloaded.length, 80.0);
+
+        std::fs::remove_file(&file.0).unwrap();
+        assert_eq!(loaded.source_hash(), original_hash);
+        assert_eq!(loaded.clone().source_hash(), original_hash);
+        // Source identity includes comments and whitespace, preserving the
+        // record keys used by existing versions of the game.
+        assert_ne!(
+            original_hash,
+            Track::parse("straight 40").unwrap().source_hash()
+        );
+    }
+
+    #[test]
+    fn loading_enforces_the_byte_limit_before_decoding() {
+        let file = TrackFile::new();
+        let mut source = String::from("straight 40\n#");
+        source.extend(std::iter::repeat_n(' ', MAX_FILE_BYTES - source.len()));
+        std::fs::write(&file.0, &source).unwrap();
+        assert_eq!(Track::load(&file.0).unwrap().length, 40.0);
+
+        let mut oversized = source.into_bytes();
+        oversized.push(0xff);
+        std::fs::write(&file.0, oversized).unwrap();
+        let error = Track::load(&file.0).unwrap_err();
+        assert!(error.contains("exceeds the 1 MB limit"), "{error}");
+        assert!(error.contains(&file.0.display().to_string()), "{error}");
+
+        std::fs::write(&file.0, b"straight 40\n#\xff").unwrap();
+        let error = Track::load(&file.0).unwrap_err();
+        assert!(error.contains("Cannot read track"), "{error}");
+        assert!(error.contains(&file.0.display().to_string()), "{error}");
+    }
 
     #[test]
     fn terrain_is_below_banked_edges_at_negative_elevations() {

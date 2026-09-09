@@ -226,7 +226,7 @@ cargo test
 - **Time trials:** ordered checkpoints, finish timing, and persistent local
   records tied to track contents.
 
-This first version has one car, keyboard controls, dry weather, and procedural
+This first version has one car, keyboard and mouse controls, dry weather, and procedural
 visuals. Audio is not included in this first version. It is a focused solo racer,
 with simplified vehicle physics rather than a full mechanical or tire simulation. Tracks are authored in text;
 there is no graphical editor. Authors should test jumps, road crossings, and

@@ -314,21 +314,17 @@ impl Car {
 
         // The tunnel roof is also a physical boundary; falling onto a roof
         // from outside is intentionally not treated as driving on its deck.
-        if let Some(road) = new_road {
-            let arch_fraction = road.lateral / (road.sample.width * 0.5 + 0.65);
-            let roof_height = road.plane_height
-                + 1.0
-                + 5.2 * (1.0 - arch_fraction * arch_fraction).max(0.0).sqrt();
-            if matches!(road.sample.kind, RoadKind::Tunnel)
-                && road.lateral.abs() < road.sample.width * 0.5
-                && before.y > road.plane_height
-                && before.y + 0.7 <= roof_height
-                && self.position.y + 0.7 > roof_height
-            {
-                self.position.y = roof_height - 0.7;
-                self.velocity.y = self.velocity.y.min(0.0);
-                self.impact = 0.6;
-            }
+        if let Some(road) = new_road
+            && let Some(roof_height) = tunnel_roof_height(road.sample, self.position)
+            && let Some(previous_roof) = old_road
+                .and_then(|road| tunnel_roof_height(road.sample, before))
+                .or_else(|| tunnel_roof_height(road.sample, before))
+            && before.y + 0.7 <= previous_roof + 0.001
+            && self.position.y + 0.7 > roof_height
+        {
+            self.position.y = roof_height - 0.7;
+            self.velocity.y = self.velocity.y.min(0.0);
+            self.impact = 0.6;
         }
     }
 
@@ -577,27 +573,35 @@ fn nearest_road(
         let surface = road_surface(point, ground_height);
         let surface_height = surface.map_or(plane_height, |surface| surface.height);
         if !matches!(sample.kind, RoadKind::Gap) && surface_height > max_surface_height {
-            // Shoulders use their plane for one-sided swept contact. Changing
-            // bank can also lift a deck beyond the height allowance, but its
-            // cross-section normal omits that longitudinal rise. Recover only
-            // from a supported deck through connected, solid cross-sections.
+            // A steep surface can rise past an airborne car in one step. Its
+            // plane provides a one-sided sweep for both decks and shoulders.
+            // Changing bank can also lift a deck beyond the height allowance,
+            // but its cross-section normal omits that longitudinal rise. That
+            // recovery needs a supported, connected chain of solid sections.
             point.swept_contact = surface.is_some_and(|surface| {
                 position.y - RIDE_HEIGHT <= surface.height
                     && sweep.is_some_and(|sweep| {
-                        if surface.offroad {
-                            sweep.before.y - RIDE_HEIGHT
-                                >= plane_height_at(surface, position, sweep.before) - 0.08
-                        } else {
-                            sweep.support.is_some_and(|support| {
-                                crosses_connected_deck(
+                        (sweep.before.y - RIDE_HEIGHT
+                            >= plane_height_at(surface, position, sweep.before) - 0.08
+                            && (surface.offroad
+                                || crosses_finite_deck(
                                     track,
-                                    support,
                                     point,
+                                    surface,
                                     sweep.before,
                                     position,
-                                )
-                            })
-                        }
+                                    ground_height,
+                                )))
+                            || (!surface.offroad
+                                && sweep.support.is_some_and(|support| {
+                                    crosses_connected_deck(
+                                        track,
+                                        support,
+                                        point,
+                                        sweep.before,
+                                        position,
+                                    )
+                                }))
                     })
             });
             if !point.swept_contact {
@@ -612,6 +616,38 @@ fn nearest_road(
         }
     }
     best.map(|(_, point)| point)
+}
+
+/// Crossing an extended deck plane outside the road is not a landing. Locate
+/// the actual contact point and require a solid route from there to this step's
+/// endpoint, including any intervening sample boundaries.
+fn crosses_finite_deck(
+    track: &Track,
+    to: RoadPoint,
+    surface: Surface,
+    before: Vec3,
+    after: Vec3,
+    ground_height: f32,
+) -> bool {
+    let start_clearance = before.y - RIDE_HEIGHT - plane_height_at(surface, after, before);
+    let end_clearance = after.y - RIDE_HEIGHT - surface.height;
+    let fraction = (start_clearance / (start_clearance - end_clearance)).clamp(0.0, 1.0);
+    let crossing = before.lerp(after, fraction);
+    nearest_road(
+        track,
+        crossing,
+        to.sample.distance,
+        crossing.y - RIDE_HEIGHT + 0.08,
+        ground_height,
+        None,
+    )
+    .is_some_and(|from| {
+        road_surface(from, ground_height).is_some_and(|surface| {
+            !surface.offroad
+                && (crossing.y - RIDE_HEIGHT - surface.height).abs() <= 0.08
+                && crosses_connected_deck(track, from, to, crossing, after)
+        })
+    })
 }
 
 /// Check the actual swept path through intervening road cross-sections, rather
@@ -723,6 +759,36 @@ fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
 
 fn plane_height_at(surface: Surface, origin: Vec3, point: Vec3) -> f32 {
     surface.height - horizontal(point - origin).dot(surface.normal) / surface.normal.y.max(0.15)
+}
+
+/// Intersect a vertical line with the same ten arch panels drawn by the world.
+/// Working in the road frame keeps roof clearance correct on banks and hills.
+fn tunnel_roof_height(sample: RoadSample, position: Vec3) -> Option<f32> {
+    if sample.kind != RoadKind::Tunnel {
+        return None;
+    }
+    let mut height: Option<f32> = None;
+    let arch = |index: usize| {
+        let angle = index as f32 / 10.0 * std::f32::consts::PI;
+        sample.pos
+            + sample.right * angle.cos() * (sample.width * 0.5 + 0.65)
+            + sample.up * (1.0 + angle.sin() * 5.2)
+    };
+    for index in 0..10 {
+        let a = arch(index);
+        let tangent = arch(index + 1) - a;
+        let normal = tangent.cross(sample.forward);
+        if normal.y <= 0.0001 {
+            continue;
+        }
+        let panel_height = a.y - horizontal(position - a).dot(normal) / normal.y;
+        let hit = vec3(position.x, panel_height, position.z);
+        let fraction = (hit - a).dot(tangent) / tangent.length_squared();
+        if (-0.0001..=1.0001).contains(&fraction) {
+            height = Some(height.map_or(panel_height, |height| height.max(panel_height)));
+        }
+    }
+    height
 }
 
 fn surface_vertical_speed(velocity: Vec3, normal: Vec3) -> f32 {
@@ -1114,6 +1180,75 @@ mod tests {
     }
 
     #[test]
+    fn moving_sideways_into_a_tunnel_arch_hits_the_roof() {
+        let track = Track::parse("tunnel 100").unwrap();
+        let mut car = Car::new(&track);
+        car.position = vec3(4.0, 4.3, 20.0);
+        car.velocity = Vec3::X * 30.0;
+        car.grounded = false;
+        car.update(&track, Control::default(), 1.0 / 30.0);
+        let roof_height = 1.0 + 5.2 * (1.0 - (car.position.x / 6.65).powi(2)).sqrt();
+        assert!(
+            car.position.y + 0.7 <= roof_height + 0.001,
+            "passed through tunnel roof: {car:?}"
+        );
+        assert!(car.impact > 0.0);
+    }
+
+    #[test]
+    fn tunnel_roof_contact_follows_the_banked_arch() {
+        for bank in [-60, -30, 0, 30, 60] {
+            let track = Track::parse(&format!("straight 50 bank {bank}\ntunnel 100")).unwrap();
+            let sample = track.sample_at(80.0);
+            // This is the top vertex of the rendered arch in the road frame.
+            let roof = sample.pos + sample.up * 6.2;
+            let mut car = Car::new(&track);
+            car.position = roof - Vec3::Y * 0.75;
+            car.velocity = Vec3::Y * 20.0;
+            car.grounded = false;
+            car.distance = sample.distance;
+            car.update(&track, Control::default(), STEP);
+            assert!(
+                (car.position.y + 0.7 - roof.y).abs() < 0.001,
+                "wrong roof contact at bank {bank}: {car:?}, roof {roof:?}"
+            );
+            assert!(car.velocity.y <= 0.0 && car.impact > 0.0);
+        }
+    }
+
+    #[test]
+    fn tunnel_roof_query_matches_arch_vertices_on_hills() {
+        for bank in [-60, -30, 0, 30, 60] {
+            for rise in [-60, 60] {
+                let track =
+                    Track::parse(&format!("straight 50 bank {bank}\ntunnel 100 rise {rise}"))
+                        .unwrap();
+                let sample = track.sample_at(80.0);
+                let roof = sample.pos + sample.up * 6.2;
+                let height = tunnel_roof_height(sample, roof).unwrap();
+                assert!(
+                    (height - roof.y).abs() < 0.001,
+                    "wrong arch height on bank {bank}, rise {rise}: {height}, expected {}",
+                    roof.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn falling_onto_a_tunnel_from_above_is_not_pulled_inside() {
+        let track = Track::parse("tunnel 100").unwrap();
+        let mut car = Car::new(&track);
+        car.position = vec3(0.0, 6.0, 20.0);
+        car.velocity = -Vec3::Y * 20.0;
+        car.grounded = false;
+        car.update(&track, Control::default(), STEP);
+        assert_eq!(car.impact, 0.0);
+        assert!(!car.grounded);
+        assert!(car.position.y > 5.8);
+    }
+
+    #[test]
     fn open_road_does_not_extend_its_collider_past_the_finish() {
         let track = Track::parse("straight 40").unwrap();
         let mut car = Car::new(&track);
@@ -1225,6 +1360,60 @@ mod tests {
         assert!(airtime > 0.4, "airtime {airtime}");
         assert!(landed, "car did not land: {:?}", car.position);
         assert!((car.position.y - RIDE_HEIGHT).abs() < 0.05);
+    }
+
+    #[test]
+    fn airborne_car_cannot_pass_through_a_rising_road() {
+        for (rise, direction) in [(60, 1.0), (-60, -1.0)] {
+            let track = Track::parse(&format!("straight 100 rise {rise}")).unwrap();
+            for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                let mut car = Car::new(&track);
+                car.reset(&track, 50.0);
+                car.position.y += 0.01;
+                car.grounded = false;
+                car.velocity = Vec3::Z * 50.0 * direction;
+                car.update(&track, Control::default(), dt);
+                assert!(
+                    car.grounded && !car.offroad,
+                    "missed uphill landing at dt {dt}, direction {direction}: {car:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn airborne_car_below_a_rising_road_is_not_pulled_through_it() {
+        let track = Track::parse("straight 100 rise 60").unwrap();
+        let mut car = Car::new(&track);
+        car.reset(&track, 50.0);
+        car.position.y -= 1.0;
+        car.grounded = false;
+        car.velocity = Vec3::Z * 50.0;
+        let before = car.position;
+        car.update(&track, Control::default(), 1.0 / 30.0);
+        assert!(!car.grounded && car.offroad);
+        assert!(car.position.y < before.y);
+    }
+
+    #[test]
+    fn crossing_a_deck_plane_outside_the_bridge_cannot_pull_a_car_inside() {
+        let track = Track::parse("bridge 100 rise 60").unwrap();
+        for (dt, position, velocity) in [
+            (STEP, vec3(6.15, 21.62, 40.0), vec3(-30.0, 0.0, 50.0)),
+            (1.0 / 30.0, vec3(8.0, 21.8, 40.0), vec3(-90.0, 0.0, 60.0)),
+        ] {
+            let mut car = Car::new(&track);
+            car.position = position;
+            car.grounded = false;
+            car.velocity = velocity;
+            car.update(&track, Control::default(), dt);
+            assert!(
+                !car.grounded && car.offroad,
+                "pulled through bridge edge at dt {dt}: {car:?}"
+            );
+            assert!(car.position.x < 6.0);
+            assert!(car.position.y < position.y);
+        }
     }
 
     #[test]

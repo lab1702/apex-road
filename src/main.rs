@@ -22,6 +22,12 @@ struct Options {
     demo: bool,
     at: Option<f32>,
 }
+fn path_argument(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf, String> {
+    args.next()
+        .filter(|value| !value.starts_with('-'))
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{flag} needs a path"))
+}
 fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut out = Options {
         path: "tracks/alpine.track".into(),
@@ -35,12 +41,10 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--track" => out.path = args.next().ok_or("--track needs a path")?.into(),
+            "--track" => out.path = path_argument(&mut args, "--track")?,
             "--validate" => {
                 out.validate = true;
-                if let Some(path) = args.next() {
-                    out.path = path.into();
-                }
+                out.path = path_argument(&mut args, "--validate")?;
             }
             "--frames" => {
                 out.frames = Some(
@@ -50,9 +54,7 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
                         .map_err(|_| "invalid frame count")?,
                 )
             }
-            "--capture" => {
-                out.capture = Some(args.next().ok_or("--capture needs a PNG path")?.into())
-            }
+            "--capture" => out.capture = Some(path_argument(&mut args, "--capture")?),
             "--autodrive" => out.autodrive = true,
             "--demo" => {
                 out.demo = true;
@@ -137,14 +139,15 @@ fn main() {
         );
         return;
     }
-    macroquad::Window::from_config(config(), game(opts, track));
-}
-fn record_path(path: &Path) -> PathBuf {
-    let bytes = std::fs::read(resolve_track(path)).unwrap_or_default();
-    let hash = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ *b as u64).wrapping_mul(0x100000001b3)
+    macroquad::Window::from_config(config(), async move {
+        if let Err(error) = game(opts, track).await {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
     });
-    PathBuf::from(format!("data/{hash:016x}.best"))
+}
+fn record_path(track: &Track) -> PathBuf {
+    PathBuf::from(format!("data/{:016x}.best", track.source_hash()))
 }
 fn read_record(path: &Path) -> Option<f32> {
     std::fs::read_to_string(path)
@@ -160,6 +163,29 @@ fn save_record(path: &Path, time: f32) -> std::io::Result<()> {
     let temp = p.with_extension("tmp");
     std::fs::write(&temp, format!("{time:.6}\n"))?;
     std::fs::rename(temp, p)
+}
+fn save_capture(path: &Path, screenshot: &Image) -> Result<(), image::ImageError> {
+    let mut pixels = image::RgbaImage::from_raw(
+        u32::from(screenshot.width),
+        u32::from(screenshot.height),
+        screenshot.bytes.clone(),
+    )
+    .ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid screenshot pixels")
+    })?;
+    // Screen readback starts at the bottom row; PNGs start at the top.
+    image::imageops::flip_vertical_in_place(&mut pixels);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut output = std::io::BufWriter::new(std::fs::File::create(path)?);
+    pixels.write_to(&mut output, image::ImageOutputFormat::Png)?;
+    // BufWriter discards flush failures on drop, including a full destination.
+    std::io::Write::flush(&mut output)?;
+    Ok(())
 }
 fn input() -> Control {
     controls_from_keys(is_key_down)
@@ -244,7 +270,7 @@ fn restart_run(car: &mut Car, track: &Track, records: &mut RunRecords, autodrive
     race
 }
 
-async fn game(opts: Options, mut track: Track) {
+async fn game(opts: Options, mut track: Track) -> Result<(), String> {
     hud::init();
     prevent_quit();
     let mut path = opts.path.clone();
@@ -253,7 +279,7 @@ async fn game(opts: Options, mut track: Track) {
     if let Some(at) = opts.at {
         car.reset(&track, at.min(track.length - 5.));
     }
-    let mut record_file = record_path(&path);
+    let mut record_file = record_path(&track);
     let mut records = RunRecords::new(read_record(&record_file));
     let mut race = records.start_race(car.distance, !opts.autodrive && opts.at.is_none());
     race.started = opts.autodrive;
@@ -276,6 +302,7 @@ async fn game(opts: Options, mut track: Track) {
         println!("Demo: {}", track.name);
     }
     let fixed = 1. / 120.;
+    let mut result = Ok(());
     loop {
         if is_quit_requested() {
             break;
@@ -346,7 +373,7 @@ async fn game(opts: Options, mut track: Track) {
                     world.rebuild(&track);
                     path = next;
                     car = Car::new(&track);
-                    record_file = record_path(&path);
+                    record_file = record_path(&track);
                     records = RunRecords::new(read_record(&record_file));
                     race = records.start_race(car.distance, !autodrive);
                     race.started = autodrive;
@@ -500,10 +527,10 @@ async fn game(opts: Options, mut track: Track) {
             && frames >= limit
         {
             if let Some(ref dest) = opts.capture {
-                if let Some(parent) = dest.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                if let Err(error) = save_capture(dest, &get_screen_data()) {
+                    result = Err(format!("Capture error for '{}': {error}", dest.display()));
+                    break;
                 }
-                get_screen_data().export_png(dest.to_str().unwrap_or("capture.png"));
                 println!("Captured {}", dest.display());
             }
             println!(
@@ -517,12 +544,55 @@ async fn game(opts: Options, mut track: Track) {
     set_cursor_grab(false);
     show_mouse(true);
     hud::shutdown();
+    result
 }
 
 #[cfg(test)]
 mod driving_checks {
     use super::*;
     use macroquad::camera::Camera;
+
+    #[test]
+    fn path_options_reject_missing_paths_without_consuming_other_options() {
+        for flag in ["--track", "--validate", "--capture"] {
+            for args in [vec![flag], vec![flag, "--autodrive", "tracks/club.track"]] {
+                assert_eq!(
+                    options(args.into_iter().map(String::from)).err(),
+                    Some(format!("{flag} needs a path"))
+                );
+            }
+        }
+        let opts = options(["--validate", "tracks/club.track"].map(String::from)).unwrap();
+        assert!(opts.validate);
+        assert_eq!(opts.path, PathBuf::from("tracks/club.track"));
+    }
+
+    #[test]
+    fn screenshot_export_is_png_or_reports_io_errors_without_panicking() {
+        let dir = std::env::temp_dir().join(format!("apex-capture-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nested/capture.without-png-extension");
+        let screenshot = Image {
+            bytes: vec![255, 0, 0, 255, 0, 0, 255, 255],
+            width: 1,
+            height: 2,
+        };
+        save_capture(&path, &screenshot).unwrap();
+        let encoded = std::fs::read(&path).unwrap();
+        assert_eq!(
+            image::guess_format(&encoded).unwrap(),
+            image::ImageFormat::Png
+        );
+        let decoded = image::load_from_memory(&encoded).unwrap().into_rgba8();
+        assert_eq!(decoded.dimensions(), (1, 2));
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(decoded.get_pixel(0, 1).0, [255, 0, 0, 255]);
+        assert!(save_capture(&dir, &screenshot).is_err());
+        assert!(save_capture(&path.join("blocked.png"), &screenshot).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(save_capture(Path::new("/dev/full"), &screenshot).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn demo_option_starts_autodrive_and_preserves_preview_options() {

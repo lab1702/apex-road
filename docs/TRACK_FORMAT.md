@@ -160,6 +160,8 @@ direction. Non-finite lookup distances return the starting sample.
 lowest sampled banked road edge.
 `Track::finish_distance()` returns the distance used by timing and the finish
 gate: the course length for circuits, or 3 m before the endpoint for sprints.
+`Track::source_hash()` identifies the exact source bytes used to build the
+loaded route, so record files stay associated with that version until reload.
 
 Each `RoadSample` contains `pos`, `forward`, `right`, `up`, `width`, `bank`
 (radians), cumulative `distance`, and `kind`. Its `kind` describes the
