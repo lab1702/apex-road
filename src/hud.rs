@@ -43,10 +43,48 @@ fn measure(label: &str, size: f32) -> TextDimensions {
     })
 }
 
+#[derive(Clone, Copy, Default)]
+pub enum Units {
+    #[default]
+    Us,
+    Metric,
+}
+
+impl Units {
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Us => Self::Metric,
+            Self::Metric => Self::Us,
+        };
+    }
+
+    fn speed(self, kmh: f32) -> f32 {
+        match self {
+            Self::Us => kmh / 1.609_344,
+            Self::Metric => kmh,
+        }
+    }
+
+    fn speed_label(self) -> &'static str {
+        match self {
+            Self::Us => "MPH",
+            Self::Metric => "KM/H",
+        }
+    }
+
+    fn distance(self, meters: f32) -> String {
+        match self {
+            Self::Us => format!("{:.1} MI", meters / 1609.344),
+            Self::Metric => format!("{:.1} KM", meters / 1000.0),
+        }
+    }
+}
+
 pub struct HudState<'a> {
     pub track_name: &'a str,
     /// Speed in kilometers per hour.
     pub speed: f32,
+    pub units: Units,
     pub rpm: f32,
     pub gear: u8,
     pub throttle: f32,
@@ -242,12 +280,13 @@ fn optional_time(seconds: Option<f32>) -> String {
         .unwrap_or_else(|| "--:--.---".to_owned())
 }
 
-fn track_map(track: &Track, position: Vec3, heading: f32, x: f32, y: f32, u: f32) {
+fn track_map(track: &Track, position: Vec3, heading: f32, origin: Vec2, u: f32, units: Units) {
     if track.samples.is_empty() {
         return;
     }
     let width = 224.0 * u;
     let height = 167.0 * u;
+    let Vec2 { x, y } = origin;
     panel(x, y, width, height, 12.0 * u, alpha(PANEL, 0.62));
     tracking(
         "THE COURSE",
@@ -258,7 +297,7 @@ fn track_map(track: &Track, position: Vec3, heading: f32, x: f32, y: f32, u: f32
         MUTED,
     );
     text_right(
-        &format!("{:.1} KM", track.length / 1000.0),
+        &units.distance(track.length),
         x + width - 17.0 * u,
         y + 25.0 * u,
         11.0 * u,
@@ -335,16 +374,17 @@ fn gauges(state: &HudState<'_>, u: f32) {
         );
     }
 
-    let speed = format!("{:03}", state.speed.abs().round() as u32);
+    let speed = format!("{:03}", state.units.speed(state.speed).abs().round() as u32);
     text(&speed, x + 27.0 * u, y + 91.0 * u, 67.0 * u, PAPER);
     tracking(
-        "KM/H",
+        state.units.speed_label(),
         x + 31.0 * u,
         y + 116.0 * u,
         11.0 * u,
         2.0 * u,
         MUTED,
     );
+    key("U", x + 111.0 * u, y + 98.0 * u, 27.0 * u, u);
     draw_line(
         x + 170.0 * u,
         y + 39.0 * u,
@@ -477,7 +517,7 @@ fn gauges(state: &HudState<'_>, u: f32) {
 }
 
 fn controls_overlay(state: &HudState<'_>, u: f32) {
-    let u = u.min(screen_width() / 650.0).min(screen_height() / 750.0);
+    let u = u.min(screen_width() / 650.0).min(screen_height() / 780.0);
     draw_rectangle(
         0.0,
         0.0,
@@ -486,7 +526,7 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
         alpha(PANEL, 0.73),
     );
     let width = 610.0 * u;
-    let height = 710.0 * u;
+    let height = 740.0 * u;
     let x = (screen_width() - width) * 0.5;
     let y = (screen_height() - height) * 0.5;
     panel(x, y, width, height, 20.0 * u, alpha(PANEL, 0.97));
@@ -530,6 +570,7 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
         ("MOUSE DOWN", "Less throttle / more brake"),
         ("SPACE", "Handbrake"),
         ("R", "Restart time trial"),
+        ("U", "Toggle US / metric units"),
         ("TAB", "Next track"),
         ("F5", "Reload track file"),
         ("ESC", "Pause / resume"),
@@ -544,22 +585,22 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
     text(
         "Hold the mouse still to keep inputs; move back to ease them off.",
         x + 32.0 * u,
-        y + 584.0 * u,
+        y + 614.0 * u,
         13.0 * u,
         MUTED,
     );
     text(
         "Pausing clears mouse inputs. Resume with neutral controls.",
         x + 32.0 * u,
-        y + 607.0 * u,
+        y + 637.0 * u,
         13.0 * u,
         MUTED,
     );
     draw_line(
         x + 32.0 * u,
-        y + 633.0 * u,
+        y + 663.0 * u,
         x + width - 32.0 * u,
-        y + 633.0 * u,
+        y + 663.0 * u,
         u,
         alpha(PAPER, 0.12),
     );
@@ -570,14 +611,14 @@ fn controls_overlay(state: &HudState<'_>, u: f32) {
             "ESC / ENTER   RESUME"
         },
         x + 32.0 * u,
-        y + 674.0 * u,
+        y + 704.0 * u,
         14.0 * u,
         CYAN,
     );
     text_right(
         &format!("{} FPS", state.fps),
         x + width - 32.0 * u,
-        y + 674.0 * u,
+        y + 704.0 * u,
         11.0 * u,
         MUTED,
     );
@@ -738,7 +779,14 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         17.0 * u,
         MUTED,
     );
-    track_map(track, position, heading, timer_x, timer_y + 174.0 * u, u);
+    track_map(
+        track,
+        position,
+        heading,
+        vec2(timer_x, timer_y + 174.0 * u),
+        u,
+        state.units,
+    );
 
     if w >= 800.0 && state.started {
         let ribbon_w = 248.0 * u;

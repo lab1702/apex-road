@@ -50,12 +50,17 @@ the game can find the bundled `tracks/` folder.
 | Mouse down | Decrease throttle / increase braking |
 | Space | Handbrake |
 | R | Restart the current time trial |
+| U | Toggle US / metric HUD units |
 | Esc | Pause / resume |
 | F1 | Show / hide the control guide |
 | F5 | Reload the current track file |
 | Tab | Switch to the next bundled track |
 | F11 | Toggle fullscreen |
 | Q, while paused | Quit |
+
+The HUD starts in US units (**mph** and **miles**). Press **U** at any time to
+switch to metric (**km/h** and **kilometers**) or back. Your selection lasts
+for the session, including restarts, track switches, and reloads.
 
 Mouse driving uses relative movement: move the mouse to adjust steering and
 pedal pressure, then hold it still to keep those inputs. Move back in the

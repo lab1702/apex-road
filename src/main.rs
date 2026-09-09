@@ -75,7 +75,7 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --demo            Auto-play every bundled track in a repeating loop\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nRight click toggles mouse driving: left/right steer, up adds throttle, down adds brake\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
+                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --demo            Auto-play every bundled track in a repeating loop\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nRight click toggles mouse driving: left/right steer, up adds throttle, down adds brake\nU toggles US / metric HUD units (default: US)\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
                 );
                 std::process::exit(0);
             }
@@ -291,6 +291,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
     race.started = opts.autodrive;
     let mut paused = false;
     let mut help = false;
+    let mut units = hud::Units::default();
     let mut fullscreen = false;
     let mut accumulator = 0.;
     let mut frames = 0;
@@ -328,6 +329,9 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
         }
         if is_key_pressed(KeyCode::F1) {
             help = !help;
+        }
+        if is_key_pressed(KeyCode::U) {
+            units.toggle();
         }
         if is_key_pressed(KeyCode::Escape) {
             if help {
@@ -506,6 +510,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
             &hud::HudState {
                 track_name: &track.name,
                 speed,
+                units,
                 rpm,
                 gear,
                 throttle: car.throttle,
