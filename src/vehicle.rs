@@ -77,7 +77,7 @@ struct RoadPoint {
 #[derive(Clone, Copy)]
 struct RoadSweep {
     before: Vec3,
-    /// A deck or shoulder supporting the car before the move, never an overpass.
+    /// A deck or shoulder beneath the preceding position, never an overpass.
     support: Option<RoadPoint>,
 }
 
@@ -241,8 +241,10 @@ impl Car {
 
         let sweep = RoadSweep {
             before,
-            support: old_road
-                .filter(|road| was_grounded && road_surface(*road, ground_height).is_some()),
+            support: old_road.filter(|road| {
+                road_surface(*road, ground_height)
+                    .is_some_and(|surface| before.y - RIDE_HEIGHT >= surface.height - 0.08)
+            }),
         };
         let max_surface_height =
             (before.y - RIDE_HEIGHT).max(self.position.y - RIDE_HEIGHT) + CONTACT_TOLERANCE;
@@ -287,8 +289,9 @@ impl Car {
         // Keep the one-sided sweep valid for those transitions as well.
         let landed = !on_same_surface
             && current_bottom <= surface.height
-            && previous_clearance >= -0.08
-            && self.velocity.y <= required_vertical + 0.3
+            && (new_road.is_some_and(|road| road.swept_contact)
+                || (previous_clearance >= -0.08
+                    && self.velocity.y <= required_vertical + 0.3))
             // The height crossing must occur on the finite deck. A car can
             // fall below a landing while over a gap, then reach the road's
             // footprint later in this step without ever touching its top.
@@ -593,18 +596,33 @@ fn nearest_road(
         // Gap centerlines remain eligible: they only guide airborne progress.
         let surface = road_surface(point, ground_height);
         let surface_height = surface.map_or(plane_height, |surface| surface.height);
+        // A changing bank has longitudinal height variation that the final
+        // cross-section normal cannot represent. Compare the actual heights
+        // at both ends of a connected sweep, including airborne approaches.
+        point.swept_contact = surface.is_some_and(|surface| {
+            position.y - RIDE_HEIGHT <= surface.height
+                && sweep.is_some_and(|sweep| {
+                    sweep.support.is_some_and(|support| {
+                        crosses_connected_surface(
+                            track,
+                            support,
+                            point,
+                            sweep.before,
+                            position,
+                            true,
+                        )
+                    })
+                })
+        });
         if !matches!(sample.kind, RoadKind::Gap)
             && surface_height > max_surface_height.min(position.y - RIDE_HEIGHT + CONTACT_TOLERANCE)
         {
             // A steep surface can rise past an airborne car in one step. Its
             // plane provides a one-sided sweep for both decks and shoulders.
-            // Changing bank can also lift a surface beyond the height allowance,
-            // but its cross-section normal omits that longitudinal rise. That
-            // recovery needs a supported, connected chain of solid sections.
-            point.swept_contact = surface.is_some_and(|surface| {
+            point.swept_contact |= surface.is_some_and(|surface| {
                 position.y - RIDE_HEIGHT <= surface.height
                     && sweep.is_some_and(|sweep| {
-                        (sweep.before.y - RIDE_HEIGHT
+                        sweep.before.y - RIDE_HEIGHT
                             >= plane_height_at(surface, position, sweep.before) - 0.08
                             && (surface.offroad
                                 || crosses_finite_deck(
@@ -614,17 +632,7 @@ fn nearest_road(
                                     sweep.before,
                                     position,
                                     ground_height,
-                                )))
-                            || sweep.support.is_some_and(|support| {
-                                crosses_connected_surface(
-                                    track,
-                                    support,
-                                    point,
-                                    sweep.before,
-                                    position,
-                                    true,
-                                )
-                            })
+                                ))
                     })
             });
             // Downward motion can exceed ordinary contact's current-position
@@ -1539,6 +1547,55 @@ mod tests {
     }
 
     #[test]
+    fn airborne_car_lands_on_a_rising_bank_transition() {
+        for bank in [-30.0_f32, 30.0] {
+            for direction in [-1.0, 1.0] {
+                for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                    let track = Track::parse(&format!(
+                        "width 20\nstraight 100\nstraight 4 bank {bank}\nstraight 100"
+                    ))
+                    .unwrap();
+                    // Evaluate the straight road and shoulder heights directly
+                    // so a missed collider cannot also hide a failed assertion.
+                    let surface_height = |car: &Car| {
+                        let sample = track.sample_at(car.position.z);
+                        let lateral = car.position.x / sample.right.x;
+                        let half_width = sample.width * 0.5;
+                        if lateral.abs() <= half_width {
+                            sample.pos.y + lateral * sample.right.y
+                        } else {
+                            let edge =
+                                sample.pos.y + lateral.signum() * half_width * sample.right.y;
+                            let fraction = (lateral.abs() - half_width) / SHOULDER_WIDTH;
+                            edge + (track.ground_height() - edge) * fraction
+                        }
+                    };
+                    for offset in [5.0, 12.0] {
+                        let mut car = Car::new(&track);
+                        let start = if direction > 0.0 { 100.0 } else { 104.0 };
+                        car.reset(&track, start);
+                        car.position +=
+                            track.sample_at(start).right * (offset * bank.signum() * direction);
+                        car.position.y = surface_height(&car) + RIDE_HEIGHT + 0.2;
+                        car.velocity = Vec3::Z * 40.0 * direction;
+                        car.heading = car.velocity.x.atan2(car.velocity.z);
+                        car.grounded = false;
+                        for _ in 0..(0.2 / dt).ceil() as usize {
+                            car.update(&track, Control::default(), dt);
+                            assert!(
+                                car.position.y - RIDE_HEIGHT >= surface_height(&car) - 0.05,
+                                "passed through rising bank {bank}, direction {direction}, offset {offset}, dt {dt}: {car:?}"
+                            );
+                        }
+                        assert!(car.grounded);
+                        assert_eq!(car.offroad, offset > 10.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rapid_banking_transitions_cannot_swallow_a_supported_car() {
         for bank in [-30.0_f32, 30.0] {
             for length in [1.0, 2.0, 4.0] {
@@ -1733,13 +1790,21 @@ mod tests {
     #[test]
     fn deck_recovery_cannot_snap_across_a_gap_to_a_higher_landing() {
         let track = Track::parse("straight 100\ngap 1 rise 0.6\nstraight 100").unwrap();
-        let mut car = Car::new(&track);
-        car.reset(&track, 99.9);
-        car.velocity = Vec3::Z * 40.0;
-        car.update(&track, Control::default(), 1.0 / 30.0);
-        assert!(car.position.z > 101.0, "the step must cross the whole gap");
-        assert!(!car.grounded && car.offroad);
-        assert!((car.position.y - RIDE_HEIGHT).abs() < 0.01);
+        for airborne in [false, true] {
+            let mut car = Car::new(&track);
+            car.reset(&track, 99.9);
+            if airborne {
+                car.position.y += 0.1;
+                car.grounded = false;
+            }
+            let initial_height = car.position.y;
+            car.velocity = Vec3::Z * 40.0;
+            car.update(&track, Control::default(), 1.0 / 30.0);
+            assert!(car.position.z > 101.0, "the step must cross the whole gap");
+            assert!(!car.grounded && car.offroad);
+            let expected_height = initial_height - if airborne { GRAVITY / 900.0 } else { 0.0 };
+            assert!((car.position.y - expected_height).abs() < 0.001);
+        }
     }
 
     #[test]

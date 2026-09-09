@@ -120,7 +120,10 @@ and keeping the same 10 m clearance from the start and finish.
 
 `close` does **not** invent a connector or teleport the road. Before it, build
 back to within 0.25 m of the start with matching heading, slope, bank and width.
-The parser removes tiny rounding drift at the seam. This complete oval closes:
+The parser removes tiny rounding drift at the seam, provided this does not
+collapse or reverse the final sampled segment. A short, densely sampled final
+transition may need a more precise endpoint or a longer final command.
+This complete oval closes:
 
 ```text
 straight 140

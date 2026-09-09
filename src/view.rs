@@ -26,7 +26,10 @@ impl DriverCamera {
         let eye = position + up * 0.84 + forward * 0.4;
         let fov = (66. + (speed / 180.).min(1.) * 5.).to_radians();
         let projection = Mat4::perspective_rh_gl(fov, aspect, 0.08, 3000.);
-        let view = Mat4::look_at_rh(eye, eye + forward, up);
+        // Preserve the direction directly: constructing a target one metre
+        // from a distant eye loses precision and makes the view jitter as the
+        // car moves through large, otherwise valid track coordinates.
+        let view = Mat4::look_to_rh(eye, forward, up);
         // An ordinary RH camera looking along +Z puts +X on screen-left.
         // Reflect clip-space X so the driver's right agrees with the road,
         // vehicle, keyboard controls, and course map. Depth and up are unchanged.
@@ -158,9 +161,19 @@ mod tests {
                 .unwrap()
         };
         let (origin, radius) = project(Vec3::ZERO);
-        let (translated, translated_radius) = project(vec3(500., 80., -700.));
-        assert!(origin.distance(translated) < 0.05);
-        assert_eq!(radius, translated_radius);
+        for position in [
+            vec3(500., 80., -700.),
+            vec3(50_000., 1_500., -10_000.),
+            vec3(50_000.01, 1_500., -9_999.99),
+        ] {
+            let (translated, translated_radius) = project(position);
+            assert!(
+                origin.distance(translated) < 0.05,
+                "camera translation {position:?} moved the sun by {} pixels",
+                origin.distance(translated)
+            );
+            assert_eq!(radius, translated_radius);
+        }
     }
 
     #[test]

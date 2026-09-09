@@ -463,7 +463,21 @@ impl Builder {
         // Remove floating point drift at the seam, keeping cumulative distance.
         let index = self.track.samples.len() - 1;
         let previous = self.track.samples[index - 1];
-        self.track.length = previous.distance + previous.pos.distance(first.pos);
+        let closing_chord = first.pos - previous.pos;
+        let length = previous.distance + closing_chord.length();
+        // A short bank transition may have samples much closer than the seam
+        // tolerance. Snapping a slight overshoot back to the start must not
+        // leave an overlapping backwards segment or duplicate sample distance.
+        if closing_chord.dot(previous.forward) <= 0.0
+            || closing_chord.dot(first.forward) <= 0.0
+            || length <= previous.distance
+        {
+            return Err(
+                "'close' would collapse or reverse the final road segment; match the endpoint more precisely or use a longer final segment"
+                    .into(),
+            );
+        }
+        self.track.length = length;
         self.track.samples[index] = RoadSample {
             distance: self.track.length,
             ..first
@@ -788,6 +802,54 @@ mod tests {
                 < 0.001
         );
         assert!(track.sample_at(track.length).pos.distance(Vec3::ZERO) < 0.0001);
+    }
+
+    #[test]
+    fn close_rejects_reversing_a_short_final_segment() {
+        let source = "straight 20\nright 180 radius 20\nstraight 20.9\nright 180 radius 20 bank 60\nstraight 1 bank 0";
+        let open = Track::parse(source).unwrap();
+        let previous = open.samples[open.samples.len() - 2];
+        assert!(previous.pos.z > open.samples[0].pos.z);
+        let error = Track::parse(&format!("{source}\nclose")).unwrap_err();
+        assert!(error.contains("collapse or reverse"), "{error}");
+    }
+
+    #[test]
+    fn close_rejects_collapsing_a_short_final_segment() {
+        let source = "start 0 0 1000\nstraight 20\nright 180 radius 20\nstraight 20.75\nright 180 radius 20 bank 12\nstraight 1 bank 0";
+        let open = Track::parse(source).unwrap();
+        assert_eq!(
+            open.samples[open.samples.len() - 2].pos,
+            open.samples[0].pos
+        );
+        let error = Track::parse(&format!("{source}\nclose")).unwrap_err();
+        assert!(error.contains("collapse or reverse"), "{error}");
+    }
+
+    #[test]
+    fn close_rejects_a_segment_below_cumulative_distance_precision() {
+        let source = "straight 20\nright 180 radius 20\nstraight 20.947372\nright 180 radius 20 bank 60\nstraight 1 bank 0";
+        let open = Track::parse(source).unwrap();
+        let previous = open.samples[open.samples.len() - 2];
+        assert!(previous.pos.z < open.samples[0].pos.z);
+        assert!((previous.pos.z - open.samples[0].pos.z).abs() < 0.000001);
+        let error = Track::parse(&format!("{source}\nclose")).unwrap_err();
+        assert!(error.contains("collapse or reverse"), "{error}");
+    }
+
+    #[test]
+    fn close_keeps_safe_drift_correction_on_short_final_segments() {
+        for return_length in [20.95, 21.1] {
+            let source = format!(
+                "straight 20\nright 180 radius 20\nstraight {return_length}\nright 180 radius 20 bank 60\nstraight 1 bank 0\nclose",
+            );
+            let track = Track::parse(&source).unwrap();
+            assert_eq!(track.samples.last().unwrap().pos, track.samples[0].pos);
+            for pair in track.samples.windows(2) {
+                assert!(pair[1].distance > pair[0].distance);
+                assert!((pair[1].pos - pair[0].pos).dot(pair[0].forward) > 0.0);
+            }
+        }
     }
 
     #[test]
