@@ -151,8 +151,9 @@ close
   transitions).
   Even short elevation transitions include interior samples so their hills
   and incoming ramp slopes remain represented in the driving surface.
-  Short banking changes receive extra samples to keep the rendered edges close
-  to the full-width driving surface.
+  Short banking changes and banked slope transitions receive extra samples to
+  keep the rendered edges close to the full-width driving surface, including
+  where a banked road climbs or descends.
   Timing distances use the resulting **3D centerline distance**, so an uphill
   `straight 100` can contribute slightly more than 100 m to course length.
 - Put a straight after the final corner to allow braking before a sprint ends.

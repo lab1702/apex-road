@@ -870,21 +870,35 @@ fn nearest_road_with_tolerance(
         let end_normal = horizontal(b.right).cross(Vec3::Y).normalize();
         let start_offset = horizontal(position - a.pos).dot(start_normal);
         let end_offset = horizontal(position - b.pos).dot(end_normal);
-        if start_offset < -segment_tolerance || end_offset > segment_tolerance {
-            continue;
-        }
-        let along = if start_offset.abs() <= segment_tolerance {
+        // Pitch and bank can turn an offset cross-section against the
+        // centerline's direction. Accept either sign change. Only snap a
+        // point outside that bracket to a nearby seam: on dense transitions,
+        // the full interval can be narrower than the usual seam tolerance.
+        let bracketed = (start_offset >= 0.0 && end_offset <= 0.0)
+            || (start_offset <= 0.0 && end_offset >= 0.0);
+        // Arithmetic on a translated track can leave an exact shared edge a
+        // few ULPs inside either neighbor. Preserve outgoing edge kinds there
+        // without consuming a measurable part of a short segment.
+        let roundoff =
+            segment_tolerance.min(0.00001 + f32::EPSILON * position.x.abs().max(position.z.abs()));
+        let along = if start_offset.abs() <= roundoff
+            || (!bracketed && start_offset.abs() <= segment_tolerance)
+        {
             0.0
-        } else if end_offset.abs() <= segment_tolerance {
+        } else if end_offset.abs() <= roundoff
+            || (!bracketed && end_offset.abs() <= segment_tolerance)
+        {
             1.0
+        } else if !bracketed {
+            continue;
         } else {
             // Interpolate the cross-section that contains the car. On a
             // banked hill, the road's right vector has a longitudinal
             // horizontal component, so projecting onto the centerline can
             // move progress by metres just from steering across the deck.
             // The interpolated raw frame gives a quadratic in `along`;
-            // this stable root crosses from the positive start half-plane to
-            // the negative end half-plane and also handles a linear segment.
+            // select the stable root for either crossing direction, also
+            // handling a linear segment.
             let start_normal = horizontal(a.right).cross(Vec3::Y);
             let normal_change = horizontal(b.right - a.right).cross(Vec3::Y);
             let offset = horizontal(position - a.pos);
@@ -892,10 +906,17 @@ fn nearest_road_with_tolerance(
             let linear = offset.dot(normal_change) - chord.dot(start_normal);
             let constant = offset.dot(start_normal);
             let discriminant = (linear * linear - 4.0 * quadratic * constant).max(0.0);
-            let along = (2.0 * constant / (-linear + discriminant.sqrt())).clamp(0.0, 1.0);
+            let signed_root = discriminant.sqrt().copysign(start_offset);
+            let along = if linear * constant > 0.0 {
+                // Rationalizing the root would subtract nearly equal terms
+                // in its denominator near a seam with this slope direction.
+                (-linear - signed_root) / (2.0 * quadratic)
+            } else {
+                2.0 * constant / (-linear + signed_root)
+            };
             let forward = a.forward.lerp(b.forward, along);
             let right = a.right.lerp(b.right, along);
-            if forward.dot(right).abs() <= 0.000001 {
+            if (0.0..=1.0).contains(&along) && forward.dot(right).abs() <= 0.000001 {
                 along
             } else {
                 // sample_at removes the interpolated right axis's forward
@@ -912,7 +933,7 @@ fn nearest_road_with_tolerance(
                     let right = right - forward * (forward.dot(right) / forward.length_squared());
                     let normal = horizontal(right).cross(Vec3::Y);
                     let offset = horizontal(position - a.pos.lerp(b.pos, middle));
-                    if offset.dot(normal) > 0.0 {
+                    if offset.dot(normal) * start_offset > 0.0 {
                         lower = middle;
                     } else {
                         upper = middle;
@@ -939,11 +960,7 @@ fn nearest_road_with_tolerance(
             width,
             bank: a.bank + (b.bank - a.bank) * along,
             distance,
-            kind: if end_offset >= -segment_tolerance {
-                b.kind
-            } else {
-                a.kind
-            },
+            kind: if along == 1.0 { b.kind } else { a.kind },
         };
         let plane_height = pos.y - horizontal(position - pos).dot(up) / up.y.max(0.15);
         let contact = vec3(position.x, plane_height, position.z);
@@ -976,9 +993,19 @@ fn nearest_road_with_tolerance(
             };
         let outside = (lateral.abs() - footprint_width).max(0.0) * horizontal(right).length();
         let vertical = position.y - RIDE_HEIGHT - surface_height;
+        // A tolerated seam extension must not tie with the real interior of
+        // its neighbor on a level road and pin progress to the earlier edge.
+        let seam_offset = if along == 0.0 {
+            start_offset
+        } else if along == 1.0 {
+            end_offset
+        } else {
+            0.0
+        };
         // Height separates crossing bridges. A small continuity preference
         // disambiguates joins, parallel lanes, and paths through a jump.
         let score = outside * outside
+            + seam_offset * seam_offset
             + vertical * vertical * 3.0
             + ((progress_delta - 12.0).max(0.0) * 0.025)
                 .powi(2)
@@ -1611,6 +1638,80 @@ mod tests {
 
     fn wide_straight() -> Track {
         Track::parse("width 40\nstraight 1000").unwrap()
+    }
+
+    #[test]
+    fn interior_progress_remains_continuous_between_close_sample_edges() {
+        for (origin, approach_segments) in [(0, 0), (10000, 0), (10000, 4), (10000, 8)] {
+            let mut track = Track::parse(&format!(
+                "start {origin} 0 {origin}\n{}straight 20",
+                "straight 5000\n".repeat(approach_segments),
+            ))
+            .unwrap();
+            // Dense tilt transitions can put both neighboring edges within
+            // the 1 cm seam tolerance. Keep interior progress even far from
+            // world zero, to within the precision of cumulative f32 distance.
+            let start = approach_segments as f32 * 5000.0;
+            let inserted = track.sample_at(start + 0.016);
+            let index = track
+                .samples
+                .partition_point(|sample| sample.distance <= start);
+            track.samples.insert(index, inserted);
+            for offset in [0.004, 0.008, 0.012] {
+                let distance = start + offset;
+                let position = track.sample_at(distance).pos + Vec3::Y * RIDE_HEIGHT;
+                let road = nearest_road(
+                    &track,
+                    position,
+                    distance,
+                    CONTACT_TOLERANCE,
+                    track.ground_height(),
+                    None,
+                )
+                .unwrap();
+                let tolerance = (f32::EPSILON * distance.max(1.0)).max(0.000001);
+                assert!(
+                    (road.sample.distance - distance).abs() <= tolerance,
+                    "origin {origin}, approach {start}, distance {distance}: got {}",
+                    road.sample.distance,
+                );
+                assert!(road.plane_height.abs() < 0.000001);
+            }
+        }
+    }
+
+    #[test]
+    fn reversed_cross_section_brackets_preserve_progress_and_contact() {
+        let track = Track::parse(
+            "width 40\nstraight 20 bank 60\nright 140 radius 22 rise -26.87807 bank -60\nstraight 20",
+        )
+        .unwrap();
+        let (distance, contact) = track
+            .samples
+            .windows(2)
+            .find_map(|pair| {
+                let [a, b] = [pair[0], pair[1]];
+                let distance = (a.distance + b.distance) * 0.5;
+                let sample = track.sample_at(distance);
+                let contact = sample.pos + sample.right * 16.0;
+                let start =
+                    horizontal(contact - a.pos).dot(horizontal(a.right).cross(Vec3::Y).normalize());
+                let end =
+                    horizontal(contact - b.pos).dot(horizontal(b.right).cross(Vec3::Y).normalize());
+                (start < -0.05 && end > 0.05).then_some((distance, contact))
+            })
+            .expect("the banked hill must reverse its projected cross-sections");
+        let road = nearest_road(
+            &track,
+            contact + Vec3::Y * RIDE_HEIGHT,
+            distance,
+            contact.y + CONTACT_TOLERANCE,
+            track.ground_height(),
+            None,
+        )
+        .unwrap();
+        assert!((road.sample.distance - distance).abs() < 0.001);
+        assert!((road.plane_height - contact.y).abs() < 0.001);
     }
 
     #[test]

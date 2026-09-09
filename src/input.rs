@@ -1,5 +1,6 @@
 //! Relative mouse driving, independent of the render rate and window edges.
 use crate::vehicle::Control;
+use macroquad::miniquad::KeyMods;
 use macroquad::prelude::*;
 
 // Logical pixels from neutral to full steering or full throttle/brake.
@@ -108,6 +109,19 @@ impl macroquad::miniquad::EventHandler for WindowInput {
 
     fn mouse_motion_event(&mut self, x: f32, y: f32) {
         self.mouse_motion.push(vec2(x, y));
+    }
+
+    fn key_down_event(&mut self, _keycode: KeyCode, _keymods: KeyMods, repeat: bool) {
+        // Miniquad also emits "minimized" when a macOS window moves, without
+        // a matching restore event. A fresh press proves input is reaching the
+        // window again. Keep the loss latched so mouse driving still pauses.
+        if !repeat {
+            self.focused = true;
+        }
+    }
+
+    fn mouse_button_down_event(&mut self, _button: MouseButton, _x: f32, _y: f32) {
+        self.focused = true;
     }
 
     fn window_minimized_event(&mut self) {
@@ -271,5 +285,47 @@ mod tests {
         focus.window_restored_event();
         assert!(focus.focused && focus.take_loss());
         assert!(!focus.take_loss());
+    }
+
+    #[test]
+    fn fresh_input_recovers_a_missing_restore_event_without_discarding_loss() {
+        use macroquad::miniquad::EventHandler;
+        for mouse_press in [false, true] {
+            let mut focus = WindowInput::new();
+            focus.window_minimized_event();
+            if mouse_press {
+                focus.mouse_button_down_event(MouseButton::Right, 10.0, 20.0);
+            } else {
+                focus.key_down_event(KeyCode::Enter, KeyMods::default(), false);
+            }
+            assert!(focus.focused);
+            assert!(
+                focus.take_loss(),
+                "active input must preserve the pause latch"
+            );
+            assert!(!focus.take_loss());
+
+            // The final event controls focus: an earlier press cannot mask a
+            // later focus loss in the same rendered frame.
+            focus.window_minimized_event();
+            assert!(!focus.focused && focus.take_loss());
+        }
+    }
+
+    #[test]
+    fn passive_input_does_not_restore_an_unfocused_window() {
+        use macroquad::miniquad::EventHandler;
+        let mut focus = WindowInput::new();
+        focus.window_minimized_event();
+        focus.mouse_motion_event(10.0, 20.0);
+        focus.key_down_event(KeyCode::W, KeyMods::default(), true);
+        focus.key_up_event(KeyCode::W, KeyMods::default());
+        focus.mouse_button_up_event(MouseButton::Right, 10.0, 20.0);
+        assert!(!focus.focused);
+        assert!(focus.take_loss());
+        assert_eq!(
+            focus.drain_mouse_motion().collect::<Vec<_>>(),
+            [vec2(10.0, 20.0)]
+        );
     }
 }

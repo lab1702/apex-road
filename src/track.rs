@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 const SAMPLE_SPACING: f32 = 2.0;
-const MAX_BANK_STEP: f32 = 5.0_f32.to_radians();
+const MAX_TILT_STEP: f32 = 5.0_f32.to_radians();
 const MAX_SAMPLES: usize = 25_001;
 const MAX_LENGTH: f32 = 50_000.0;
 const MAX_FILE_BYTES: usize = 1_000_000;
@@ -423,11 +423,21 @@ impl Builder {
         let elevation_transition = rise != 0.0 || self.grade != 0.0 || end_grade != 0.0;
         let steps = steps.max(if elevation_transition { 4 } else { 1 });
         // Mesh edges interpolate linearly, while driving frames keep a unit
-        // right vector. Large bank changes between samples would pinch the
-        // rendered road far inside its collision surface. Smoothstep's maximum
-        // derivative is 1.5, so this bounds adjacent bank changes to five degrees.
-        let bank_steps = ((end_bank - start.bank).abs() * 1.5 / MAX_BANK_STEP).ceil() as usize;
-        let steps = steps.max(bank_steps);
+        // right vector. Both banking and the changing pitch of a banked hill
+        // rotate that vector; sparse samples can leave metres of invisible
+        // driving surface beyond the rendered road. Smoothstep's maximum bank
+        // derivative is 1.5. Pitch is atan(grade), whose derivative is bounded
+        // by the grade derivative, a line with its maximum at an endpoint.
+        // Bound their combined rotation to five degrees between samples.
+        let pitch_rate = if start.bank != 0.0 || end_bank != 0.0 {
+            slope_b.abs().max((2.0 * slope_a + slope_b).abs())
+        } else {
+            // Without banking, the right axis stays horizontal as pitch changes.
+            0.0
+        };
+        let tilt_steps =
+            ((pitch_rate + (end_bank - start.bank).abs() * 1.5) / MAX_TILT_STEP).ceil() as usize;
+        let steps = steps.max(tilt_steps);
         if self.track.samples.len() + steps > MAX_SAMPLES {
             return Err(format!(
                 "Track exceeds the {} sample limit; shorten the route",
@@ -1209,6 +1219,41 @@ mod tests {
             assert!((b.bank - a.bank).abs() <= 5.0_f32.to_radians() + 0.0001);
         }
         assert!(transitions > 1);
+    }
+
+    #[test]
+    fn short_banked_hills_keep_rendered_edges_close_to_the_driving_surface() {
+        for width in [12, 40] {
+            for bank in [-60, 60] {
+                for transition in [
+                    "straight 1 rise 0.6",
+                    "ramp 1 rise 0.6\nstraight 1 rise -0.4928",
+                    "ramp 1 rise 0.6\nstraight 1 rise -0.4928 bank 0",
+                ] {
+                    let source = format!(
+                        "width {width}\nstraight 20 bank {bank}\n{transition}\nstraight 20"
+                    );
+                    let track = Track::parse(&source).unwrap();
+                    for pair in track.samples.windows(2) {
+                        let [a, b] = [pair[0], pair[1]];
+                        for t in [0.25, 0.5, 0.75] {
+                            let sample =
+                                track.sample_at(a.distance + (b.distance - a.distance) * t);
+                            for side in [-1.0, 1.0] {
+                                let rendered_edge = (a.pos + a.right * a.width * 0.5 * side)
+                                    .lerp(b.pos + b.right * b.width * 0.5 * side, t);
+                                let driving_edge =
+                                    sample.pos + sample.right * sample.width * 0.5 * side;
+                                assert!(
+                                    rendered_edge.distance(driving_edge) < 0.02,
+                                    "{source}: rendered edge {rendered_edge:?} differs from driving edge {driving_edge:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
