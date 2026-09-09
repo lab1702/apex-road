@@ -261,8 +261,8 @@ impl Car {
         if let Some(road) = new_road {
             self.road_index = road.index;
             self.distance = road.sample.distance;
-            self.resolve_guardrail(track, road, old_road, before);
         }
+        self.resolve_guardrail(track, new_road, old_road, before);
         // Do not attach to an overpass that is above the car. The preceding
         // position provides a swept, one-sided contact test at landings.
         let new_road = nearest_road(
@@ -484,15 +484,18 @@ impl Car {
     fn resolve_guardrail(
         &mut self,
         track: &Track,
-        road: RoadPoint,
+        road: Option<RoadPoint>,
         previous_road: Option<RoadPoint>,
         before: Vec3,
     ) {
         // The barrier follows the banked road frame. Both its correction and
         // impulse must stay in the road plane, or an uphill impact launches
         // the car by retaining its old upward velocity after the rebound.
-        let swept_hit = previous_road
-            .and_then(|prior| guardrail_sweep(track, prior, road, before, self.position));
+        let swept_hit = previous_road.and_then(|prior| {
+            let destination =
+                road.unwrap_or_else(|| guardrail_exit_road(track, prior, before, self.position));
+            guardrail_sweep(track, prior, destination, before, self.position)
+        });
         let (normal, outward) = if let Some((hit, normal, outward)) = swept_hit {
             // Stop at the wall that was crossed. On a taper, shunting all
             // the way to the final narrow cross-section would teleport
@@ -500,6 +503,9 @@ impl Car {
             self.position = hit - outward * 0.001;
             (normal, outward)
         } else {
+            let Some(road) = road else {
+                return;
+            };
             if !matches!(road.sample.kind, RoadKind::Bridge | RoadKind::Tunnel) {
                 return;
             }
@@ -538,6 +544,36 @@ impl Car {
             self.impact = self.impact.max((outward_speed / 10.0).clamp(0.08, 1.0));
         }
     }
+}
+
+/// An endpoint outside every road footprint can still have crossed a rail.
+/// Follow the swept cross-sections from its preceding road so the collision
+/// query includes short final segments without extending the road collider.
+fn guardrail_exit_road(track: &Track, mut road: RoadPoint, before: Vec3, after: Vec3) -> RoadPoint {
+    let forward = horizontal(after - before).dot(road.sample.forward) >= 0.0;
+    let direction = if forward { 1.0 } else { -1.0 };
+    let segments = track.samples.len() - 1;
+    for _ in 0..segments {
+        let boundary = track.samples[road.index + usize::from(forward)];
+        let normal = horizontal(boundary.right).cross(Vec3::Y).normalize();
+        let start = horizontal(before - boundary.pos).dot(normal) * direction;
+        let end = horizontal(after - boundary.pos).dot(normal) * direction;
+        if start > SEGMENT_TOLERANCE || end < -SEGMENT_TOLERANCE || end <= start {
+            break;
+        }
+        road.sample = boundary;
+        if !track.closed
+            && ((forward && road.index + 1 == segments) || (!forward && road.index == 0))
+        {
+            break;
+        }
+        road.index = if forward {
+            (road.index + 1) % segments
+        } else {
+            (road.index + segments - 1) % segments
+        };
+    }
+    road
 }
 
 /// Sweep the chassis center against the inset edges of the intervening road
@@ -1390,6 +1426,66 @@ mod tests {
     }
 
     #[test]
+    fn taper_collision_precedes_leaving_the_track_in_the_same_step() {
+        for kind in ["bridge", "tunnel"] {
+            let track = Track::parse(&format!("width 40\n{kind} 30\nwidth 4\n{kind} 1")).unwrap();
+            for side in [-1.0, 1.0] {
+                for (start, dt) in [(30.8, STEP), (30.8, 1.0 / 60.0), (29.9, 1.0 / 30.0)] {
+                    let mut car = Car::new(&track);
+                    car.reset(&track, start);
+                    car.position.x = side * 4.0;
+                    car.velocity = Vec3::Z * 40.0;
+                    car.update(&track, Control::default(), dt);
+                    assert!(car.position.z < 31.0, "missed final {kind} rail: {car:?}");
+                    assert!(car.velocity.z < 0.0 && car.impact > 0.0);
+                    assert!(car.grounded && !car.offroad);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_exits_hit_side_rails_in_both_directions_and_only_at_deck_height() {
+        for kind in ["bridge", "tunnel"] {
+            let track = Track::parse(&format!("{kind} 100")).unwrap();
+            for direction in [-1.0, 1.0] {
+                let start = if direction > 0.0 { 99.8 } else { 0.2 };
+                for side in [-1.0, 1.0] {
+                    for below_deck in [false, true] {
+                        let mut car = Car::new(&track);
+                        car.reset(&track, start);
+                        car.position.x = side * 5.1;
+                        if below_deck {
+                            car.position.y = track.ground_height() + RIDE_HEIGHT;
+                        }
+                        car.velocity = vec3(side * 20.0, 0.0, direction * 40.0);
+                        car.update(&track, Control::default(), STEP);
+                        if below_deck {
+                            assert!(car.position.x.abs() > 5.2);
+                            assert!(!(0.0..=100.0).contains(&car.position.z));
+                            assert_eq!(car.impact, 0.0);
+                            assert!(car.grounded && car.offroad);
+                        } else {
+                            assert!(car.position.x.abs() <= 6.0 - CAR_HALF_WIDTH);
+                            assert!((0.0..100.0).contains(&car.position.z));
+                            assert!(car.velocity.x * side < 0.0 && car.impact > 0.0);
+                            assert!(car.grounded && !car.offroad);
+                        }
+                    }
+                }
+                // The road still ends here: an unobstructed exit has no wall.
+                let mut car = Car::new(&track);
+                car.reset(&track, start);
+                car.velocity = Vec3::Z * direction * 40.0;
+                car.update(&track, Control::default(), STEP);
+                assert!(!(0.0..=100.0).contains(&car.position.z));
+                assert_eq!(car.impact, 0.0);
+                assert!(!car.grounded);
+            }
+        }
+    }
+
+    #[test]
     fn guardrail_sweep_requires_the_height_of_the_crossed_deck() {
         let track = Track::parse("start 0 8 0\nbridge 100").unwrap();
         for side in [-1.0, 1.0] {
@@ -1437,7 +1533,7 @@ mod tests {
         let mut car = Car::new(&track);
         car.position = after;
         car.velocity = Vec3::Z * 20.0;
-        car.resolve_guardrail(&track, to, Some(from), before);
+        car.resolve_guardrail(&track, Some(to), Some(from), before);
         assert_eq!(car.position, after);
         assert_eq!(car.velocity, Vec3::Z * 20.0);
         assert_eq!(car.impact, 0.0);
