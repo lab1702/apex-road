@@ -307,10 +307,21 @@ impl RunRecords {
         race: &mut Race,
         candidate: Option<f32>,
     ) -> std::io::Result<Option<SavedRecord>> {
+        let previous_best = self.best;
         let Some(candidate) = self.accept(candidate) else {
             return Ok(None);
         };
-        let saved = save_record(path, candidate)?;
+        let saved = match save_record(path, candidate) {
+            Ok(saved) => saved,
+            Err(error) => {
+                // Race already promoted the candidate. Keep both best-time
+                // thresholds at the saved value so a failed write cannot
+                // suppress later records, including after a restart.
+                self.best = previous_best;
+                race.best = previous_best;
+                return Err(error);
+            }
+        };
         self.best = Some(saved.best);
         race.best = Some(saved.best);
         Ok(Some(saved))
@@ -709,6 +720,53 @@ mod driving_checks {
         assert_eq!(slow_race.best, Some(35.0));
         assert_eq!(slow_records.best, Some(35.0));
         assert_eq!(read_record(&path), Some(35.0));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_record_saves_do_not_suppress_later_persistent_records() {
+        let directory =
+            std::env::temp_dir().join(format!("apex-record-recovery-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("course.best");
+        let track = Track::parse("straight 40").unwrap();
+        for previous_best in [None, Some(60.0)] {
+            if let Some(best) = previous_best {
+                save_record(&path, best).unwrap();
+            }
+            let mut records = RunRecords::new(previous_best);
+            let mut race = records.start_race(track.finish_distance() - 1.0, true);
+            race.started = true;
+            race.next_checkpoint = track.checkpoints.len();
+            let candidate = race.update(&track, 40.0, track.finish_distance(), true);
+            assert_eq!(candidate, Some(40.0));
+            // Block the temporary write regardless of test-user permissions.
+            let blocked = path.with_extension("tmp");
+            std::fs::create_dir(&blocked).unwrap();
+            assert!(records.save_candidate(&path, &mut race, candidate).is_err());
+            assert_eq!(race.last, Some(40.0));
+            assert_eq!(race.best, previous_best);
+            assert_eq!(records.best, previous_best);
+            assert_eq!(read_record(&path), previous_best);
+
+            // Once the destination is repaired, even a slower run can beat the
+            // persistent record. The failed write must not hide that candidate.
+            std::fs::remove_dir(&blocked).unwrap();
+            race = records.start_race(track.finish_distance() - 1.0, true);
+            race.started = true;
+            race.next_checkpoint = track.checkpoints.len();
+            let candidate = race.update(&track, 50.0, track.finish_distance(), true);
+            assert_eq!(candidate, Some(50.0));
+            let saved = records
+                .save_candidate(&path, &mut race, candidate)
+                .unwrap()
+                .unwrap();
+            assert!(saved.improved);
+            assert_eq!(read_record(&path), Some(50.0));
+            assert_eq!(race.best, Some(50.0));
+            assert_eq!(records.best, Some(50.0));
+            std::fs::remove_file(&path).unwrap();
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 
