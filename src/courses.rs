@@ -64,6 +64,7 @@ pub fn next_path(current: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::collections::HashSet;
 
     #[test]
@@ -96,27 +97,22 @@ mod tests {
 
     #[test]
     fn custom_course_with_a_bundled_filename_starts_the_bundled_cycle() {
-        let directory =
-            std::env::temp_dir().join(format!("apex-custom-course-test-{}", std::process::id()));
-        let path = directory.join("tracks/club.track");
+        let directory = TempDir::new("apex-custom-course-test");
+        let path = directory.path().join("tracks/club.track");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "straight 40").unwrap();
         let next = next_path(&path).unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
         assert_eq!(next, PathBuf::from(BUNDLED_PATHS[0]));
     }
 
     #[cfg(unix)]
     #[test]
     fn bundled_course_alias_continues_from_its_actual_position() {
-        let directory =
-            std::env::temp_dir().join(format!("apex-course-alias-test-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let alias = directory.join("favorite.track");
+        let directory = TempDir::new("apex-course-alias-test");
+        let alias = directory.path().join("favorite.track");
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join(BUNDLED_PATHS[1]);
         std::os::unix::fs::symlink(bundled, &alias).unwrap();
         let next = next_path(&alias).unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
         assert_eq!(next, PathBuf::from(BUNDLED_PATHS[2]));
     }
 
@@ -126,19 +122,16 @@ mod tests {
         // without racing the other tests' relative file accesses.
         const CHILD: &str = "APEX_RELOAD_PATH_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let directory =
-                std::env::temp_dir().join(format!("apex-reload-path-test-{}", std::process::id()));
-            std::fs::create_dir_all(&directory).unwrap();
+            let directory = TempDir::new("apex-reload-path-test");
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "courses::tests::reload_keeps_the_selected_file_when_local_overrides_change",
                     "--nocapture",
                 ])
-                .env(CHILD, &directory)
-                .current_dir(&directory)
+                .env(CHILD, directory.path())
+                .current_dir(directory.path())
                 .output();
-            std::fs::remove_dir_all(directory).unwrap();
             let output = result.unwrap();
             assert!(
                 output.status.success(),

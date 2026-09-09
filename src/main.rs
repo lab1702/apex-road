@@ -2,6 +2,8 @@ mod courses;
 mod hud;
 mod input;
 mod race;
+#[cfg(test)]
+mod test_support;
 mod track;
 mod vehicle;
 mod view;
@@ -639,6 +641,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
 #[cfg(test)]
 mod driving_checks {
     use super::*;
+    use crate::test_support::TempDir;
     use macroquad::camera::Camera;
 
     #[test]
@@ -658,9 +661,8 @@ mod driving_checks {
 
     #[test]
     fn screenshot_export_is_png_or_reports_io_errors_without_panicking() {
-        let dir = std::env::temp_dir().join(format!("apex-capture-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("nested/capture.without-png-extension");
+        let dir = TempDir::new("apex-capture-test");
+        let path = dir.path().join("nested/capture.without-png-extension");
         let screenshot = Image {
             bytes: vec![255, 0, 0, 255, 0, 0, 255, 255],
             width: 1,
@@ -676,19 +678,16 @@ mod driving_checks {
         assert_eq!(decoded.dimensions(), (1, 2));
         assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 255, 255]);
         assert_eq!(decoded.get_pixel(0, 1).0, [255, 0, 0, 255]);
-        assert!(save_capture(&dir, &screenshot).is_err());
+        assert!(save_capture(dir.path(), &screenshot).is_err());
         assert!(save_capture(&path.join("blocked.png"), &screenshot).is_err());
         #[cfg(target_os = "linux")]
         assert!(save_capture(Path::new("/dev/full"), &screenshot).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_stale_session_cannot_replace_a_faster_saved_record() {
-        let directory =
-            std::env::temp_dir().join(format!("apex-stale-record-test-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("course.best");
+        let directory = TempDir::new("apex-stale-record-test");
+        let path = directory.path().join("course.best");
         let mut fast_records = RunRecords::new(None);
         let mut slow_records = RunRecords::new(None);
         let mut fast_race = fast_records.start_race(0.0, true);
@@ -720,15 +719,12 @@ mod driving_checks {
         assert_eq!(slow_race.best, Some(35.0));
         assert_eq!(slow_records.best, Some(35.0));
         assert_eq!(read_record(&path), Some(35.0));
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn failed_record_saves_do_not_suppress_later_persistent_records() {
-        let directory =
-            std::env::temp_dir().join(format!("apex-record-recovery-test-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("course.best");
+        let directory = TempDir::new("apex-record-recovery-test");
+        let path = directory.path().join("course.best");
         let track = Track::parse("straight 40").unwrap();
         for previous_best in [None, Some(60.0)] {
             if let Some(best) = previous_best {
@@ -767,7 +763,6 @@ mod driving_checks {
             assert_eq!(records.best, Some(50.0));
             std::fs::remove_file(&path).unwrap();
         }
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -798,11 +793,8 @@ mod driving_checks {
             return;
         }
 
-        let directory = std::env::temp_dir().join(format!(
-            "apex-concurrent-record-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
+        let fixture = TempDir::new("apex-concurrent-record-test");
+        let directory = fixture.path();
         let children: Vec<_> = (0..4)
             .map(|writer| {
                 std::process::Command::new(std::env::current_exe().unwrap())
@@ -811,7 +803,7 @@ mod driving_checks {
                         "driving_checks::record_writers_share_one_lock_across_processes",
                         "--nocapture",
                     ])
-                    .env(CHILD, &directory)
+                    .env(CHILD, directory)
                     .env(WRITER, writer.to_string())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -831,7 +823,6 @@ mod driving_checks {
         let best = read_record(&directory.join("course.best"));
         assert!(directory.join("course.lock").is_file());
         assert!(!directory.join("course.tmp").exists());
-        std::fs::remove_dir_all(directory).unwrap();
         for output in outputs {
             assert!(
                 output.status.success(),
@@ -845,10 +836,8 @@ mod driving_checks {
 
     #[test]
     fn record_saving_preserves_read_errors_and_recovers_invalid_numbers() {
-        let directory =
-            std::env::temp_dir().join(format!("apex-record-errors-test-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("course.best");
+        let directory = TempDir::new("apex-record-errors-test");
+        let path = directory.path().join("course.best");
         std::fs::create_dir(&path).unwrap();
         assert!(save_record(&path, 60.0).is_err());
         assert!(path.is_dir());
@@ -858,7 +847,6 @@ mod driving_checks {
         assert!(saved.improved);
         assert_eq!(saved.best, 60.0);
         assert_eq!(read_record(&path), Some(60.0));
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

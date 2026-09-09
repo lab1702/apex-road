@@ -635,9 +635,14 @@ impl Car {
             // Without a proven wall crossing, retain the local correction
             // for a car already touching the rail. An outside approach
             // must not teleport through the bridge to its inside edge.
-            let old_lateral =
-                (before - Vec3::Y * RIDE_HEIGHT - road.sample.pos).dot(road.sample.right);
-            if old_lateral.abs() > road.sample.width * 0.5 + 1.0 {
+            // Measure the prior horizontal footprint on the deck plane.
+            // Airborne clearance otherwise moves this coordinate inward on
+            // the downhill side of a bank even while the car stays outside.
+            let old_offset = horizontal(before - road.sample.pos);
+            let old_contact =
+                old_offset - Vec3::Y * old_offset.dot(road.sample.up) / road.sample.up.y.max(0.15);
+            let old_lateral = old_contact.dot(road.sample.right);
+            if old_lateral.abs() > road.sample.width * 0.5 + SEGMENT_TOLERANCE {
                 return;
             }
             let normal = road.sample.up;
@@ -2237,6 +2242,41 @@ mod tests {
         assert_eq!(car.position, after);
         assert_eq!(car.velocity, Vec3::Z * 20.0);
         assert_eq!(car.impact, 0.0);
+    }
+
+    #[test]
+    fn flying_just_outside_a_guardrail_does_not_teleport_onto_the_deck() {
+        for kind in ["bridge", "tunnel"] {
+            for bank in [-60, 0, 60] {
+                for rise in [-20, 0, 20] {
+                    let track =
+                        Track::parse(&format!("straight 50 bank {bank}\n{kind} 100 rise {rise}"))
+                            .unwrap();
+                    let sample = track.sample_at(80.0);
+                    for side in [-1.0, 1.0] {
+                        for offset in [0.25, 0.75] {
+                            for clearance in [-0.25, 0.0, 0.5] {
+                                let mut car = Car::new(&track);
+                                car.reset(&track, 80.0);
+                                car.position +=
+                                    sample.right * side * (6.0 + offset) + Vec3::Y * clearance;
+                                car.velocity = sample.forward * 25.0;
+                                car.grounded = false;
+                                let before = car.position;
+                                car.update(&track, Control::default(), STEP);
+                                assert!(
+                                    (car.position.x - before.x).abs() < 0.001,
+                                    "pulled inside {kind}, bank {bank}, rise {rise}, side {side}, clearance {clearance}: {car:?}"
+                                );
+                                assert!(car.position.z > before.z);
+                                assert!(!car.grounded && car.offroad);
+                                assert_eq!(car.impact, 0.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

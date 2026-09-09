@@ -724,31 +724,14 @@ fn tokenize(line: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TrackFile(std::path::PathBuf);
-
-    impl TrackFile {
-        fn new() -> Self {
-            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!(
-                "apex-road-track-test-{}-{id}.track",
-                std::process::id()
-            )))
-        }
-    }
-
-    impl Drop for TrackFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn source_identity_belongs_to_the_loaded_version() {
-        let file = TrackFile::new();
-        std::fs::write(&file.0, "straight 40\n").unwrap();
-        let loaded = Track::load(&file.0).unwrap();
+        let directory = TempDir::new("apex-road-track-test");
+        let file = directory.path().join("course.track");
+        std::fs::write(&file, "straight 40\n").unwrap();
+        let loaded = Track::load(&file).unwrap();
         let original_hash = loaded.source_hash();
         assert_eq!(original_hash, 0x64633c68e54952d9);
         assert_eq!(
@@ -756,14 +739,14 @@ mod tests {
             Track::parse("straight 40\n").unwrap().source_hash()
         );
 
-        std::fs::write(&file.0, "straight 80\n").unwrap();
-        let reloaded = Track::load(&file.0).unwrap();
+        std::fs::write(&file, "straight 80\n").unwrap();
+        let reloaded = Track::load(&file).unwrap();
         assert_ne!(original_hash, reloaded.source_hash());
         assert_eq!(loaded.source_hash(), original_hash);
         assert_eq!(loaded.length, 40.0);
         assert_eq!(reloaded.length, 80.0);
 
-        std::fs::remove_file(&file.0).unwrap();
+        std::fs::remove_file(&file).unwrap();
         assert_eq!(loaded.source_hash(), original_hash);
         assert_eq!(loaded.clone().source_hash(), original_hash);
         // Source identity includes comments and whitespace, preserving the
@@ -776,23 +759,24 @@ mod tests {
 
     #[test]
     fn loading_enforces_the_byte_limit_before_decoding() {
-        let file = TrackFile::new();
+        let directory = TempDir::new("apex-road-track-test");
+        let file = directory.path().join("course.track");
         let mut source = String::from("straight 40\n#");
         source.extend(std::iter::repeat_n(' ', MAX_FILE_BYTES - source.len()));
-        std::fs::write(&file.0, &source).unwrap();
-        assert_eq!(Track::load(&file.0).unwrap().length, 40.0);
+        std::fs::write(&file, &source).unwrap();
+        assert_eq!(Track::load(&file).unwrap().length, 40.0);
 
         let mut oversized = source.into_bytes();
         oversized.push(0xff);
-        std::fs::write(&file.0, oversized).unwrap();
-        let error = Track::load(&file.0).unwrap_err();
+        std::fs::write(&file, oversized).unwrap();
+        let error = Track::load(&file).unwrap_err();
         assert!(error.contains("exceeds the 1 MB limit"), "{error}");
-        assert!(error.contains(&file.0.display().to_string()), "{error}");
+        assert!(error.contains(&file.display().to_string()), "{error}");
 
-        std::fs::write(&file.0, b"straight 40\n#\xff").unwrap();
-        let error = Track::load(&file.0).unwrap_err();
+        std::fs::write(&file, b"straight 40\n#\xff").unwrap();
+        let error = Track::load(&file).unwrap_err();
         assert!(error.contains("Cannot read track"), "{error}");
-        assert!(error.contains(&file.0.display().to_string()), "{error}");
+        assert!(error.contains(&file.display().to_string()), "{error}");
     }
 
     #[test]
