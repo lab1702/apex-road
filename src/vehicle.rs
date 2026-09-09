@@ -585,19 +585,10 @@ fn nearest_road(
         let plane_height = pos.y - horizontal(position - pos).dot(up) / up.y.max(0.15);
         let contact = vec3(position.x, plane_height, position.z);
         let lateral = (contact - pos).dot(right);
-        let delta = horizontal(position - pos);
-        let vertical = position.y - RIDE_HEIGHT - plane_height;
         let mut progress_delta = (distance - previous_distance).abs();
         if track.closed && track.length > 0.0 {
             progress_delta = progress_delta.min((track.length - progress_delta).abs());
         }
-        // Height separates crossing bridges. A small continuity preference
-        // disambiguates joins, parallel lanes, and paths through a jump.
-        let score = delta.length_squared()
-            + vertical * vertical * 3.0
-            + ((progress_delta - 12.0).max(0.0) * 0.025)
-                .powi(2)
-                .min(180.0);
         let mut point = RoadPoint {
             sample,
             index,
@@ -611,6 +602,24 @@ fn nearest_road(
         // Gap centerlines remain eligible: they only guide airborne progress.
         let surface = road_surface(point, ground_height);
         let surface_height = surface.map_or(plane_height, |surface| surface.height);
+        // Compare finite surfaces rather than centerlines: a narrow adjacent
+        // deck or its lower shoulder must not hide the wide road under a car.
+        // Gap footprints retain their virtual plane for airborne progress.
+        let footprint_width = width * 0.5
+            + if matches!(sample.kind, RoadKind::Road | RoadKind::Ramp) {
+                SHOULDER_WIDTH
+            } else {
+                0.0
+            };
+        let outside = (lateral.abs() - footprint_width).max(0.0) * horizontal(right).length();
+        let vertical = position.y - RIDE_HEIGHT - surface_height;
+        // Height separates crossing bridges. A small continuity preference
+        // disambiguates joins, parallel lanes, and paths through a jump.
+        let score = outside * outside
+            + vertical * vertical * 3.0
+            + ((progress_delta - 12.0).max(0.0) * 0.025)
+                .powi(2)
+                .min(180.0);
         // A changing bank has longitudinal height variation that the final
         // cross-section normal cannot represent. Compare the actual heights
         // at both ends of a connected sweep, including airborne approaches.
@@ -2147,6 +2156,33 @@ mod tests {
                 .is_some()
         );
         assert!(race.finished && !race.invalid);
+    }
+
+    #[test]
+    fn a_nearby_narrow_route_does_not_hide_the_road_beneath_the_car() {
+        for adjacent in [
+            "straight 20\nright 180 radius 12 kind bridge\nbridge 140",
+            "straight 20\nright 180 radius 12 kind tunnel\ntunnel 140",
+            "straight 20\nright 180 radius 12\nstraight 140",
+            "straight 20 rise 3\nright 180 radius 9 kind gap\ngap 140\nstraight 20",
+        ] {
+            let track =
+                Track::parse(&format!("width 40\nstraight 100\nwidth 4\n{adjacent}")).unwrap();
+            for speed in [0.0, 15.0] {
+                let mut car = Car::new(&track);
+                car.reset(&track, 50.0);
+                car.position.x = 19.0;
+                car.velocity = Vec3::Z * speed;
+                advance(&mut car, &track, Control::default(), 0.5);
+                assert!(
+                    car.grounded && !car.offroad,
+                    "lost supporting wide road beside {adjacent}, speed {speed}: {car:?}"
+                );
+                assert!((car.position.y - RIDE_HEIGHT).abs() < 0.001);
+                assert!((car.distance - car.position.z).abs() < 0.01);
+                assert!((car.velocity.z - speed).abs() < 0.5);
+            }
+        }
     }
 
     #[test]
