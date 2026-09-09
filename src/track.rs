@@ -451,7 +451,8 @@ impl Builder {
         if self.track.samples[self.track.samples.len() - 2].kind == RoadKind::Gap {
             return Err("Track must finish on a drivable road, not a gap".into());
         }
-        if self.track.sample_at(self.track.finish_distance()).kind == RoadKind::Gap {
+        let finish = self.track.finish_distance();
+        if self.track.sample_at(finish).kind == RoadKind::Gap {
             return Err(
                 "Sprint finish line is 3 m before the endpoint and must be on solid road; extend the landing road".into(),
             );
@@ -469,7 +470,7 @@ impl Builder {
             .track
             .checkpoints
             .last()
-            .is_some_and(|d| self.track.length - d < 10.0)
+            .is_some_and(|d| finish - d < 10.0)
         {
             return Err("The final checkpoint must be at least 10 m before the finish".into());
         }
@@ -478,7 +479,7 @@ impl Builder {
             for fraction in [0.25, 0.5, 0.75] {
                 let candidate = self.track.length * fraction;
                 if candidate >= 10.0
-                    && self.track.length - candidate >= 10.0
+                    && finish - candidate >= 10.0
                     && self.track.sample_at(candidate).kind != RoadKind::Gap
                 {
                     self.track.checkpoints.push(candidate);
@@ -794,6 +795,40 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_leave_ten_metres_before_the_timing_finish() {
+        for landing_length in [10, 11, 12] {
+            let source = format!("straight 30\ncheckpoint\nstraight {landing_length}");
+            let error = Track::parse(&source).unwrap_err();
+            assert!(error.contains("at least 10 m before the finish"), "{error}");
+        }
+        let sprint = Track::parse("straight 30\ncheckpoint\nstraight 13").unwrap();
+        assert_eq!(sprint.finish_distance() - sprint.checkpoints[0], 10.0);
+
+        let circuit = Track::parse(
+            "straight 20\nright 180 radius 20\nstraight 30\nright 180 radius 20\ncheckpoint\nstraight 10\nclose",
+        )
+        .unwrap();
+        assert!((circuit.finish_distance() - circuit.checkpoints[0] - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn automatic_checkpoints_respect_the_timing_finish_and_skip_gaps() {
+        for (source, expected) in [
+            ("straight 20", vec![]),
+            ("straight 40", vec![10.0, 20.0]),
+            ("straight 52", vec![13.0, 26.0, 39.0]),
+            ("straight 20\ngap 50\nstraight 50", vec![90.0]),
+        ] {
+            let track = Track::parse(source).unwrap();
+            assert_eq!(track.checkpoints, expected, "{source}");
+            for &distance in &track.checkpoints {
+                assert!(track.finish_distance() - distance >= 10.0, "{source}");
+                assert_ne!(track.sample_at(distance).kind, RoadKind::Gap, "{source}");
+            }
+        }
+    }
+
+    #[test]
     fn short_hills_retain_their_surface_slope_and_downhill_gravity() {
         let track = Track::parse("straight 20\nstraight 2 rise 1\nstraight 20").unwrap();
         let interior: Vec<_> = track
@@ -844,7 +879,7 @@ mod tests {
         assert_eq!(track.sample_at(-100.0).pos, Vec3::ZERO);
         assert_eq!(track.sample_at(f32::NAN).pos, Vec3::ZERO);
         assert_eq!(track.sample_at(100.0).pos, vec3(0.0, 0.0, 40.0));
-        assert_eq!(track.checkpoints.len(), 3);
+        assert_eq!(track.checkpoints, vec![10.0, 20.0]);
     }
 
     #[test]

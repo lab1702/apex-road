@@ -6,7 +6,8 @@ pub struct Race {
     pub finished: bool,
     /// Finish crossings since the last reset, including invalid laps/runs.
     pub completed_runs: u64,
-    pub elapsed: f32,
+    /// Keep accumulated simulation time precise; display and stored records use f32.
+    pub elapsed: f64,
     pub best: Option<f32>,
     pub last: Option<f32>,
     pub next_checkpoint: usize,
@@ -51,7 +52,7 @@ impl Race {
         if !dt.is_finite() || dt <= 0.0 {
             return None;
         }
-        self.elapsed += dt;
+        self.elapsed += f64::from(dt);
         let mut delta = distance - self.previous;
         if track.closed {
             if delta < -track.length * 0.5 {
@@ -80,19 +81,19 @@ impl Race {
                 }
                 // Divide the simulation step at the finish plane. Otherwise
                 // the completed lap gains a frame and the next one loses it.
-                let remainder = dt * ((end - finish) / delta).clamp(0.0, 1.0);
+                let remainder = f64::from(dt) * f64::from(((end - finish) / delta).clamp(0.0, 1.0));
                 let completed_time = self.elapsed - remainder;
-                let result = if !self.invalid && self.best.is_none_or(|best| completed_time < best)
-                {
-                    self.best = Some(completed_time);
-                    Some(completed_time)
+                let record_time = completed_time as f32;
+                let result = if !self.invalid && self.best.is_none_or(|best| record_time < best) {
+                    self.best = Some(record_time);
+                    Some(record_time)
                 } else {
                     None
                 };
                 self.last = if self.invalid {
                     None
                 } else {
-                    Some(completed_time)
+                    Some(record_time)
                 };
                 if track.closed {
                     self.elapsed = remainder;
@@ -325,8 +326,33 @@ mod tests {
         race.next_checkpoint = track.checkpoints.len();
         race.elapsed = 10.0;
         assert_eq!(race.update(&track, 0.4, 199.0, true), Some(10.2));
-        assert_eq!(race.elapsed, 10.2);
+        assert!((race.elapsed - 10.2).abs() < 0.000001);
         assert!(race.finished);
+    }
+
+    #[test]
+    fn long_run_keeps_clock_and_record_within_a_millisecond() {
+        let track = straight();
+        let mut race = Race::new(None, 5.0);
+        race.started = true;
+        let dt = 1.0 / 120.0;
+        let total_steps = 1800 * 120;
+        let steps_to_finish = 192;
+        for step in 1..=total_steps - steps_to_finish {
+            assert!(race.update(&track, dt, 5.0, true).is_none());
+            if step == 600 * 120 {
+                assert!((race.elapsed - 600.0).abs() < 0.001);
+            }
+        }
+        let mut record = None;
+        for distance in 6..=197 {
+            record = race.update(&track, dt, distance as f32, true).or(record);
+        }
+        assert!(race.finished && !race.invalid);
+        assert!((race.elapsed - 1800.0).abs() < 0.001);
+        assert!((record.unwrap() - 1800.0).abs() < 0.001);
+        assert_eq!(race.last, record);
+        assert_eq!(race.best, record);
     }
 
     #[test]

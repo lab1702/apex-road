@@ -474,7 +474,7 @@ async fn game(opts: Options, mut track: Track) {
                 brake: car.brake,
                 steering: car.steering / 0.58,
                 slip: car.slip,
-                elapsed: race.elapsed,
+                elapsed: race.elapsed as f32,
                 best: race.best,
                 last: race.last,
                 checkpoint: race.next_checkpoint,

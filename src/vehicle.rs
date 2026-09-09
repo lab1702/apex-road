@@ -69,7 +69,8 @@ struct RoadPoint {
     index: usize,
     lateral: f32,
     plane_height: f32,
-    horizontal_right: Vec3,
+    /// The motion crossed a rising shoulder from above during this step.
+    crossed_shoulder: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +207,7 @@ impl Car {
             self.distance,
             before.y - RIDE_HEIGHT + 0.25,
             ground_height,
+            None,
         );
         let old_surface = contact_surface(old_road, before.y - RIDE_HEIGHT + 0.25, ground_height);
         let was_grounded =
@@ -236,6 +238,7 @@ impl Car {
             self.distance,
             max_surface_height,
             ground_height,
+            Some(before),
         );
         if let Some(road) = new_road {
             self.road_index = road.index;
@@ -250,6 +253,7 @@ impl Car {
             self.distance,
             max_surface_height,
             ground_height,
+            Some(before),
         );
         let surface = contact_surface(new_road, max_surface_height, ground_height);
         let required_vertical = surface_vertical_speed(self.velocity, surface.normal);
@@ -257,7 +261,8 @@ impl Car {
         let previous_clearance =
             before.y - RIDE_HEIGHT - plane_height_at(surface, self.position, before);
         let on_same_surface = was_grounded
-            && (current_bottom - surface.height).abs() < 0.30
+            && ((current_bottom - surface.height).abs() < 0.30
+                || new_road.is_some_and(|road| road.crossed_shoulder))
             && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025;
         let landed = !was_grounded
             && current_bottom <= surface.height
@@ -437,18 +442,24 @@ impl Car {
         }
         // Cars approaching the side from below/outside should not teleport
         // through an entire bridge to its inside edge.
-        let old_lateral = (before - road.sample.pos).dot(road.horizontal_right);
+        let old_lateral = (before - Vec3::Y * RIDE_HEIGHT - road.sample.pos).dot(road.sample.right);
         if old_lateral.abs() > road.sample.width * 0.5 + 1.0 {
             return;
         }
         let side = road.lateral.signum();
-        self.position += road.horizontal_right * (side * limit - road.lateral);
-        let outward_speed = self.velocity.dot(road.horizontal_right) * side;
+        // The barrier follows the banked road frame. Both its correction and
+        // impulse must stay in the road plane, or an uphill impact launches
+        // the car by retaining its old upward velocity after the rebound.
+        let normal = road.sample.up;
+        let lateral_axis = (road.sample.right - normal * road.sample.right.dot(normal)).normalize();
+        self.position +=
+            lateral_axis * ((side * limit - road.lateral) / lateral_axis.dot(road.sample.right));
+        let outward_speed = self.velocity.dot(lateral_axis) * side;
         if outward_speed > 0.0 {
-            self.velocity -= road.horizontal_right * side * outward_speed * 1.12;
+            self.velocity -= lateral_axis * side * outward_speed * 1.12;
             let scrub = (outward_speed * 0.012).min(0.16);
-            self.velocity.x *= 1.0 - scrub;
-            self.velocity.z *= 1.0 - scrub;
+            let tangent_velocity = self.velocity - normal * self.velocity.dot(normal);
+            self.velocity -= tangent_velocity * scrub;
             self.yaw_rate *= 0.68;
             self.impact = self.impact.max((outward_speed / 10.0).clamp(0.08, 1.0));
         }
@@ -472,6 +483,7 @@ fn nearest_road(
     previous_distance: f32,
     max_surface_height: f32,
     ground_height: f32,
+    sweep_start: Option<Vec3>,
 ) -> Option<RoadPoint> {
     let mut best: Option<(f32, RoadPoint)> = None;
     for (index, pair) in track.samples.windows(2).enumerate() {
@@ -520,7 +532,6 @@ fn nearest_road(
                 a.kind
             },
         };
-        let horizontal_right = horizontal(right).normalize_or_zero();
         let plane_height = pos.y - horizontal(position - pos).dot(up) / up.y.max(0.15);
         let contact = vec3(position.x, plane_height, position.z);
         let lateral = (contact - pos).dot(right);
@@ -537,21 +548,33 @@ fn nearest_road(
             + ((progress_delta - 12.0).max(0.0) * 0.025)
                 .powi(2)
                 .min(180.0);
-        let point = RoadPoint {
+        let mut point = RoadPoint {
             sample,
             index,
             lateral,
             plane_height,
-            horizontal_right,
+            crossed_shoulder: false,
         };
         // An overhead deck cannot become the route merely because the car
         // rises closer to it during a jump. Use the same swept height bound as
         // contact, including the actual shoulder height for terrain re-entry.
         // Gap centerlines remain eligible: they only guide airborne progress.
-        let surface_height =
-            road_surface(point, ground_height).map_or(plane_height, |surface| surface.height);
+        let surface = road_surface(point, ground_height);
+        let surface_height = surface.map_or(plane_height, |surface| surface.height);
         if !matches!(sample.kind, RoadKind::Gap) && surface_height > max_surface_height {
-            continue;
+            // A fast approach can penetrate a rising shoulder farther than the
+            // height allowance in one step. Accept that swept crossing only
+            // from above its plane; cars already under a deck stay underneath.
+            point.crossed_shoulder = surface.is_some_and(|surface| {
+                surface.offroad
+                    && position.y - RIDE_HEIGHT <= surface.height
+                    && sweep_start.is_some_and(|before| {
+                        before.y - RIDE_HEIGHT >= plane_height_at(surface, position, before) - 0.08
+                    })
+            });
+            if !point.crossed_shoulder {
+                continue;
+            }
         }
         if best
             .as_ref()
@@ -573,9 +596,11 @@ fn contact_surface(
         normal: Vec3::Y,
         offroad: true,
     };
-    road.and_then(|road| road_surface(road, ground_height))
-        .filter(|surface| surface.height <= max_surface_height)
-        .unwrap_or(ground)
+    road.and_then(|road| {
+        road_surface(road, ground_height)
+            .filter(|surface| surface.height <= max_surface_height || road.crossed_shoulder)
+    })
+    .unwrap_or(ground)
 }
 
 fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
@@ -595,13 +620,13 @@ fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
         let side = road.lateral.signum();
         let edge = road.sample.pos + road.sample.right * half_width * side;
         let fraction = ((road.lateral.abs() - half_width) / SHOULDER_WIDTH).clamp(0.0, 1.0);
-        let side_slope = (ground_height - edge.y) / SHOULDER_WIDTH * side;
-        let flat_forward = horizontal(road.sample.forward);
-        let along_slope = road.sample.forward.y / flat_forward.length().max(0.2) * (1.0 - fraction);
-        let normal = (Vec3::Y
-            - road.horizontal_right * side_slope
-            - flat_forward.normalize_or_zero() * along_slope)
-            .normalize();
+        // Banking shortens and can skew the shoulder's horizontal span. Use
+        // its actual tangents so the normal agrees with the surface height.
+        let across = horizontal(road.sample.right) * SHOULDER_WIDTH
+            + Vec3::Y * (ground_height - edge.y) * side;
+        let along =
+            horizontal(road.sample.forward) + Vec3::Y * road.sample.forward.y * (1.0 - fraction);
+        let normal = along.cross(across).normalize();
         Surface {
             height: edge.y + (ground_height - edge.y) * fraction,
             normal,
@@ -951,6 +976,44 @@ mod tests {
     }
 
     #[test]
+    fn banked_guardrail_impacts_preserve_ground_contact_on_both_sides_and_slopes() {
+        for kind in ["bridge", "tunnel"] {
+            for bank in [-60, -30, -14, 14, 30, 60] {
+                for rise in [-20, 0, 20] {
+                    for side in [-1.0, 1.0] {
+                        let track = Track::parse(&format!(
+                            "straight 50 bank {bank}\n{kind} 200 rise {rise}"
+                        ))
+                        .unwrap();
+                        let mut car = Car::new(&track);
+                        car.reset(&track, 80.0);
+                        let sample = track.sample_at(car.distance);
+                        car.position =
+                            sample.pos + sample.right * (side * 5.0) + Vec3::Y * RIDE_HEIGHT;
+                        car.velocity = sample.right * (side * 8.0) + sample.forward * 22.0;
+                        let mut rebounded = false;
+                        for _ in 0..18 {
+                            car.update(&track, Control::default(), STEP);
+                            assert!(
+                                car.grounded && !car.offroad,
+                                "lost road contact on {kind}, bank {bank}, rise {rise}, side {side}: {car:?}"
+                            );
+                            if car.impact > 0.0 && !rebounded {
+                                let road = track.sample_at(car.distance);
+                                assert!(car.velocity.dot(road.right) * side < 0.0);
+                                rebounded = true;
+                            }
+                        }
+                        assert!(rebounded);
+                        assert!(car.velocity.dot(sample.forward) > 17.0);
+                        assert!(car.impact > 0.1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn car_on_terrain_passes_under_bridge_and_tunnel_guardrails() {
         for kind in ["bridge", "tunnel"] {
             let track = Track::parse(&format!("start 0 8 0\n{kind} 160")).unwrap();
@@ -1032,6 +1095,7 @@ mod tests {
                             gate.distance,
                             position.y + 1.0,
                             track.ground_height(),
+                            None,
                         )
                         .expect("shared cross-section must not leave a contact hole");
                         let expected = if offset < 0.0 {
@@ -1160,6 +1224,7 @@ mod tests {
             100.0,
             0.30,
             track.ground_height(),
+            None,
         )
         .unwrap();
         let upper = nearest_road(
@@ -1168,6 +1233,7 @@ mod tests {
             600.0,
             8.30,
             track.ground_height(),
+            None,
         )
         .unwrap();
         assert!(lower.sample.pos.y.abs() < 0.001);
@@ -1254,6 +1320,78 @@ mod tests {
     }
 
     #[test]
+    fn fast_shoulder_entry_cannot_pass_beneath_a_raised_road() {
+        for bank in [-60, -30, -14, 0, 14, 30, 60] {
+            let track =
+                Track::parse(&format!("straight 50 rise 20 bank {bank}\nstraight 200")).unwrap();
+            let sample = track.sample_at(70.0);
+            let ground = track.ground_height();
+            let half_width = sample.width * 0.5;
+            let outer_edge = half_width + SHOULDER_WIDTH;
+            for side in [-1.0, 1.0] {
+                for speed in [10.0, 20.0, 40.0] {
+                    for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                        let mut car = Car::new(&track);
+                        car.reset(&track, sample.distance);
+                        car.position = sample.pos + sample.right * side * (outer_edge + 1.0);
+                        car.position.y = ground + RIDE_HEIGHT;
+                        car.heading = -side * std::f32::consts::FRAC_PI_2;
+                        car.velocity = -Vec3::X * side * speed;
+                        let mut climbed = false;
+                        for _ in 0..(2.0 / dt) as usize {
+                            car.update(
+                                &track,
+                                Control {
+                                    throttle: 1.0,
+                                    ..Control::default()
+                                },
+                                dt,
+                            );
+                            let lateral = car.position.x / sample.right.x;
+                            if lateral.abs() <= outer_edge {
+                                let edge_height =
+                                    sample.pos.y + lateral.signum() * sample.right.y * half_width;
+                                let fraction =
+                                    ((lateral.abs() - half_width) / SHOULDER_WIDTH).clamp(0.0, 1.0);
+                                let surface_height = if lateral.abs() <= half_width {
+                                    sample.pos.y + lateral * sample.right.y
+                                } else {
+                                    edge_height + (ground - edge_height) * fraction
+                                };
+                                assert!(
+                                    car.position.y - RIDE_HEIGHT >= surface_height - 0.05,
+                                    "passed through shoulder: bank {bank}, side {side}, speed {speed}, dt {dt}, car {car:?}"
+                                );
+                            }
+                            climbed |= car.position.y > ground + RIDE_HEIGHT + 1.0;
+                        }
+                        assert!(
+                            climbed,
+                            "did not enter shoulder: bank {bank}, side {side}, speed {speed}, dt {dt}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn car_already_below_a_raised_shoulder_is_not_pulled_through_it() {
+        let track = Track::parse("straight 50 rise 20\nstraight 200").unwrap();
+        let mut car = Car::new(&track);
+        car.reset(&track, 70.0);
+        car.position.x = 12.0;
+        car.position.y = track.ground_height() + RIDE_HEIGHT;
+        car.heading = -std::f32::consts::FRAC_PI_2;
+        car.velocity = -Vec3::X * 20.0;
+        for _ in 0..60 {
+            car.update(&track, Control::default(), STEP);
+            assert!((car.position.y - track.ground_height() - RIDE_HEIGHT).abs() < 0.01);
+            assert!(car.grounded && car.offroad);
+        }
+    }
+
+    #[test]
     fn exact_gap_boundaries_use_the_outgoing_surface() {
         let track =
             Track::parse("straight 90\ncheckpoint\nstraight 10\ngap 10\nstraight 3").unwrap();
@@ -1266,6 +1404,7 @@ mod tests {
                 distance - 0.25,
                 1.0,
                 track.ground_height(),
+                None,
             )
             .unwrap();
             assert_eq!(road.sample.kind, kind);
