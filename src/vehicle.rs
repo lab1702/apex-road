@@ -361,7 +361,12 @@ impl Car {
         if let Some((hit, normal)) = tunnel_roof_sweep(track, before, self.position) {
             self.position = hit - Vec3::Y * 0.7 - normal * 0.0001;
             self.velocity -= normal * self.velocity.dot(normal).max(0.0);
-            self.velocity.y = self.velocity.y.min(0.0);
+            // Downward motion stays inside an upward-facing ceiling. On a
+            // banked side panel that faces down, removing an upward tangent
+            // would instead put outward velocity back into the wall.
+            if normal.y >= 0.0 {
+                self.velocity.y = self.velocity.y.min(0.0);
+            }
             self.impact = 0.6;
             // The sweep can stop before a gate that the unconstrained step
             // crossed. Timing and surface state must follow the corrected car.
@@ -1044,9 +1049,11 @@ fn tunnel_roof_sweep(track: &Track, before: Vec3, after: Vec3) -> Option<(Vec3, 
                 let u = second - origin;
                 let v = third - origin;
                 let normal = u.cross(v).normalize_or_zero();
-                // Match the upper arch's one-sided boundary. Falling from
-                // outside onto the roof must not pull the car into the tunnel.
-                if normal.y <= 0.0001 {
+                // Winding points out of the tunnel even when banking tilts a
+                // side panel below horizontal. World-up filtering would leave
+                // those visible panels without a collider; the signed sweep
+                // below already rejects approaches from outside the arch.
+                if normal == Vec3::ZERO {
                     continue;
                 }
                 let start = (before - origin).dot(normal);
@@ -1780,6 +1787,61 @@ mod tests {
                 "wrong roof contact at bank {bank}: {car:?}, roof {roof:?}"
             );
             assert!(car.velocity.y <= 0.0 && car.impact > 0.0);
+        }
+    }
+
+    #[test]
+    fn banked_tunnel_side_panels_block_outward_motion() {
+        for (bank, panel) in [(-60, 1), (60, 8)] {
+            let track = Track::parse(&format!("straight 50 bank {bank}\ntunnel 100")).unwrap();
+            let sample = track.sample_at(80.0);
+            let arch = |index: usize| {
+                let angle = index as f32 / 10.0 * std::f32::consts::PI;
+                sample.pos
+                    + sample.right * angle.cos() * (sample.width * 0.5 + 0.65)
+                    + sample.up * (1.0 + angle.sin() * 5.2)
+            };
+            let a = arch(panel);
+            let b = arch(panel + 1);
+            let roof = (a + b) * 0.5;
+            let outward = (b - a).cross(sample.forward).normalize();
+            assert!(outward.y < 0.0, "banking must tilt this panel downward");
+
+            for tangential_speed in [0.0, 24.0] {
+                let tangent = (Vec3::Y - outward * outward.y).normalize();
+                let mut car = Car::new(&track);
+                car.position = roof - Vec3::Y * 0.7 - outward * 0.1;
+                car.velocity = outward * 24.0 + tangent * tangential_speed;
+                car.grounded = false;
+                car.distance = sample.distance;
+                car.update(&track, Control::default(), STEP);
+                assert!(
+                    (car.position + Vec3::Y * 0.7 - roof).dot(outward) <= 0.001,
+                    "escaped through the banked tunnel wall at bank {bank}: {car:?}"
+                );
+                assert!(car.impact > 0.0);
+                assert!(
+                    car.velocity.dot(outward) <= 0.001,
+                    "collision response pushed back through the wall: {car:?}"
+                );
+                if tangential_speed > 0.0 {
+                    assert!(
+                        car.velocity.dot(tangent) > tangential_speed * 0.95,
+                        "glancing collision scrubbed motion along the wall: {car:?}"
+                    );
+                }
+            }
+
+            // The same panel remains one-sided: an exterior approach must
+            // not pull the chassis through the wall into the tunnel.
+            assert!(
+                tunnel_roof_sweep(
+                    &track,
+                    roof - Vec3::Y * 0.7 + outward * 0.1,
+                    roof - Vec3::Y * 0.7 - outward * 0.1,
+                )
+                .is_none()
+            );
         }
     }
 
