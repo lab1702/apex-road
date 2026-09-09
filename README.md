@@ -120,6 +120,22 @@ After taking control, press **R** to start a fresh run that can save records.
 Restarting after a `--at` preview also restores record saving. Switching or
 reloading courses uses the current driving mode to determine record eligibility.
 
+To watch every bundled course in a continuous loop:
+
+```sh
+cargo run --release -- --demo
+```
+
+Demo mode starts driving immediately, completes each sprint or one circuit lap,
+then starts the next course in the **Tab** order above. After the final course,
+it starts over. Use `--track PATH` to choose the first course; a custom starting
+track is followed by the bundled courses. **Tab** skips to the next course,
+and `--frames N` can limit the demo's total duration in rendered frames.
+
+Demo runs do not save records. Right click to take manual control and disable
+both automatic driving and course cycling for the rest of the session. As with
+`--autodrive`, press **R** after taking control to start a record-eligible run.
+
 ## Build a track in text
 
 A `.track` file contains one road-building command per line. Lengths are in
@@ -162,7 +178,8 @@ grammar, examples, limits, and track-design notes.
 | `--track PATH` | Load a specific `.track` file |
 | `--validate PATH` | Parse and check a track without opening a window |
 | `--smoke-test` | Run a 240-frame automated driving demo, then exit |
-| `--autodrive` | Enable automated driving for a graphics demo |
+| `--autodrive` | Enable automated driving on the current course |
+| `--demo` | Auto-drive all bundled courses in sequence, looping indefinitely |
 | `--frames N` | Exit after a specified number of rendered frames |
 | `--at METERS` | Begin the preview at a distance along the track |
 | `--capture PATH` | Write a PNG screenshot |

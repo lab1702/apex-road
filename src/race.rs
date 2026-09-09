@@ -4,6 +4,8 @@ use crate::track::Track;
 pub struct Race {
     pub started: bool,
     pub finished: bool,
+    /// Finish crossings since the last reset, including invalid laps/runs.
+    pub completed_runs: u64,
     pub elapsed: f32,
     pub best: Option<f32>,
     pub last: Option<f32>,
@@ -16,6 +18,7 @@ impl Race {
         Self {
             started: false,
             finished: false,
+            completed_runs: 0,
             elapsed: 0.,
             best: best.filter(|time| time.is_finite() && *time > 0.0),
             last: None,
@@ -75,6 +78,7 @@ impl Race {
             };
             self.cross_checkpoints(track, self.previous, end.min(finish), on_course);
             if self.previous < finish && end >= finish {
+                self.completed_runs += 1;
                 if self.next_checkpoint != track.checkpoints.len() || !on_course {
                     self.invalid = true;
                 }
@@ -143,6 +147,7 @@ mod tests {
             record = r.update(&t, 0.1, d as f32, true).or(record);
         }
         assert!(r.finished);
+        assert_eq!(r.completed_runs, 1);
         assert!(record.is_some());
         assert_eq!(r.next_checkpoint, 1);
     }
@@ -158,6 +163,7 @@ mod tests {
             );
         }
         assert!(r.finished && r.invalid);
+        assert_eq!(r.completed_runs, 1);
         assert!(r.best.is_none());
     }
     #[test]
@@ -167,6 +173,7 @@ mod tests {
         r.started = true;
         r.update(&t, 1., 150., true);
         assert!(r.invalid);
+        assert_eq!(r.completed_runs, 0);
     }
     #[test]
     fn unstarted_clock_stays_still() {
@@ -174,6 +181,7 @@ mod tests {
         let mut r = Race::new(None, 5.);
         r.update(&t, 3., 5., true);
         assert_eq!(r.elapsed, 0.);
+        assert_eq!(r.completed_runs, 0);
     }
 
     fn circuit() -> Track {
@@ -214,6 +222,7 @@ mod tests {
         assert!(race.best.is_none());
         assert!(race.invalid);
         assert_eq!(race.next_checkpoint, track.checkpoints.len());
+        assert_eq!(race.completed_runs, 0);
     }
 
     #[test]
@@ -254,6 +263,7 @@ mod tests {
         let records = advance(&mut race, &track, 0.0, track.length * 2.0 + 3.0, speed);
         assert!(!records.is_empty());
         assert!(!race.finished && !race.invalid);
+        assert_eq!(race.completed_runs, 2);
         assert!((race.last.unwrap() - track.length / speed).abs() < 0.001);
         assert!((race.elapsed - 0.3).abs() < 0.001);
         assert_eq!(race.next_checkpoint, 0);
@@ -276,11 +286,13 @@ mod tests {
         }
         assert!(race.best.is_none() && race.last.is_none());
         assert!(!race.invalid);
+        assert_eq!(race.completed_runs, 1);
         assert_eq!(
             advance(&mut race, &track, track.length, track.length * 2.0, 10.0).len(),
             1
         );
         assert!(race.last.is_some());
+        assert_eq!(race.completed_runs, 2);
     }
 
     #[test]

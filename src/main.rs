@@ -19,18 +19,20 @@ struct Options {
     frames: Option<u64>,
     capture: Option<PathBuf>,
     autodrive: bool,
+    demo: bool,
     at: Option<f32>,
 }
-fn options() -> Result<Options, String> {
+fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut out = Options {
         path: "tracks/alpine.track".into(),
         validate: false,
         frames: None,
         capture: None,
         autodrive: false,
+        demo: false,
         at: None,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--track" => out.path = args.next().ok_or("--track needs a path")?.into(),
@@ -52,6 +54,10 @@ fn options() -> Result<Options, String> {
                 out.capture = Some(args.next().ok_or("--capture needs a PNG path")?.into())
             }
             "--autodrive" => out.autodrive = true,
+            "--demo" => {
+                out.demo = true;
+                out.autodrive = true;
+            }
             "--smoke-test" => {
                 out.frames = Some(240);
                 out.autodrive = true;
@@ -66,7 +72,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nRight click toggles mouse driving: left/right steer, up adds throttle, down adds brake\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
+                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --demo            Auto-play every bundled track in a repeating loop\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nRight click toggles mouse driving: left/right steer, up adds throttle, down adds brake\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
                 );
                 std::process::exit(0);
             }
@@ -108,7 +114,7 @@ fn config() -> macroquad::conf::Conf {
     }
 }
 fn main() {
-    let opts = options().unwrap_or_else(|e| {
+    let opts = options(std::env::args().skip(1)).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
     });
@@ -266,6 +272,9 @@ async fn game(opts: Options, mut track: Track) {
     let mut focus = input::WindowFocus::new();
     let input_subscriber = macroquad::input::utils::register_input_subscriber();
     let mut autodrive = opts.autodrive;
+    if opts.demo {
+        println!("Demo: {}", track.name);
+    }
     let fixed = 1. / 120.;
     loop {
         if is_quit_requested() {
@@ -321,8 +330,10 @@ async fn game(opts: Options, mut track: Track) {
             note = "NEW RUN".into();
             note_time = 2.;
         }
-        let switch = is_key_pressed(KeyCode::Tab);
+        let demo = opts.demo && autodrive;
         let reload = is_key_pressed(KeyCode::F5);
+        let advance_demo = demo && race.completed_runs > 0 && !paused && !help && !reload;
+        let switch = is_key_pressed(KeyCode::Tab) || advance_demo;
         if switch || reload {
             let next = if switch {
                 courses::next_path(&path)
@@ -339,21 +350,28 @@ async fn game(opts: Options, mut track: Track) {
                     records = RunRecords::new(read_record(&record_file));
                     race = records.start_race(car.distance, !autodrive);
                     race.started = autodrive;
+                    if demo {
+                        println!("Demo: {}", track.name);
+                    }
                     camera_pitch = car.pitch;
                     camera_roll = car.roll;
                     accumulator = 0.;
                     paused = false;
                     respawn_timer = 0.;
                     mouse.reset();
-                    note = if reload {
-                        "TRACK RELOADED"
-                    } else {
+                    note = if switch {
                         "COURSE LOADED"
+                    } else {
+                        "TRACK RELOADED"
                     }
                     .into();
                     note_time = 3.;
                 }
                 Err(e) => {
+                    // Stop automatic retries until the user resumes or reloads.
+                    if advance_demo {
+                        paused = true;
+                    }
                     note = format!("RELOAD FAILED: {e}");
                     eprintln!("{note}");
                     note_time = 15.;
@@ -405,7 +423,7 @@ async fn game(opts: Options, mut track: Track) {
                     break;
                 }
                 accumulator -= fixed;
-                if race.finished {
+                if race.finished || (demo && race.completed_runs > 0) {
                     accumulator = 0.;
                     break;
                 }
@@ -505,6 +523,26 @@ async fn game(opts: Options, mut track: Track) {
 mod driving_checks {
     use super::*;
     use macroquad::camera::Camera;
+
+    #[test]
+    fn demo_option_starts_autodrive_and_preserves_preview_options() {
+        for args in [
+            vec!["--demo", "--track", "tracks/club.track", "--frames", "180"],
+            vec!["--track", "tracks/club.track", "--frames", "180", "--demo"],
+        ] {
+            let opts = options(args.into_iter().map(String::from)).unwrap();
+            assert!(opts.demo && opts.autodrive);
+            assert_eq!(opts.path, PathBuf::from("tracks/club.track"));
+            assert_eq!(opts.frames, Some(180));
+        }
+        let opts = options(["--demo".into()]).unwrap();
+        assert!(opts.demo && opts.autodrive);
+        assert!(opts.frames.is_none());
+        assert_eq!(opts.path, PathBuf::from(courses::BUNDLED_PATHS[0]));
+        for args in [vec![], vec!["--autodrive"], vec!["--smoke-test"]] {
+            assert!(!options(args.into_iter().map(String::from)).unwrap().demo);
+        }
+    }
 
     fn finish_straight_run(
         track: &Track,
@@ -626,17 +664,33 @@ mod driving_checks {
     }
 
     #[test]
-    fn demonstration_driver_completes_every_bundled_course() {
-        for path in courses::BUNDLED_PATHS {
-            let track = Track::load(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
+    fn demo_drives_every_bundled_course_and_repeats_without_saving_records() {
+        let opts = options(["--demo".into()]).unwrap();
+        let mut path = opts.path.clone();
+        for expected in courses::BUNDLED_PATHS
+            .iter()
+            .cycle()
+            .take(courses::BUNDLED_PATHS.len() * 2)
+        {
+            assert_eq!(path, PathBuf::from(expected));
+            let track = Track::load(resolve_track(&path)).unwrap();
             let mut car = Car::new(&track);
-            let mut race = Race::new(None, car.distance);
-            race.started = true;
-            for _ in 0..(240 * 120) {
+            let mut records = RunRecords::new(None);
+            let mut race = records.start_race(car.distance, !opts.autodrive);
+            race.started = opts.autodrive;
+            assert_eq!(race.completed_runs, 0);
+            for _ in 0..(240 * 60) {
+                // Match the game's 60 Hz control input and 120 Hz physics.
                 let control = demo_control(&car, &track);
-                car.update(&track, control, 1. / 120.);
-                race.update(&track, 1. / 120., car.distance, !car.offroad);
-                if race.finished || race.last.is_some() {
+                for _ in 0..2 {
+                    car.update(&track, control, 1. / 120.);
+                    let candidate = race.update(&track, 1. / 120., car.distance, !car.offroad);
+                    assert!(records.accept(candidate).is_none());
+                    if race.completed_runs > 0 {
+                        break;
+                    }
+                }
+                if race.completed_runs > 0 {
                     break;
                 }
             }
@@ -657,6 +711,10 @@ mod driving_checks {
                 car.distance,
                 race.next_checkpoint
             );
+            assert_eq!(race.completed_runs, 1);
+            assert!(records.best.is_none());
+            path = courses::next_path(&path);
         }
+        assert_eq!(path, opts.path);
     }
 }
