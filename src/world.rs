@@ -114,9 +114,35 @@ fn edge(s: RoadSample, x: f32, h: f32) -> Vec3 {
 }
 
 struct Chunk {
-    center: Vec3,
+    min: Vec3,
+    max: Vec3,
     mesh: Mesh,
     distant: bool,
+}
+impl Chunk {
+    fn new(mesh: Mesh, distant: bool) -> Self {
+        let origin = mesh.vertices.first().map_or(Vec3::ZERO, |v| v.position);
+        let (min, max) = mesh
+            .vertices
+            .iter()
+            .fold((origin, origin), |(min, max), v| {
+                (min.min(v.position), max.max(v.position))
+            });
+        Self {
+            min,
+            max,
+            mesh,
+            distant,
+        }
+    }
+
+    fn visible_from(&self, position: Vec3) -> bool {
+        // Tall supports and sloping shoulders can be close to the camera even
+        // when the road deck is far away. Cull only when the entire bounds are.
+        !self.mesh.vertices.is_empty()
+            && (self.distant
+                || position.distance_squared(position.clamp(self.min, self.max)) < 900. * 900.)
+    }
 }
 pub struct World {
     chunks: Vec<Chunk>,
@@ -377,11 +403,7 @@ impl World {
                     );
                 }
             }
-            chunks.push(Chunk {
-                center: points[points.len() / 2][0].pos,
-                mesh: b.finish(),
-                distant: false,
-            });
+            chunks.push(Chunk::new(b.finish(), false));
         }
         let mut gates = Builder::new();
         // Circuits share the start gate at the seam; only sprints need a
@@ -440,19 +462,11 @@ impl World {
                 }
             }
             if idx % 32 == 31 {
-                chunks.push(Chunk {
-                    center: s.pos,
-                    mesh: gates.finish(),
-                    distant: true,
-                });
+                chunks.push(Chunk::new(gates.finish(), true));
                 gates = Builder::new();
             }
         }
-        chunks.push(Chunk {
-            center: Vec3::ZERO,
-            mesh: gates.finish(),
-            distant: true,
-        });
+        chunks.push(Chunk::new(gates.finish(), true));
         let min = track
             .samples
             .iter()
@@ -481,11 +495,7 @@ impl World {
                 );
             }
         }
-        chunks.push(Chunk {
-            center: mid,
-            mesh: ground.finish(),
-            distant: true,
-        });
+        chunks.push(Chunk::new(ground.finish(), true));
         // Rounded overlapping alpine ridges; deliberately outside the driving area.
         for k in 0..28u32 {
             let angle = k as f32 / 28. * std::f32::consts::TAU;
@@ -503,11 +513,7 @@ impl World {
                 100. + noise(k + 600) * 240.,
                 k,
             );
-            chunks.push(Chunk {
-                center: p,
-                mesh: b.finish(),
-                distant: true,
-            });
+            chunks.push(Chunk::new(b.finish(), true));
         }
         chunks
     }
@@ -539,7 +545,7 @@ impl World {
         self.material.set_uniform("Eye", camera.position);
         gl_use_material(&self.material);
         for c in &self.chunks {
-            if c.distant || c.center.distance(camera.position) < 900. {
+            if c.visible_from(camera.position) {
                 draw_mesh(&c.mesh);
             }
         }
@@ -661,3 +667,35 @@ void main() {
     gl_FragColor=vec4(mix(color.rgb,haze,clamp(fog,0.0,0.97)),color.a);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearby_bridge_supports_remain_visible_below_a_distant_deck() {
+        let track = Track::parse(
+            "straight 100\nright 180 radius 300 rise 100\nstraight 1000 rise 500\nright 180 radius 300 rise 400\nbridge 1000\nfinish",
+        )
+        .unwrap();
+        let eye = vec3(0., 1.4, 5.);
+        let chunks = World::build_chunks(&track);
+        let nearby_supports: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| {
+                !chunk.distant
+                    && chunk.mesh.vertices.iter().any(|v| v.position.y > 900.)
+                    && chunk
+                        .mesh
+                        .vertices
+                        .iter()
+                        .any(|v| v.position.distance(eye) < 50.)
+            })
+            .collect();
+        assert!(!nearby_supports.is_empty());
+        for chunk in nearby_supports {
+            assert!(chunk.visible_from(eye), "nearby bridge support was culled");
+            assert!(!chunk.visible_from(eye + Vec3::X * 10_000.));
+        }
+    }
+}

@@ -30,9 +30,27 @@ impl MouseDriving {
         self.previous_position = None;
     }
 
-    /// Call once per rendered frame. Captured positions accumulate raw mouse
-    /// motion in Macroquad, so they can travel beyond the window boundaries.
-    pub fn update(&mut self, position: Vec2, active: bool) {
+    /// Replay every motion event before reading the final position. Clamping
+    /// only the frame's net motion loses reversals after reaching a limit.
+    pub fn update_frame(
+        &mut self,
+        motion: impl IntoIterator<Item = Vec2>,
+        position: Vec2,
+        active: bool,
+    ) {
+        if self.enabled && active && self.previous_position.is_some() {
+            for position in motion {
+                self.update(position, true);
+            }
+        }
+        // A reset establishes a new baseline at the current position and skips
+        // queued motion from before activation, resume, or the cursor grab.
+        self.update(position, active);
+    }
+
+    /// Captured positions accumulate raw mouse motion in Macroquad, so they can
+    /// travel beyond the window boundaries.
+    fn update(&mut self, position: Vec2, active: bool) {
         if !self.enabled || !active {
             self.reset();
             return;
@@ -55,29 +73,42 @@ impl MouseDriving {
     }
 }
 
-/// Miniquad reports Linux focus changes as minimized/restored events.
-/// Keep a loss latched even if focus returns within the same rendered frame.
-pub struct WindowFocus {
+/// Preserve mouse event order and keep a focus loss latched even if focus
+/// returns within the same rendered frame. Miniquad reports Linux focus
+/// changes as minimized/restored events.
+pub struct WindowInput {
     pub focused: bool,
     lost: bool,
+    mouse_motion: Vec<Vec2>,
 }
 
-impl WindowFocus {
+impl WindowInput {
     pub fn new() -> Self {
         Self {
             focused: true,
             lost: false,
+            mouse_motion: Vec::new(),
         }
     }
 
     pub fn take_loss(&mut self) -> bool {
         std::mem::take(&mut self.lost)
     }
+
+    /// Event coordinates are physical pixels; callers convert them to the same
+    /// logical pixels returned by Macroquad's `mouse_position`.
+    pub fn drain_mouse_motion(&mut self) -> impl Iterator<Item = Vec2> + '_ {
+        self.mouse_motion.drain(..)
+    }
 }
 
-impl macroquad::miniquad::EventHandler for WindowFocus {
+impl macroquad::miniquad::EventHandler for WindowInput {
     fn update(&mut self) {}
     fn draw(&mut self) {}
+
+    fn mouse_motion_event(&mut self, x: f32, y: f32) {
+        self.mouse_motion.push(vec2(x, y));
+    }
 
     fn window_minimized_event(&mut self) {
         self.focused = false;
@@ -155,6 +186,57 @@ mod tests {
     }
 
     #[test]
+    fn motion_at_limits_is_independent_of_frame_splitting() {
+        let positions = [vec2(3600., -3000.), vec2(3000., -2500.)];
+        let mut single = active_mouse();
+        single.update_frame(positions, positions[1], true);
+        let mut split = active_mouse();
+        for position in positions {
+            split.update_frame([position], position, true);
+        }
+        assert_eq!(single.control(false).steer, 0.5);
+        assert_eq!(single.control(false).throttle, 0.5);
+        assert_eq!(single.control(false).steer, split.control(false).steer);
+        assert_eq!(
+            single.control(false).throttle,
+            split.control(false).throttle
+        );
+    }
+
+    #[test]
+    fn frame_after_reset_discards_queued_motion_before_the_new_baseline() {
+        let mut mouse = active_mouse();
+        mouse.update(vec2(600., -500.), true);
+        mouse.reset();
+        mouse.update_frame(
+            [vec2(3600., -3000.), vec2(3000., -2500.)],
+            vec2(100., 200.),
+            true,
+        );
+        assert_eq!(mouse.control(false).steer, 0.);
+        assert_eq!(mouse.control(false).throttle, 0.);
+        mouse.update_frame([vec2(250., 75.)], vec2(250., 75.), true);
+        assert_eq!(mouse.control(false).steer, 0.125);
+        assert_eq!(mouse.control(false).throttle, 0.125);
+        mouse.update_frame([vec2(3600., -3000.)], vec2(3600., -3000.), false);
+        assert_eq!(mouse.control(false).steer, 0.);
+        assert_eq!(mouse.control(false).throttle, 0.);
+    }
+
+    #[test]
+    fn queued_mouse_motion_retains_event_order_and_drains_each_frame() {
+        use macroquad::miniquad::EventHandler;
+        let mut input = WindowInput::new();
+        input.mouse_motion_event(3600., -3000.);
+        input.mouse_motion_event(3000., -2500.);
+        assert_eq!(
+            input.drain_mouse_motion().collect::<Vec<_>>(),
+            [vec2(3600., -3000.), vec2(3000., -2500.)]
+        );
+        assert_eq!(input.drain_mouse_motion().count(), 0);
+    }
+
+    #[test]
     fn toggling_suspending_and_resetting_discard_stale_motion() {
         let mut mouse = active_mouse();
         mouse.update(vec2(100., -100.), true);
@@ -183,7 +265,7 @@ mod tests {
     #[test]
     fn focus_loss_is_latched_until_handled() {
         use macroquad::miniquad::EventHandler;
-        let mut focus = WindowFocus::new();
+        let mut focus = WindowInput::new();
         focus.window_minimized_event();
         assert!(!focus.focused);
         focus.window_restored_event();

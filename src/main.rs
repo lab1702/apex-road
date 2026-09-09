@@ -295,7 +295,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
     let mut respawn_timer = 0.;
     let mut mouse = input::MouseDriving::default();
     let mut cursor_grabbed = false;
-    let mut focus = input::WindowFocus::new();
+    let mut focus = input::WindowInput::new();
     let input_subscriber = macroquad::input::utils::register_input_subscriber();
     let mut autodrive = opts.autodrive;
     if opts.demo {
@@ -415,7 +415,14 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
             mouse.reset();
         }
         let (mouse_x, mouse_y) = mouse_position();
-        mouse.update(vec2(mouse_x, mouse_y), capture_mouse);
+        let dpi_scale = macroquad::miniquad::window::dpi_scale();
+        mouse.update_frame(
+            focus
+                .drain_mouse_motion()
+                .map(|position| position / dpi_scale),
+            vec2(mouse_x, mouse_y),
+            capture_mouse,
+        );
         let control = if autodrive {
             demo_control(&car, &track)
         } else if mouse.enabled() {
@@ -720,8 +727,9 @@ mod driving_checks {
         for direction in [-1., 1.] {
             let mut mouse = input::MouseDriving::default();
             mouse.toggle();
-            mouse.update(Vec2::ZERO, true);
-            mouse.update(vec2(150. * direction, 0.), true);
+            mouse.update_frame([], Vec2::ZERO, true);
+            let position = vec2(150. * direction, 0.);
+            mouse.update_frame([position], position, true);
             let mut car = Car::new(&track);
             car.velocity = Vec3::Z * 15.;
             let camera = view::DriverCamera::new(car.position, 0., 0., 0., 54., 16. / 9.);

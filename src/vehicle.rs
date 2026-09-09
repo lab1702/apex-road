@@ -76,7 +76,7 @@ struct RoadPoint {
 #[derive(Clone, Copy)]
 struct RoadSweep {
     before: Vec3,
-    /// A deck actually supporting the car before the move, never an overpass.
+    /// A deck or shoulder supporting the car before the move, never an overpass.
     support: Option<RoadPoint>,
 }
 
@@ -240,7 +240,8 @@ impl Car {
 
         let sweep = RoadSweep {
             before,
-            support: old_road.filter(|_| was_grounded && !old_surface.offroad),
+            support: old_road
+                .filter(|road| was_grounded && road_surface(*road, ground_height).is_some()),
         };
         let max_surface_height = (before.y - RIDE_HEIGHT).max(self.position.y - RIDE_HEIGHT) + 0.30;
         let new_road = nearest_road(
@@ -578,7 +579,7 @@ fn nearest_road(
         if !matches!(sample.kind, RoadKind::Gap) && surface_height > max_surface_height {
             // A steep surface can rise past an airborne car in one step. Its
             // plane provides a one-sided sweep for both decks and shoulders.
-            // Changing bank can also lift a deck beyond the height allowance,
+            // Changing bank can also lift a surface beyond the height allowance,
             // but its cross-section normal omits that longitudinal rise. That
             // recovery needs a supported, connected chain of solid sections.
             point.swept_contact = surface.is_some_and(|surface| {
@@ -595,16 +596,16 @@ fn nearest_road(
                                     position,
                                     ground_height,
                                 )))
-                            || (!surface.offroad
-                                && sweep.support.is_some_and(|support| {
-                                    crosses_connected_deck(
-                                        track,
-                                        support,
-                                        point,
-                                        sweep.before,
-                                        position,
-                                    )
-                                }))
+                            || sweep.support.is_some_and(|support| {
+                                crosses_connected_surface(
+                                    track,
+                                    support,
+                                    point,
+                                    sweep.before,
+                                    position,
+                                    true,
+                                )
+                            })
                     })
             });
             if !point.swept_contact {
@@ -648,19 +649,20 @@ fn crosses_finite_deck(
         road_surface(from, ground_height).is_some_and(|surface| {
             !surface.offroad
                 && (crossing.y - RIDE_HEIGHT - surface.height).abs() <= 0.08
-                && crosses_connected_deck(track, from, to, crossing, after)
+                && crosses_connected_surface(track, from, to, crossing, after, false)
         })
     })
 }
 
 /// Check the actual swept path through intervening road cross-sections, rather
-/// than treating proximity in world space as evidence of a connected deck.
-fn crosses_connected_deck(
+/// than treating proximity in world space as evidence of a connected surface.
+fn crosses_connected_surface(
     track: &Track,
     from: RoadPoint,
     to: RoadPoint,
     before: Vec3,
     after: Vec3,
+    allow_shoulders: bool,
 ) -> bool {
     let mut delta = to.sample.distance - from.sample.distance;
     if track.closed {
@@ -693,16 +695,30 @@ fn crosses_connected_deck(
             return false;
         }
         let crossing = before.lerp(after, (start / (start - end)).clamp(0.0, 1.0));
-        let right = horizontal(boundary.right);
-        let lateral = horizontal(crossing - boundary.pos).dot(right) / right.length_squared();
-        if lateral.abs() > boundary.width * 0.5 + SEGMENT_TOLERANCE {
-            return false;
-        }
-        index = if forward {
+        let next_index = if forward {
             (index + 1) % segments
         } else {
             (index + segments - 1) % segments
         };
+        // A shoulder ends when either side of the join is a bridge, tunnel,
+        // or gap. Recovery must not extend terrain support across that edge.
+        let shoulder_width = if allow_shoulders
+            && (starts_at_boundary
+                || matches!(track.samples[index].kind, RoadKind::Road | RoadKind::Ramp))
+            && matches!(
+                track.samples[next_index].kind,
+                RoadKind::Road | RoadKind::Ramp
+            ) {
+            SHOULDER_WIDTH
+        } else {
+            0.0
+        };
+        let right = horizontal(boundary.right);
+        let lateral = horizontal(crossing - boundary.pos).dot(right) / right.length_squared();
+        if lateral.abs() > boundary.width * 0.5 + shoulder_width + SEGMENT_TOLERANCE {
+            return false;
+        }
+        index = next_index;
     }
     // A sweep may not recover onto a gap, including its exact starting edge.
     to.sample.kind != RoadKind::Gap
@@ -1521,6 +1537,95 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn rapid_banking_transitions_cannot_swallow_a_supported_shoulder_car() {
+        for bank in [-30.0_f32, 30.0] {
+            for length in [1.0, 2.0, 4.0] {
+                let track = Track::parse(&format!(
+                    "straight 100\nstraight {length} bank {bank}\nstraight 100"
+                ))
+                .unwrap();
+                let ground = track.ground_height();
+                for direction in [-1.0, 1.0] {
+                    for speed in [20.0, 40.0] {
+                        for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                            let start = if direction > 0.0 {
+                                99.0
+                            } else {
+                                101.0 + length
+                            };
+                            let mut car = Car::new(&track);
+                            car.reset(&track, start);
+                            car.position.x = 10.0 * bank.signum() * direction;
+                            let surface_at = |car: &Car| {
+                                let road = nearest_road(
+                                    &track,
+                                    car.position,
+                                    car.distance,
+                                    10.0,
+                                    ground,
+                                    None,
+                                )
+                                .unwrap();
+                                road_surface(road, ground).unwrap()
+                            };
+                            car.position.y = surface_at(&car).height + RIDE_HEIGHT;
+                            car.heading = if direction > 0.0 {
+                                0.0
+                            } else {
+                                std::f32::consts::PI
+                            };
+                            car.velocity = Vec3::Z * speed * direction;
+                            for _ in 0..(0.5 / dt).ceil() as usize {
+                                car.update(&track, Control::default(), dt);
+                                let surface = surface_at(&car);
+                                assert!(
+                                    car.position.y - RIDE_HEIGHT >= surface.height - 0.05,
+                                    "penetrated shoulder at bank {bank}, length {length}, direction {direction}, speed {speed}, dt {dt}: {car:?}"
+                                );
+                                assert!(car.grounded && car.offroad);
+                            }
+                            assert!((car.distance - start) * direction > length + 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shoulder_recovery_cannot_snap_across_a_gap_or_bridge() {
+        for intervening in ["gap", "bridge", "tunnel"] {
+            let track = Track::parse(&format!(
+                "straight 100\n{intervening} 1 rise 0.6\nstraight 100"
+            ))
+            .unwrap();
+            let mut car = Car::new(&track);
+            car.reset(&track, 99.9);
+            car.position.x = 10.0;
+            let road = nearest_road(
+                &track,
+                car.position,
+                car.distance,
+                10.0,
+                track.ground_height(),
+                None,
+            )
+            .unwrap();
+            car.position.y =
+                road_surface(road, track.ground_height()).unwrap().height + RIDE_HEIGHT;
+            let initial_height = car.position.y;
+            car.velocity = Vec3::Z * 40.0;
+            car.update(&track, Control::default(), 1.0 / 30.0);
+            assert!(car.position.z > 101.0);
+            assert!(
+                !car.grounded && car.offroad,
+                "snapped across {intervening}: {car:?}"
+            );
+            assert!(car.position.y <= initial_height + 0.01);
         }
     }
 
