@@ -372,10 +372,11 @@ impl World {
             });
         }
         let mut gates = Builder::new();
-        // Start/finish and checkpoint gates make progress visible in the world.
+        // Circuits share the start gate at the seam; only sprints need a
+        // separate finish gate before the endpoint.
         for (idx, d) in std::iter::once(0.)
             .chain(track.checkpoints.iter().copied())
-            .chain(std::iter::once(track.length - 3.))
+            .chain((!track.closed).then_some(track.finish_distance()))
             .enumerate()
         {
             let s = track.sample_at(d);
@@ -410,7 +411,7 @@ impl World {
                 vec3(width - 0.8, 0.15, 0.025),
                 color,
             );
-            if idx == 0 || d > track.length - 4. {
+            if idx == 0 || d == track.finish_distance() {
                 for x in 0..16 {
                     for row in 0..2 {
                         let c = if (x + row) % 2 == 0 { CREAM } else { ASPHALT };

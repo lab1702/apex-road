@@ -106,6 +106,10 @@ overlap; the parser does not check all-world intersections.
 
 ## Time trials and closed circuits
 
+Sprint timing and the finish gate sit 3 m before the road endpoint. That
+position must be on solid road; extend the landing if a final gap would cover
+it. Circuits use a single start/finish gate at the closing seam.
+
 Checkpoints must be driven in order. Start and finish are implicit; place
 interior checkpoints at useful road boundaries. They must be at least 10 m
 from the start, finish, and one another. Do not place a checkpoint at the start
@@ -154,6 +158,8 @@ frame, clamps point-to-point routes and wraps closed routes in either
 direction. Non-finite lookup distances return the starting sample.
 `Track::ground_height()` returns the base terrain elevation, 3 m below the
 lowest sampled banked road edge.
+`Track::finish_distance()` returns the distance used by timing and the finish
+gate: the course length for circuits, or 3 m before the endpoint for sprints.
 
 Each `RoadSample` contains `pos`, `forward`, `right`, `up`, `width`, `bank`
 (radians), cumulative `distance`, and `kind`. Its `kind` describes the

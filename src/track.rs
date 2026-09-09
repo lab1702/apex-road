@@ -67,6 +67,15 @@ impl Track {
         builder.finish()
     }
 
+    /// Timing and gate location: the circuit seam or 3 m before a sprint's end.
+    pub fn finish_distance(&self) -> f32 {
+        if self.closed {
+            self.length
+        } else {
+            self.length - 3.0
+        }
+    }
+
     /// Base landscape height, 3 m below the lowest banked road edge.
     /// Deriving this from the route keeps negative-elevation tracks above
     /// their terrain instead of burying them under a fixed world plane.
@@ -442,6 +451,11 @@ impl Builder {
         if self.track.samples[self.track.samples.len() - 2].kind == RoadKind::Gap {
             return Err("Track must finish on a drivable road, not a gap".into());
         }
+        if self.track.sample_at(self.track.finish_distance()).kind == RoadKind::Gap {
+            return Err(
+                "Sprint finish line is 3 m before the endpoint and must be on solid road; extend the landing road".into(),
+            );
+        }
         // A later road command sets the outgoing kind at an existing gate, so
         // its launch-side validation must wait until the route is complete.
         for (&distance, &line_number) in self.track.checkpoints.iter().zip(&self.checkpoint_lines) {
@@ -724,6 +738,42 @@ mod tests {
         assert!(Track::parse("gap 30\nstraight 40").is_err());
         assert!(Track::parse("straight 40\ngap 20").is_err());
         assert!(Track::parse("straight 40\nstart 0 0 0").is_err());
+    }
+
+    #[test]
+    fn sprint_finish_cannot_fall_inside_the_last_gap() {
+        let approach = "straight 100\ncheckpoint\nramp 24 rise 2.5\ngap 14 rise -2.5";
+        for landing in [
+            "straight 1",
+            "straight 2",
+            "bridge 2",
+            "straight 1\nstraight 1",
+        ] {
+            for ending in ["", "\nfinish"] {
+                let Err(error) = Track::parse(&format!("{approach}\n{landing}{ending}")) else {
+                    panic!("the timing line would be inside the gap");
+                };
+                assert!(error.contains("Sprint finish line"), "{error}");
+            }
+        }
+        // The solid landing can span multiple commands, and its exact first
+        // sample belongs to the landing rather than the preceding gap.
+        for landing in [
+            "straight 3",
+            "straight 4",
+            "straight 1\nstraight 1\nstraight 2",
+        ] {
+            let track = Track::parse(&format!("{approach}\n{landing}")).unwrap();
+            assert_ne!(track.sample_at(track.length - 3.0).kind, RoadKind::Gap);
+        }
+        // Circuits finish at the seam, so a short solid segment after a gap
+        // is legal even when the point three metres before the seam is a gap.
+        let circuit = Track::parse(
+            "straight 20\nright 180 radius 20\nstraight 20\nright 170 radius 20\nright 7 radius 20 kind gap\nright 3 radius 20\nclose",
+        )
+        .unwrap();
+        assert_eq!(circuit.sample_at(circuit.length - 3.0).kind, RoadKind::Gap);
+        assert_ne!(circuit.sample_at(circuit.length).kind, RoadKind::Gap);
     }
 
     #[test]

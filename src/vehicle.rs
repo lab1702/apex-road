@@ -199,7 +199,13 @@ impl Car {
         self.steering = approach(self.steering, desired_steer, steering_rate * dt);
 
         let before = self.position;
-        let old_road = nearest_road(track, before, self.distance);
+        let old_road = nearest_road(
+            track,
+            before,
+            self.distance,
+            before.y - RIDE_HEIGHT + 0.25,
+            ground_height,
+        );
         let old_surface = contact_surface(old_road, before.y - RIDE_HEIGHT + 0.25, ground_height);
         let was_grounded =
             self.grounded && (before.y - RIDE_HEIGHT - old_surface.height).abs() < 0.55;
@@ -222,7 +228,14 @@ impl Car {
         self.heading = wrap_angle(self.heading + self.yaw_rate * dt);
         self.position += self.velocity * dt;
 
-        let new_road = nearest_road(track, self.position, self.distance);
+        let max_surface_height = (before.y - RIDE_HEIGHT).max(self.position.y - RIDE_HEIGHT) + 0.30;
+        let new_road = nearest_road(
+            track,
+            self.position,
+            self.distance,
+            max_surface_height,
+            ground_height,
+        );
         if let Some(road) = new_road {
             self.road_index = road.index;
             self.distance = road.sample.distance;
@@ -230,12 +243,14 @@ impl Car {
         }
         // Do not attach to an overpass that is above the car. The preceding
         // position provides a swept, one-sided contact test at landings.
-        let new_road = nearest_road(track, self.position, self.distance);
-        let surface = contact_surface(
-            new_road,
-            (before.y - RIDE_HEIGHT).max(self.position.y - RIDE_HEIGHT) + 0.30,
+        let new_road = nearest_road(
+            track,
+            self.position,
+            self.distance,
+            max_surface_height,
             ground_height,
         );
+        let surface = contact_surface(new_road, max_surface_height, ground_height);
         let required_vertical = surface_vertical_speed(self.velocity, surface.normal);
         let current_bottom = self.position.y - RIDE_HEIGHT;
         let previous_clearance =
@@ -450,7 +465,13 @@ fn tire_force(slip_angle: f32, stiffness: f32, available_grip: f32) -> f32 {
     force * (1.0 - slide_loss)
 }
 
-fn nearest_road(track: &Track, position: Vec3, previous_distance: f32) -> Option<RoadPoint> {
+fn nearest_road(
+    track: &Track,
+    position: Vec3,
+    previous_distance: f32,
+    max_surface_height: f32,
+    ground_height: f32,
+) -> Option<RoadPoint> {
     let mut best: Option<(f32, RoadPoint)> = None;
     for (index, pair) in track.samples.windows(2).enumerate() {
         let a = pair[0];
@@ -476,7 +497,7 @@ fn nearest_road(track: &Track, position: Vec3, previous_distance: f32) -> Option
             width,
             bank: a.bank + (b.bank - a.bank) * along,
             distance,
-            kind: a.kind,
+            kind: if along == 1.0 { b.kind } else { a.kind },
         };
         let horizontal_right = horizontal(right).normalize_or_zero();
         let plane_height = pos.y - horizontal(position - pos).dot(up) / up.y.max(0.15);
@@ -505,6 +526,15 @@ fn nearest_road(track: &Track, position: Vec3, previous_distance: f32) -> Option
                 && ((index == 0 && projection < -0.001)
                     || (index + 2 == track.samples.len() && projection > 1.001)),
         };
+        // An overhead deck cannot become the route merely because the car
+        // rises closer to it during a jump. Use the same swept height bound as
+        // contact, including the actual shoulder height for terrain re-entry.
+        // Gap centerlines remain eligible: they only guide airborne progress.
+        let surface_height =
+            road_surface(point, ground_height).map_or(plane_height, |surface| surface.height);
+        if !matches!(sample.kind, RoadKind::Gap) && surface_height > max_surface_height {
+            continue;
+        }
         if best
             .as_ref()
             .is_none_or(|(best_score, _)| score < *best_score)
@@ -525,9 +555,14 @@ fn contact_surface(
         normal: Vec3::Y,
         offroad: true,
     };
-    let Some(road) = road else { return ground };
+    road.and_then(|road| road_surface(road, ground_height))
+        .filter(|surface| surface.height <= max_surface_height)
+        .unwrap_or(ground)
+}
+
+fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
     if road.beyond_endpoint || matches!(road.sample.kind, RoadKind::Gap) {
-        return ground;
+        return None;
     }
     let half_width = road.sample.width * 0.5;
     let surface = if road.lateral.abs() <= half_width {
@@ -555,13 +590,9 @@ fn contact_surface(
             offroad: true,
         }
     } else {
-        ground
+        return None;
     };
-    if surface.height > max_surface_height {
-        ground
-    } else {
-        surface
-    }
+    Some(surface)
 }
 
 fn plane_height_at(surface: Surface, origin: Vec3, point: Vec3) -> f32 {
@@ -1031,8 +1062,22 @@ mod tests {
         high.distance = 700.0;
         track.samples.push(high);
         track.length = 700.0;
-        let lower = nearest_road(&track, vec3(0.0, RIDE_HEIGHT, 100.0), 100.0).unwrap();
-        let upper = nearest_road(&track, vec3(0.0, 8.0 + RIDE_HEIGHT, 100.0), 600.0).unwrap();
+        let lower = nearest_road(
+            &track,
+            vec3(0.0, RIDE_HEIGHT, 100.0),
+            100.0,
+            0.30,
+            track.ground_height(),
+        )
+        .unwrap();
+        let upper = nearest_road(
+            &track,
+            vec3(0.0, 8.0 + RIDE_HEIGHT, 100.0),
+            600.0,
+            8.30,
+            track.ground_height(),
+        )
+        .unwrap();
         assert!(lower.sample.pos.y.abs() < 0.001);
         assert!((upper.sample.pos.y - 8.0).abs() < 0.001);
         let mut car = Car::new(&track);
@@ -1041,6 +1086,123 @@ mod tests {
         advance(&mut car, &track, Control::default(), 2.0);
         assert!(car.position.z > 105.0);
         assert!((car.position.y - RIDE_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn jump_under_bridge_preserves_lower_route_progress_and_landing() {
+        let lower_route = "straight 40\ncheckpoint\nramp 20 rise 4\ngap 20 rise -4\nstraight 20";
+        let lower = Track::parse(lower_route).unwrap();
+        let crossing = Track::parse(&format!(
+            "{lower_route}\nright 270 radius 20 rise 10 kind bridge\nbridge 40"
+        ))
+        .unwrap();
+        let mut reference = Car::new(&lower);
+        let mut car = Car::new(&crossing);
+        let mut race = crate::race::Race::new(None, car.distance);
+        race.started = true;
+        let control = Control {
+            throttle: 1.0,
+            ..Control::default()
+        };
+        let mut passed_under_bridge = false;
+        let mut landed = false;
+        for _ in 0..1_200 {
+            reference.update(&lower, control, STEP);
+            let was_grounded = car.grounded;
+            car.update(&crossing, control, STEP);
+            race.update(&crossing, STEP, car.distance, !car.offroad);
+            assert!(
+                (car.distance - reference.distance).abs() < 0.01,
+                "overhead deck changed progress: lower {}, crossing {} at {:?}",
+                reference.distance,
+                car.distance,
+                car.position
+            );
+            assert!(!race.invalid);
+            assert!(car.position.distance(reference.position) < 0.01);
+            if (74.0..86.0).contains(&car.position.z) && !car.grounded {
+                assert!(car.position.y + 0.7 < 9.0);
+                passed_under_bridge = true;
+            }
+            landed |= !was_grounded && car.grounded && car.position.z > 80.0;
+            if car.position.z >= 96.0 {
+                break;
+            }
+        }
+        assert!(passed_under_bridge && landed);
+        assert!(car.position.z >= 96.0 && car.grounded && !car.offroad);
+    }
+
+    #[test]
+    fn car_can_climb_a_shoulder_from_below_the_road_deck() {
+        let track = Track::parse("straight 100").unwrap();
+        let mut car = Car::new(&track);
+        car.position = vec3(18.0, track.ground_height() + RIDE_HEIGHT, 50.0);
+        car.heading = -std::f32::consts::FRAC_PI_2;
+        car.velocity = -Vec3::X * 10.0;
+        for _ in 0..600 {
+            car.update(
+                &track,
+                Control {
+                    throttle: 1.0,
+                    ..Control::default()
+                },
+                STEP,
+            );
+            if car.grounded && !car.offroad {
+                break;
+            }
+        }
+        assert!(
+            car.position.x.abs() < 6.0,
+            "could not re-enter road: {car:?}"
+        );
+        assert!(car.grounded && !car.offroad);
+        assert!((car.position.y - RIDE_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn exact_gap_boundaries_use_the_outgoing_surface() {
+        let track =
+            Track::parse("straight 90\ncheckpoint\nstraight 10\ngap 10\nstraight 3").unwrap();
+        for (distance, kind, offroad) in
+            [(100.0, RoadKind::Gap, true), (110.0, RoadKind::Road, false)]
+        {
+            let road = nearest_road(
+                &track,
+                vec3(0.0, 1.0, distance),
+                distance - 0.25,
+                1.0,
+                track.ground_height(),
+            )
+            .unwrap();
+            assert_eq!(road.sample.kind, kind);
+            assert_eq!(
+                contact_surface(Some(road), 1.0, track.ground_height()).offroad,
+                offroad
+            );
+        }
+
+        // Reach the first landing sample exactly in one airborne step. It is
+        // also the sprint finish, so using the preceding gap invalidates a run.
+        let finish = track.finish_distance();
+        let speed = 30.0;
+        let post_drag_speed = speed - speed * (0.0015 * speed * STEP);
+        let mut car = Car::new(&track);
+        car.position = vec3(0.0, 1.0, finish - post_drag_speed * STEP);
+        car.distance = car.position.z;
+        car.velocity = Vec3::Z * speed;
+        car.grounded = false;
+        let mut race = crate::race::Race::new(None, car.distance);
+        race.started = true;
+        race.next_checkpoint = track.checkpoints.len();
+        car.update(&track, Control::default(), STEP);
+        assert_eq!(car.distance, finish);
+        assert!(
+            race.update(&track, STEP, car.distance, !car.offroad)
+                .is_some()
+        );
+        assert!(race.finished && !race.invalid);
     }
 
     #[test]

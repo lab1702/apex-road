@@ -71,11 +71,7 @@ impl Race {
         }
         if delta > 0. {
             let end = self.previous + delta;
-            let finish = if track.closed {
-                track.length
-            } else {
-                track.length - 3.
-            };
+            let finish = track.finish_distance();
             self.cross_checkpoints(track, self.previous, end.min(finish), on_course);
             if self.previous < finish && end >= finish {
                 self.completed_runs += 1;
