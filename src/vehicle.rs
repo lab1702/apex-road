@@ -264,18 +264,23 @@ impl Car {
         // terrain beyond it. Resolve that earlier contact before continuing
         // the remaining motion, without applying input forces a second time.
         if !was_grounded
-            && let Some(((crossing, surface, fraction), entering)) = old_road.and_then(|from| {
-                road_contact_before_exit(
-                    track,
-                    from,
-                    new_road,
-                    before,
-                    self.position,
-                    ground_height,
-                )
-                .map(|contact| (contact, false))
+            && let Some(((crossing, surface, fraction), entering)) = old_road
                 .or_else(|| {
-                    road_entry_contact_before_exit(
+                    // Just outside a shoulder, the height-filtered lookup can
+                    // reject its elevated deck even though this step enters the
+                    // shoulder. Use it only to bound the triangle sweep; a real
+                    // one-sided surface crossing is still required for contact.
+                    nearest_road(
+                        track,
+                        before,
+                        self.distance,
+                        f32::INFINITY,
+                        ground_height,
+                        None,
+                    )
+                })
+                .and_then(|from| {
+                    road_contact_before_exit(
                         track,
                         from,
                         new_road,
@@ -283,9 +288,19 @@ impl Car {
                         self.position,
                         ground_height,
                     )
-                    .map(|contact| (contact, true))
+                    .map(|contact| (contact, false))
+                    .or_else(|| {
+                        road_entry_contact_before_exit(
+                            track,
+                            from,
+                            new_road,
+                            before,
+                            self.position,
+                            ground_height,
+                        )
+                        .map(|contact| (contact, true))
+                    })
                 })
-            })
         {
             self.resolve_landing(surface);
             if entering {
@@ -1043,7 +1058,7 @@ fn road_contact_before_exit(
 }
 
 /// A car can enter and leave a short deck, or cut across its corner, while
-/// both endpoints remain outside its footprint. Sweep finite deck triangles
+/// both endpoints remain outside its footprint. Sweep finite surface triangles
 /// in only the intervening route segments. The local response normal includes
 /// the longitudinal slope created by changing bank as well as ordinary grade.
 fn road_entry_contact_before_exit(
@@ -1089,9 +1104,24 @@ fn road_entry_contact_before_exit(
             let normal = (a.up + b.up).normalize();
             let twist = (b.right * b.width - a.right * a.width).dot(normal).abs() * 0.25;
             let frame_change = a.forward.distance(b.forward).max(a.right.distance(b.right));
+            // A shoulder also twists on an ordinary hill: its inner edge
+            // changes elevation while the terrain edge remains level.
+            let shoulder_height_change = if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
+                [-1.0_f32, 1.0]
+                    .into_iter()
+                    .map(|side| {
+                        ((b.pos.y - a.pos.y)
+                            + (b.right.y * b.width - a.right.y * a.width) * side * 0.5)
+                            .abs()
+                    })
+                    .fold(0.0_f32, f32::max)
+            } else {
+                0.0
+            };
             let steps = (twist / 0.01)
                 .ceil()
                 .max((frame_change / 0.05).ceil())
+                .max((shoulder_height_change / 0.04).ceil())
                 .max(1.0) as usize;
             let sample_at = |step| {
                 if step == 0 {
@@ -1111,50 +1141,68 @@ fn road_entry_contact_before_exit(
                 let right_start = start.pos + start.right * start.width * 0.5;
                 let left_end = end.pos - end.right * end.width * 0.5;
                 let right_end = end.pos + end.right * end.width * 0.5;
-                for [origin, second, third] in [
-                    [left_start, right_end, right_start],
-                    [left_start, left_end, right_end],
-                ] {
-                    let u = second - origin;
-                    let v = third - origin;
-                    let normal = u.cross(v).normalize_or_zero();
-                    let start = (before - Vec3::Y * RIDE_HEIGHT - origin).dot(normal);
-                    let end = (after - Vec3::Y * RIDE_HEIGHT - origin).dot(normal);
-                    if start < -0.001 || end >= 0.0 || end >= start {
-                        continue;
-                    }
-                    let fraction = (start / (start - end)).max(0.0);
-                    let crossing = before.lerp(after, fraction);
-                    let offset = crossing - Vec3::Y * RIDE_HEIGHT - origin;
-                    let uu = u.length_squared();
-                    let vv = v.length_squared();
-                    let uv = u.dot(v);
-                    let denominator = uu * vv - uv * uv;
-                    if denominator <= 0.0000001 {
-                        continue;
-                    }
-                    let along_u = (offset.dot(u) * vv - offset.dot(v) * uv) / denominator;
-                    let along_v = (offset.dot(v) * uu - offset.dot(u) * uv) / denominator;
-                    if along_u < -0.0001 || along_v < -0.0001 || along_u + along_v > 1.0001 {
-                        continue;
-                    }
-                    let Some((crossing, surface, fraction, road)) = refine_road_entry_contact(
-                        track,
-                        before,
-                        after,
-                        a.distance,
-                        fraction,
-                        ground_height,
-                    ) else {
-                        continue;
-                    };
-                    if hit.is_none_or(|(_, _, best)| fraction < best)
-                        && !to.is_some_and(|to| {
-                            road_surface(to, ground_height).is_some()
-                                && crosses_connected_surface(track, road, to, crossing, after)
-                        })
-                    {
-                        hit = Some((crossing, surface, fraction));
+                let outer = |sample: RoadSample, side: f32| {
+                    let mut point = sample.pos
+                        + horizontal(sample.right) * side * (sample.width * 0.5 + SHOULDER_WIDTH);
+                    point.y = ground_height;
+                    point
+                };
+                let strips = [
+                    (left_start, right_start, left_end, right_end),
+                    (outer(start, -1.0), left_start, outer(end, -1.0), left_end),
+                    (right_start, outer(start, 1.0), right_end, outer(end, 1.0)),
+                ];
+                let strip_count = if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
+                    strips.len()
+                } else {
+                    1
+                };
+                for &(left_start, right_start, left_end, right_end) in &strips[..strip_count] {
+                    for [origin, second, third] in [
+                        [left_start, right_end, right_start],
+                        [left_start, left_end, right_end],
+                    ] {
+                        let u = second - origin;
+                        let v = third - origin;
+                        let normal = u.cross(v).normalize_or_zero();
+                        let start = (before - Vec3::Y * RIDE_HEIGHT - origin).dot(normal);
+                        let end = (after - Vec3::Y * RIDE_HEIGHT - origin).dot(normal);
+                        if start < -0.001 || end >= 0.0 || end >= start {
+                            continue;
+                        }
+                        let fraction = (start / (start - end)).max(0.0);
+                        let crossing = before.lerp(after, fraction);
+                        let offset = crossing - Vec3::Y * RIDE_HEIGHT - origin;
+                        let uu = u.length_squared();
+                        let vv = v.length_squared();
+                        let uv = u.dot(v);
+                        let denominator = uu * vv - uv * uv;
+                        if denominator <= 0.0000001 {
+                            continue;
+                        }
+                        let along_u = (offset.dot(u) * vv - offset.dot(v) * uv) / denominator;
+                        let along_v = (offset.dot(v) * uu - offset.dot(u) * uv) / denominator;
+                        if along_u < -0.0001 || along_v < -0.0001 || along_u + along_v > 1.0001 {
+                            continue;
+                        }
+                        let Some((crossing, surface, fraction, road)) = refine_road_entry_contact(
+                            track,
+                            before,
+                            after,
+                            a.distance,
+                            fraction,
+                            ground_height,
+                        ) else {
+                            continue;
+                        };
+                        if hit.is_none_or(|(_, _, best)| fraction < best)
+                            && !to.is_some_and(|to| {
+                                road_surface(to, ground_height).is_some()
+                                    && crosses_connected_surface(track, road, to, crossing, after)
+                            })
+                        {
+                            hit = Some((crossing, surface, fraction));
+                        }
                     }
                 }
             }
@@ -1197,7 +1245,7 @@ fn refine_road_entry_contact(
         )?;
         let mut surface = road_surface(road, ground_height)?;
         let clearance = crossing.y - RIDE_HEIGHT - surface.height;
-        if surface.offroad || clearance.abs() > 0.08 {
+        if clearance.abs() > 0.08 {
             return None;
         }
         // Differentiate at the contact's actual lateral coordinate. A triangle
@@ -1209,15 +1257,34 @@ fn refine_road_entry_contact(
             ((road.sample.distance - a.distance) / (b.distance - a.distance)).clamp(0.0, 1.0);
         let lower = (along - 0.01).max(0.0);
         let upper = (along + 0.01).min(1.0);
-        let right_at = |fraction| {
+        let point_at = |fraction| {
             let forward = a.forward.lerp(b.forward, fraction).normalize();
             let right = a.right.lerp(b.right, fraction);
-            (right - forward * right.dot(forward)).normalize()
+            let right = (right - forward * right.dot(forward)).normalize();
+            // Work relative to the segment origin so short subsegments retain
+            // precision even when the authored track is far from world zero.
+            let pos = (b.pos - a.pos) * fraction;
+            let mut point = pos + right * road.lateral;
+            if surface.offroad {
+                let half_width = (a.width + (b.width - a.width) * fraction) * 0.5;
+                let edge_height = pos.y + right.y * road.lateral.signum() * half_width;
+                let shoulder_fraction = (road.lateral.abs() - half_width) / SHOULDER_WIDTH;
+                point.y = edge_height + (ground_height - a.pos.y - edge_height) * shoulder_fraction;
+            }
+            point
         };
         // Subtract endpoints before scaling to retain precision far from origin.
-        let tangent =
-            (b.pos - a.pos) * (upper - lower) + (right_at(upper) - right_at(lower)) * road.lateral;
-        surface.normal = tangent.cross(road.sample.right).normalize();
+        let tangent = point_at(upper) - point_at(lower);
+        let across = if surface.offroad {
+            let side = road.lateral.signum();
+            let edge_height =
+                road.sample.pos.y + road.sample.right.y * side * road.sample.width * 0.5;
+            horizontal(road.sample.right) * SHOULDER_WIDTH
+                + Vec3::Y * (ground_height - edge_height) * side
+        } else {
+            road.sample.right
+        };
+        surface.normal = tangent.cross(across).normalize();
         crossing.y = surface.height + RIDE_HEIGHT;
         let start = (before - crossing).dot(surface.normal);
         let end = (after - crossing).dot(surface.normal);
@@ -2411,6 +2478,135 @@ mod tests {
             assert!(!car.grounded && car.offroad);
             assert!((car.position.y - RIDE_HEIGHT).abs() < 0.001, "{car:?}");
             assert!(car.velocity.y.abs() < 0.001 && car.impact > 0.0);
+        }
+    }
+
+    #[test]
+    fn landing_precedes_crossing_a_short_shoulder_in_one_step() {
+        let track = Track::parse("straight 20\ngap 10\nstraight 1\ngap 10\nstraight 20").unwrap();
+        for side in [-1.0, 1.0] {
+            for direction in [-1.0, 1.0] {
+                let mut car = Car::new(&track);
+                car.position = vec3(
+                    side * 10.0,
+                    -1.0 + RIDE_HEIGHT + 0.05,
+                    if direction > 0.0 { 29.9 } else { 31.1 },
+                );
+                car.distance = car.position.z;
+                car.velocity = vec3(0.0, -5.0, direction * 40.0);
+                car.grounded = false;
+                car.update(&track, Control::default(), 1.0 / 30.0);
+                let edge = if direction > 0.0 { 31.0 } else { 30.0 };
+                assert!((car.position.z - edge) * direction > 0.0);
+                assert!(!car.grounded && car.offroad);
+                assert!(
+                    (car.position.y - (-1.0 + RIDE_HEIGHT)).abs() < 0.02,
+                    "{car:?}"
+                );
+                assert!(car.velocity.y.abs() < 0.5 && car.impact > 0.0, "{car:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn shoulder_corner_landings_are_swept_at_the_game_step() {
+        let track = Track::parse("straight 20\ngap 10\nstraight 1\ngap 10\nstraight 20").unwrap();
+        for side in [-1.0, 1.0] {
+            for direction in [-1.0, 1.0] {
+                let edge = if direction > 0.0 { 31.0 } else { 30.0 };
+                let mut car = Car::new(&track);
+                car.position = vec3(
+                    side * 18.05,
+                    track.ground_height() + RIDE_HEIGHT + 0.02,
+                    edge - direction * 0.2,
+                );
+                car.distance = car.position.z;
+                car.velocity = vec3(-side * 28.0, -5.0, direction * 28.0);
+                car.grounded = false;
+                car.update(&track, Control::default(), STEP);
+                assert!((car.position.z - edge) * direction > 0.0);
+                assert!(!car.grounded && car.offroad, "{car:?}");
+                assert!(car.impact > 0.0 && car.velocity.y > 0.0, "{car:?}");
+                assert!(car.position.y > track.ground_height() + RIDE_HEIGHT + 0.03);
+            }
+        }
+    }
+
+    #[test]
+    fn shoulder_entry_sweeps_require_a_top_crossing_on_banks_tapers_and_hills() {
+        for bank in [-30, 0, 30] {
+            for (solid, reach, center) in [
+                ("width 16\nstraight 1", 0.6, 30.5),
+                ("straight 2 rise 1.2", 2.0, 31.2),
+            ] {
+                if bank != 0 && center != 30.5 {
+                    continue;
+                }
+                for origin in [Vec3::ZERO, vec3(9000.0, 500.0, 9000.0)] {
+                    let track = Track::parse(&format!(
+                    "start {} {} {}\nstraight 20 bank {bank}\ngap 10\n{solid}\ngap 10\nstraight 20",
+                    origin.x, origin.y, origin.z
+                ))
+                .unwrap();
+                    let ground = track.ground_height();
+                    let sample = track.sample_at(center);
+                    for side in [-1.0, 1.0] {
+                        for direction in [-1.0, 1.0] {
+                            let lateral = side * 12.0;
+                            let mut crossing = sample.pos + sample.right * lateral;
+                            let road = nearest_road(
+                                &track,
+                                crossing,
+                                center,
+                                origin.y + 10.0,
+                                ground,
+                                None,
+                            )
+                            .unwrap();
+                            let surface = road_surface(road, ground).unwrap();
+                            assert!(surface.offroad);
+                            crossing.y = surface.height + RIDE_HEIGHT;
+                            for offset in [-5.0, 0.0, 5.0] {
+                                let before = crossing + vec3(0.0, 2.0 + offset, -direction * reach);
+                                let after = crossing + vec3(0.0, -2.0 + offset, direction * reach);
+                                let road_at = |position: Vec3| {
+                                    nearest_road(
+                                        &track,
+                                        position,
+                                        center,
+                                        origin.y + 10.0,
+                                        ground,
+                                        None,
+                                    )
+                                };
+                                let hit = road_entry_contact_before_exit(
+                                    &track,
+                                    road_at(before).unwrap(),
+                                    road_at(after),
+                                    before,
+                                    after,
+                                    ground,
+                                );
+                                assert_eq!(
+                                    hit.is_some(),
+                                    offset == 0.0,
+                                    "solid {solid}, bank {bank}, origin {origin:?}, side {side}, direction {direction}, offset {offset}"
+                                );
+                                if let Some((point, surface, fraction)) = hit {
+                                    assert!(surface.offroad);
+                                    assert!(
+                                        point.distance(crossing) < 0.02,
+                                        "{point:?}, {crossing:?}"
+                                    );
+                                    assert!((fraction - 0.5).abs() < 0.02);
+                                    assert!(surface.normal.is_normalized());
+                                    assert!((after - before).dot(surface.normal) < 0.0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
