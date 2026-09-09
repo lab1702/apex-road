@@ -32,7 +32,12 @@ pub fn next_path(current: &Path) -> Result<PathBuf, String> {
         Ok(resolved.canonicalize().unwrap_or(resolved))
     };
     let current = identity(current)?;
-    for directory in [Path::new(env!("CARGO_MANIFEST_DIR")), Path::new(".")] {
+    // Anchor the local candidates before resolving identity. If a loaded
+    // override has since disappeared, a relative candidate would fall back
+    // to the bundled namesake and lose the selected file's cycle position.
+    let local_directory = std::env::current_dir()
+        .map_err(|error| format!("Cannot resolve the local track directory: {error}"))?;
+    for directory in [Path::new(env!("CARGO_MANIFEST_DIR")), &local_directory] {
         for (index, path) in BUNDLED_PATHS.iter().enumerate() {
             if current == identity(&directory.join(path))? {
                 return Ok(BUNDLED_PATHS[(index + 1) % BUNDLED_PATHS.len()].into());
@@ -152,6 +157,11 @@ mod tests {
         std::fs::rename(requested, "tracks/renamed.track").unwrap();
         assert!(crate::track::Track::load(&selected).is_err());
         assert_eq!(resolve_track(&selected).unwrap(), selected);
+        assert_eq!(
+            next_path(&selected).unwrap(),
+            PathBuf::from(BUNDLED_PATHS[1]),
+            "removing the selected local override must not reset the course cycle"
+        );
 
         // Conversely, creating a local override must not redirect the reload
         // of a bundled file selected before that override existed.

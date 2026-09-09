@@ -233,6 +233,46 @@ fn checkerboard(track: &Track, distance: f32) -> Vec<Mesh> {
     meshes
 }
 
+struct TreeExclusion<'a> {
+    samples: &'a [RoadSample],
+    min: Vec2,
+    max: Vec2,
+}
+impl<'a> TreeExclusion<'a> {
+    fn new(samples: &'a [RoadSample]) -> Self {
+        let mut min = Vec2::splat(f32::INFINITY);
+        let mut max = Vec2::splat(f32::NEG_INFINITY);
+        let mut half_width = 0.0_f32;
+        for sample in samples {
+            min = min.min(sample.pos.xz());
+            max = max.max(sample.pos.xz());
+            half_width = half_width.max(sample.width * 0.5);
+        }
+        let padding = Vec2::splat(half_width + 12.0);
+        Self {
+            samples,
+            min: min - padding,
+            max: max + padding,
+        }
+    }
+
+    fn allows_tree(&self, position: Vec2, radius: f32) -> bool {
+        // Reject distant batches first, keeping full-segment clearance cheap
+        // even for a 25,000-sample course. Include the crown and its shadow.
+        if position.distance_squared(position.clamp(self.min, self.max)) > radius * radius {
+            return true;
+        }
+        self.samples.windows(2).all(|pair| {
+            let a = pair[0].pos.xz();
+            let span = pair[1].pos.xz() - a;
+            let t = ((position - a).dot(span) / span.length_squared().max(f32::EPSILON))
+                .clamp(0.0, 1.0);
+            let clearance = pair[0].width.max(pair[1].width) * 0.5 + 12.0 + radius;
+            position.distance_squared(a + span * t) > clearance * clearance
+        })
+    }
+}
+
 struct Chunk {
     min: Vec3,
     max: Vec3,
@@ -300,6 +340,14 @@ impl World {
 
     fn build_chunks(track: &Track) -> Vec<Chunk> {
         let ground_y = track.ground_height();
+        let tree_exclusions: Vec<_> = (0..track.samples.len() - 1)
+            .step_by(48)
+            .map(|first| {
+                TreeExclusion::new(
+                    &track.samples[first..=(first + 48).min(track.samples.len() - 1)],
+                )
+            })
+            .collect();
         let mut chunks = vec![];
         // Road, shoulders and architecture are spatially batched for cheap distance culling.
         for (chunk_index, points) in track
@@ -489,11 +537,14 @@ impl World {
                         let seed = i as u32 * 17 + if side > 0. { 11 } else { 79 };
                         let p = edge(a, side * (w + 15. + noise(seed) * 34.), 0.);
                         let pos = vec3(p.x, ground_y, p.z);
-                        // Avoid planting trees on nearby stretches of a folded track.
-                        if track.samples.iter().step_by(5).all(|s| {
-                            vec2(s.pos.x - pos.x, s.pos.z - pos.z).length() > s.width * 0.5 + 8.
-                        }) {
-                            tree(&mut b, pos, 5. + noise(seed + 7) * 8., seed);
+                        let height = 5. + noise(seed + 7) * 8.;
+                        // Keep the entire tree outside nearby road shoulders,
+                        // including crossings between sampled center points.
+                        if tree_exclusions
+                            .iter()
+                            .all(|area| area.allows_tree(pos.xz(), height * 0.34))
+                        {
+                            tree(&mut b, pos, height, seed);
                         }
                     }
                 }
@@ -1040,5 +1091,25 @@ mod tests {
             assert!(chunk.visible_from(eye), "nearby bridge support was culled");
             assert!(!chunk.visible_from(eye + Vec3::X * 10_000.));
         }
+    }
+
+    #[test]
+    fn trees_stay_outside_the_shoulders_of_neighboring_straights() {
+        let track = Track::parse("straight 500\nright 180 radius 20\nstraight 500").unwrap();
+        let trunk_top: [u8; 4] = tint(Color::new(0.33, 0.28, 0.21, 1.), 1.15).into();
+        let mut trunks = 0;
+        for chunk in World::build_chunks(&track) {
+            for vertex in chunk.mesh.vertices {
+                let p = vertex.position;
+                if vertex.color == trunk_top && (20.0..480.0).contains(&p.z) {
+                    trunks += 1;
+                    // The parallel straights are at x = 0 and x = 40. Their
+                    // drivable shoulders extend 18 m from each centerline.
+                    let clearance = p.x.abs().min((p.x - 40.0).abs());
+                    assert!(clearance > 18.0, "tree intrudes into a shoulder at {p:?}");
+                }
+            }
+        }
+        assert!(trunks > 0, "the course must still contain roadside trees");
     }
 }
