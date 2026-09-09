@@ -110,14 +110,19 @@ fn config() -> macroquad::conf::Conf {
     }
 }
 fn main() {
-    let opts = options(std::env::args().skip(1)).unwrap_or_else(|e| {
+    let mut opts = options(std::env::args().skip(1)).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
     });
-    let track = Track::load(resolve_track(&opts.path)).unwrap_or_else(|e| {
-        eprintln!("Track error: {e}");
-        std::process::exit(1)
-    });
+    let track = resolve_track(&opts.path)
+        .and_then(|path| {
+            opts.path = path;
+            Track::load(&opts.path)
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("Track error: {e}");
+            std::process::exit(1)
+        });
     if opts.validate {
         println!(
             "OK: {} | {:.0} m | {} samples | {} checkpoints | {}",
@@ -357,12 +362,12 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
         let switch = is_key_pressed(KeyCode::Tab) || advance_demo;
         if switch || reload {
             let next = if switch {
-                courses::next_path(&path)
+                courses::next_path(&path).and_then(|path| resolve_track(&path))
             } else {
-                path.clone()
+                Ok(path.clone())
             };
-            match Track::load(resolve_track(&next)) {
-                Ok(new_track) => {
+            match next.and_then(|path| Track::load(&path).map(|track| (path, track))) {
+                Ok((next, new_track)) => {
                     track = new_track;
                     world.rebuild(&track);
                     path = next;
@@ -745,7 +750,7 @@ mod driving_checks {
             .take(courses::BUNDLED_PATHS.len() * 2)
         {
             assert_eq!(path, PathBuf::from(expected));
-            let track = Track::load(resolve_track(&path)).unwrap();
+            let track = Track::load(resolve_track(&path).unwrap()).unwrap();
             let mut car = Car::new(&track);
             let mut records = RunRecords::new(None);
             let mut race = records.start_race(car.distance, !opts.autodrive);
@@ -785,7 +790,7 @@ mod driving_checks {
             );
             assert_eq!(race.completed_runs, 1);
             assert!(records.best.is_none());
-            path = courses::next_path(&path);
+            path = courses::next_path(&path).unwrap();
         }
         assert_eq!(path, opts.path);
     }

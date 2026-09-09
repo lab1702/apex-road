@@ -161,9 +161,10 @@ cargo run --release -- --validate tracks/my.track
 cargo run --release -- --track tracks/my.track
 ```
 
-While editing a loaded track, press **F5** to reload it. A malformed edit
-reports an error and leaves the currently loaded track available. A successful
-reload rebuilds the world and restarts the run.
+While editing a loaded track, press **F5** to reload the same selected file.
+A malformed edit or missing file reports an error and leaves the currently
+loaded track available. A successful reload rebuilds the world and restarts
+the run.
 
 The format supports straights, left and right turns, elevation changes,
 banking, width changes, bridges, tunnels, launch ramps, gaps, and closed

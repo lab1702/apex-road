@@ -114,6 +114,7 @@ fn fit_lines(
     max_lines: usize,
     measure_width: impl Fn(&str) -> f32,
 ) -> Vec<String> {
+    const MAX_LINE_CHARACTERS: usize = 256;
     let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut remaining = normalized.as_str();
     let mut lines = Vec::new();
@@ -121,22 +122,16 @@ fn fit_lines(
         return lines;
     }
     while !remaining.is_empty() && lines.len() < max_lines {
-        if measure_width(remaining) <= width {
-            lines.push(remaining.to_owned());
-            break;
-        }
         let last_line = lines.len() + 1 == max_lines;
         let mut end = 0;
         let mut word_break = None;
-        for (offset, character) in remaining.char_indices() {
+        // Measuring text also rasterizes uncached glyphs. Inspect only the
+        // visible prefix: a parser error can contain a nearly 1 MB token, most
+        // of which will never be shown in the notification. Also cap character
+        // count because combining marks may have zero width.
+        for (offset, character) in remaining.char_indices().take(MAX_LINE_CHARACTERS) {
             let next = offset + character.len_utf8();
-            let candidate = &remaining[..next];
-            let candidate_width = if last_line {
-                measure_width(&format!("{candidate}…"))
-            } else {
-                measure_width(candidate)
-            };
-            if candidate_width > width {
+            if measure_width(&remaining[..next]) > width {
                 break;
             }
             end = next;
@@ -144,7 +139,14 @@ fn fit_lines(
                 word_break = Some(offset);
             }
         }
+        if end == remaining.len() {
+            lines.push(remaining.to_owned());
+            break;
+        }
         if last_line || end == 0 {
+            while end > 0 && measure_width(&format!("{}…", remaining[..end].trim_end())) > width {
+                end = remaining[..end].char_indices().next_back().unwrap().0;
+            }
             lines.push(format!("{}…", remaining[..end].trim_end()));
             break;
         }
@@ -1018,5 +1020,58 @@ mod tests {
         );
         assert!(fit_lines("Course", 0.5, 1, monospace_width).is_empty());
         assert!(fit_lines("Course", 20.0, 0, monospace_width).is_empty());
+    }
+
+    #[test]
+    fn long_parser_errors_do_not_measure_or_cache_hidden_glyphs() {
+        let token = (0x4e00..0x9fff)
+            .filter_map(char::from_u32)
+            .collect::<String>()
+            .repeat(14);
+        let error = crate::track::Track::parse(&token).unwrap_err();
+        assert!(error.len() > 880_000 && error.contains("Unknown command"));
+        let lines = fit_lines(&error, 40.0, 6, |candidate| {
+            assert!(
+                candidate.chars().count() <= 41,
+                "measured the hidden suffix of a large parser error"
+            );
+            monospace_width(candidate)
+        });
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].starts_with("Line 1: Unknown command"));
+        assert!(lines.iter().all(|line| monospace_width(line) <= 40.0));
+        assert!(lines.last().unwrap().ends_with('…'));
+    }
+
+    #[test]
+    fn a_final_line_that_fits_does_not_reserve_an_ellipsis() {
+        assert_eq!(
+            fit_lines("Exactly fits", 12.0, 1, monospace_width),
+            ["Exactly fits"]
+        );
+        assert_eq!(
+            fit_lines("First Exactly fits", 12.0, 2, monospace_width),
+            ["First", "Exactly fits"]
+        );
+    }
+
+    #[test]
+    fn zero_width_suffixes_have_bounded_measurement_and_are_ellipsized() {
+        let measurements = std::cell::Cell::new(0);
+        let zero_width_marks = |candidate: &str| {
+            measurements.set(measurements.get() + 1);
+            assert!(candidate.chars().count() <= 257);
+            candidate.chars().filter(|c| *c != '\u{0301}').count() as f32
+        };
+        let label = format!("Error{}", "\u{0301}".repeat(400_000));
+        let lines = fit_lines(&label, 12.0, 6, zero_width_marks);
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].starts_with("Error"));
+        assert!(lines.last().unwrap().ends_with('…'));
+        assert!(measurements.get() < 1_600);
+
+        // Reaching the cap exactly is still a complete line.
+        let exact = format!("A{}", "\u{0301}".repeat(255));
+        assert_eq!(fit_lines(&exact, 12.0, 1, zero_width_marks), [exact]);
     }
 }

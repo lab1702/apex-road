@@ -11,27 +11,32 @@ pub const BUNDLED_PATHS: &[&str] = &[
     "tracks/skyline_eight.track",
 ];
 
-pub fn resolve_track(path: &Path) -> PathBuf {
-    if path.exists() {
-        path.into()
+/// Select a source once, retaining its lexical absolute path for later reloads.
+/// Do not canonicalize: an editor may replace a file or retarget its symlink.
+pub fn resolve_track(path: &Path) -> Result<PathBuf, String> {
+    let selected = if path.exists() {
+        path.to_owned()
     } else {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
-    }
+    };
+    std::path::absolute(selected)
+        .map_err(|error| format!("Cannot resolve track '{}': {error}", path.display()))
 }
 
-pub fn next_path(current: &Path) -> PathBuf {
+pub fn next_path(current: &Path) -> Result<PathBuf, String> {
     // Compare the files that loading resolves, including aliases. A custom
     // course may have the same trailing filename as a bundled course.
-    let identity = |path: &Path| {
-        let resolved = resolve_track(path);
-        resolved.canonicalize().unwrap_or(resolved)
+    let identity = |path: &Path| -> Result<PathBuf, String> {
+        let resolved = resolve_track(path)?;
+        Ok(resolved.canonicalize().unwrap_or(resolved))
     };
-    let current = identity(current);
-    let next = BUNDLED_PATHS
-        .iter()
-        .position(|path| current == identity(Path::new(path)))
-        .map_or(0, |index| (index + 1) % BUNDLED_PATHS.len());
-    BUNDLED_PATHS[next].into()
+    let current = identity(current)?;
+    for (index, path) in BUNDLED_PATHS.iter().enumerate() {
+        if current == identity(Path::new(path))? {
+            return Ok(BUNDLED_PATHS[(index + 1) % BUNDLED_PATHS.len()].into());
+        }
+    }
+    Ok(BUNDLED_PATHS[0].into())
 }
 
 #[cfg(test)]
@@ -49,12 +54,12 @@ mod tests {
                 visited.insert(current.clone()),
                 "course appeared twice before completing the cycle"
             );
-            current = next_path(&current);
+            current = next_path(&current).unwrap();
         }
         assert_eq!(current, first);
         assert_eq!(visited.len(), BUNDLED_PATHS.len());
         assert_eq!(
-            next_path(&Path::new(env!("CARGO_MANIFEST_DIR")).join(BUNDLED_PATHS[0])),
+            next_path(&Path::new(env!("CARGO_MANIFEST_DIR")).join(BUNDLED_PATHS[0])).unwrap(),
             PathBuf::from(BUNDLED_PATHS[1])
         );
     }
@@ -62,7 +67,7 @@ mod tests {
     #[test]
     fn custom_course_returns_to_bundled_selection() {
         assert_eq!(
-            next_path(Path::new("tracks/my_custom.track")),
+            next_path(Path::new("tracks/my_custom.track")).unwrap(),
             PathBuf::from(BUNDLED_PATHS[0])
         );
     }
@@ -74,7 +79,7 @@ mod tests {
         let path = directory.join("tracks/club.track");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "straight 40").unwrap();
-        let next = next_path(&path);
+        let next = next_path(&path).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
         assert_eq!(next, PathBuf::from(BUNDLED_PATHS[0]));
     }
@@ -88,8 +93,76 @@ mod tests {
         let alias = directory.join("favorite.track");
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join(BUNDLED_PATHS[1]);
         std::os::unix::fs::symlink(bundled, &alias).unwrap();
-        let next = next_path(&alias);
+        let next = next_path(&alias).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
         assert_eq!(next, PathBuf::from(BUNDLED_PATHS[2]));
+    }
+
+    #[test]
+    fn reload_keeps_the_selected_file_when_local_overrides_change() {
+        // A separate process gives resolution a custom working directory
+        // without racing the other tests' relative file accesses.
+        const CHILD: &str = "APEX_RELOAD_PATH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory =
+                std::env::temp_dir().join(format!("apex-reload-path-test-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "courses::tests::reload_keeps_the_selected_file_when_local_overrides_change",
+                    "--nocapture",
+                ])
+                .env(CHILD, &directory)
+                .current_dir(&directory)
+                .output();
+            std::fs::remove_dir_all(directory).unwrap();
+            let output = result.unwrap();
+            assert!(
+                output.status.success(),
+                "reload regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            PathBuf::from(std::env::var_os(CHILD).unwrap()),
+            "reload fixture must run in its isolated temporary directory"
+        );
+
+        let requested = Path::new(BUNDLED_PATHS[0]);
+        std::fs::create_dir_all(requested.parent().unwrap()).unwrap();
+        std::fs::write(requested, "name Custom\nstraight 40").unwrap();
+        let selected = resolve_track(requested).unwrap();
+        assert_eq!(selected, std::env::current_dir().unwrap().join(requested));
+        assert_eq!(crate::track::Track::load(&selected).unwrap().name, "Custom");
+
+        // Renaming an authored file should report a reload error, preserving
+        // the active world, rather than silently loading the bundled namesake.
+        std::fs::rename(requested, "tracks/renamed.track").unwrap();
+        assert!(crate::track::Track::load(&selected).is_err());
+        assert_eq!(resolve_track(&selected).unwrap(), selected);
+
+        // Conversely, creating a local override must not redirect the reload
+        // of a bundled file selected before that override existed.
+        let bundled = resolve_track(requested).unwrap();
+        let original = crate::track::Track::load(&bundled).unwrap();
+        std::fs::write(requested, "name Replacement\nstraight 60").unwrap();
+        assert_eq!(resolve_track(&bundled).unwrap(), bundled);
+        assert_eq!(
+            crate::track::Track::load(&bundled).unwrap().source_hash(),
+            original.source_hash()
+        );
+        assert_ne!(resolve_track(requested).unwrap(), bundled);
+
+        #[cfg(unix)]
+        {
+            let alias = Path::new("favorite.track");
+            std::os::unix::fs::symlink(requested, alias).unwrap();
+            let selected_alias = resolve_track(alias).unwrap();
+            assert_eq!(selected_alias, std::env::current_dir().unwrap().join(alias));
+        }
     }
 }

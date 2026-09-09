@@ -142,7 +142,8 @@ close
 - A rise is between -500 and +500 m and no more than 60% of horizontal length.
   Slopes throughout the cubic elevation profile may not exceed 100%, including
   between generated samples; use longer transitions if rejected.
-- Road elevation stays between -1000 and +2000 m. Start coordinates are
+- Road elevation stays between -1000 and +2000 m, including peaks between
+  generated samples. Start coordinates are
   limited to ±10000 m horizontally and ±1000 m vertically.
 - A track must be at least 20 m long, at most 50 km, with at most 25001 samples.
   Track files are limited to 1 MB; name and description each to 500 bytes.

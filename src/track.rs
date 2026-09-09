@@ -380,6 +380,41 @@ impl Builder {
                 }
             }
         }
+        let m0 = self.grade * length;
+        let m1 = end_grade * length;
+        let elevation_at = |t: f32| {
+            let smooth = t * t * (3.0 - 2.0 * t);
+            start.pos.y
+                + (smooth * rise + (t * t * t - 2.0 * t * t + t) * m0 + (t * t * t - t * t) * m1)
+        };
+        // An incoming ramp can take a short transition above its endpoints.
+        // Check the cubic's stationary points as well as generated samples;
+        // a narrow peak can sit entirely between those samples.
+        let height_extrema = if slope_a == 0.0 {
+            if slope_b == 0.0 {
+                [0.0; 2]
+            } else {
+                [-self.grade / slope_b; 2]
+            }
+        } else {
+            let discriminant = slope_b * slope_b - 4.0 * slope_a * self.grade;
+            if discriminant > 0.0 {
+                let root = discriminant.sqrt();
+                // Avoid subtracting nearly equal values for the small root.
+                let q = -0.5 * (slope_b + root.copysign(slope_b));
+                [q / slope_a, self.grade / q]
+            } else {
+                [0.0; 2]
+            }
+        };
+        for t in height_extrema {
+            if (0.0..1.0).contains(&t) && !(-1_000.0..=2_000.0).contains(&elevation_at(t)) {
+                return Err(
+                    "Elevation transition exceeds height limits; adjust its elevation or incoming ramp slope"
+                        .into(),
+                );
+            }
+        }
         let steps =
             (length * (1.0 + self.grade.abs() + end_grade.abs()) / SAMPLE_SPACING).ceil() as usize;
         // Sampling only a short hill's level endpoints erases its slope from
@@ -415,9 +450,7 @@ impl Builder {
                 pos.x += first_heading.sin() * length * t;
                 pos.z += first_heading.cos() * length * t;
             }
-            let m0 = self.grade * length;
-            let m1 = end_grade * length;
-            pos.y += smooth * rise + (t * t * t - 2.0 * t * t + t) * m0 + (t * t * t - t * t) * m1;
+            pos.y = elevation_at(t);
             let grade = ((6.0 * t - 6.0 * t * t) * rise
                 + (3.0 * t * t - 4.0 * t + 1.0) * m0
                 + (3.0 * t * t - 2.0 * t) * m1)
@@ -1105,6 +1138,29 @@ mod tests {
         assert!(
             Track::parse("straight 20\nramp 2 rise 1.2\nstraight 6 rise -2.94\nstraight 20")
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn height_limits_cover_extrema_between_generated_samples() {
+        // The final cubic peaks at t = 1/7, between its four generated
+        // samples. The t = 1/4 sample remains below 2000 m even though the
+        // incoming ramp slope takes the actual profile above the limit.
+        let source =
+            "start 0 1000 0\nstraight 1000 rise 499.97\nramp 1000 rise 500\nstraight 1 rise -0.5";
+        let Err(error) = Track::parse(source) else {
+            panic!("an elevation peak above the height limit must be rejected");
+        };
+        assert!(error.starts_with("Line 4:"), "{error}");
+        assert!(error.contains("height limits"), "{error}");
+
+        // Lowering the same profile by five centimetres preserves the
+        // intended shape while keeping its complete elevation in bounds.
+        assert!(
+            Track::parse(
+                "start 0 1000 0\nstraight 1000 rise 499.92\nramp 1000 rise 500\nstraight 1 rise -0.5"
+            )
+            .is_ok()
         );
     }
 

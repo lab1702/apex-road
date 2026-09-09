@@ -261,7 +261,7 @@ impl Car {
         if let Some(road) = new_road {
             self.road_index = road.index;
             self.distance = road.sample.distance;
-            self.resolve_guardrail(road, before);
+            self.resolve_guardrail(track, road, old_road, before);
         }
         // Do not attach to an overpass that is above the car. The preceding
         // position provides a swept, one-sided contact test at landings.
@@ -273,6 +273,10 @@ impl Car {
             ground_height,
             Some(sweep),
         );
+        if let Some(road) = new_road {
+            self.road_index = road.index;
+            self.distance = road.sample.distance;
+        }
         let surface = contact_surface(new_road, max_surface_height, ground_height);
         let required_vertical = surface_vertical_speed(self.velocity, surface.normal);
         let current_bottom = self.position.y - RIDE_HEIGHT;
@@ -463,37 +467,56 @@ impl Car {
         self.slip += (sliding - self.slip) * (1.0 - (-8.0 * dt).exp());
     }
 
-    fn resolve_guardrail(&mut self, road: RoadPoint, before: Vec3) {
-        if !matches!(road.sample.kind, RoadKind::Bridge | RoadKind::Tunnel) {
-            return;
-        }
-        let clearance = self.position.y - RIDE_HEIGHT - road.plane_height;
-        // Ground contact may belong to terrain beneath an overpass; only a
-        // car at the deck's height can hit its guardrails.
-        if !(-0.45..0.85).contains(&clearance) {
-            return;
-        }
-        let limit = (road.sample.width * 0.5 - CAR_HALF_WIDTH).max(0.5);
-        if road.lateral.abs() <= limit {
-            return;
-        }
-        // Cars approaching the side from below/outside should not teleport
-        // through an entire bridge to its inside edge.
-        let old_lateral = (before - Vec3::Y * RIDE_HEIGHT - road.sample.pos).dot(road.sample.right);
-        if old_lateral.abs() > road.sample.width * 0.5 + 1.0 {
-            return;
-        }
-        let side = road.lateral.signum();
+    fn resolve_guardrail(
+        &mut self,
+        track: &Track,
+        road: RoadPoint,
+        previous_road: Option<RoadPoint>,
+        before: Vec3,
+    ) {
         // The barrier follows the banked road frame. Both its correction and
         // impulse must stay in the road plane, or an uphill impact launches
         // the car by retaining its old upward velocity after the rebound.
-        let normal = road.sample.up;
-        let lateral_axis = (road.sample.right - normal * road.sample.right.dot(normal)).normalize();
-        self.position +=
-            lateral_axis * ((side * limit - road.lateral) / lateral_axis.dot(road.sample.right));
-        let outward_speed = self.velocity.dot(lateral_axis) * side;
+        let swept_hit = previous_road
+            .and_then(|prior| guardrail_sweep(track, prior, road, before, self.position));
+        let (normal, outward) = if let Some((hit, normal, outward)) = swept_hit {
+            // Stop at the wall that was crossed. On a taper, shunting all
+            // the way to the final narrow cross-section would teleport
+            // the car sideways and leave its forward speed unchanged.
+            self.position = hit - outward * 0.001;
+            (normal, outward)
+        } else {
+            if !matches!(road.sample.kind, RoadKind::Bridge | RoadKind::Tunnel) {
+                return;
+            }
+            let clearance = self.position.y - RIDE_HEIGHT - road.plane_height;
+            // Terrain beneath an overpass cannot hit its guardrails.
+            if !(-0.45..0.85).contains(&clearance) {
+                return;
+            }
+            let limit = (road.sample.width * 0.5 - CAR_HALF_WIDTH).max(0.5);
+            if road.lateral.abs() <= limit {
+                return;
+            }
+            let side = road.lateral.signum();
+            // Without a proven wall crossing, retain the local correction
+            // for a car already touching the rail. An outside approach
+            // must not teleport through the bridge to its inside edge.
+            let old_lateral =
+                (before - Vec3::Y * RIDE_HEIGHT - road.sample.pos).dot(road.sample.right);
+            if old_lateral.abs() > road.sample.width * 0.5 + 1.0 {
+                return;
+            }
+            let normal = road.sample.up;
+            let lateral_axis =
+                (road.sample.right - normal * road.sample.right.dot(normal)).normalize();
+            self.position += lateral_axis
+                * ((side * limit - road.lateral) / lateral_axis.dot(road.sample.right));
+            (normal, lateral_axis * side)
+        };
+        let outward_speed = self.velocity.dot(outward);
         if outward_speed > 0.0 {
-            self.velocity -= lateral_axis * side * outward_speed * 1.12;
+            self.velocity -= outward * outward_speed * 1.12;
             let scrub = (outward_speed * 0.012).min(0.16);
             let tangent_velocity = self.velocity - normal * self.velocity.dot(normal);
             self.velocity -= tangent_velocity * scrub;
@@ -501,6 +524,93 @@ impl Car {
             self.impact = self.impact.max((outward_speed / 10.0).clamp(0.08, 1.0));
         }
     }
+}
+
+/// Sweep the chassis center against the inset edges of the intervening road
+/// segments. The wall tangent includes width changes as well as road curvature.
+fn guardrail_sweep(
+    track: &Track,
+    from: RoadPoint,
+    to: RoadPoint,
+    before: Vec3,
+    after: Vec3,
+) -> Option<(Vec3, Vec3, Vec3)> {
+    let mut delta = to.sample.distance - from.sample.distance;
+    if track.closed {
+        if delta > track.length * 0.5 {
+            delta -= track.length;
+        } else if delta < -track.length * 0.5 {
+            delta += track.length;
+        }
+    }
+    // Route selection can jump between nearby but disconnected roads. Such a
+    // jump is not evidence that the intervening guardrails were traversed.
+    if delta.abs() > 12.0 {
+        return None;
+    }
+    let segments = track.samples.len() - 1;
+    let forward = if delta == 0.0 && from.index != to.index {
+        // The same cross-section may be reported from either adjacent
+        // segment. At the circuit seam, +0 alone would choose a full lap.
+        if (from.index + 1) % segments == to.index {
+            true
+        } else if (to.index + 1) % segments == from.index {
+            false
+        } else {
+            return None;
+        }
+    } else {
+        delta >= 0.0
+    };
+    let mut index = from.index;
+    let motion = horizontal(after - before);
+    let cross = |a: Vec3, b: Vec3| a.x * b.z - a.z * b.x;
+    let mut hit: Option<(f32, Vec3, Vec3)> = None;
+    loop {
+        let a = track.samples[index];
+        let b = track.samples[index + 1];
+        if matches!(a.kind, RoadKind::Bridge | RoadKind::Tunnel) {
+            for side in [-1.0, 1.0] {
+                let edge = |sample: RoadSample| {
+                    sample.pos
+                        + sample.right * side * (sample.width * 0.5 - CAR_HALF_WIDTH).max(0.5)
+                };
+                let start = edge(a);
+                let tangent = edge(b) - start;
+                let wall = horizontal(tangent);
+                let offset = horizontal(start - before);
+                let denominator = cross(motion, wall);
+                if denominator.abs() > 0.00001 {
+                    let fraction = cross(offset, wall) / denominator;
+                    let along = cross(offset, motion) / denominator;
+                    if (0.0..=1.0).contains(&fraction)
+                        && (0.0..=1.0).contains(&along)
+                        && hit.is_none_or(|(best, _, _)| fraction < best)
+                    {
+                        let clearance = before.lerp(after, fraction).y
+                            - RIDE_HEIGHT
+                            - (start.y + tangent.y * along);
+                        if (-0.45..0.85).contains(&clearance) {
+                            let normal = a.up.lerp(b.up, along).normalize();
+                            let outward = normal.cross(tangent).normalize() * side;
+                            if motion.dot(outward) > 0.0 {
+                                hit = Some((fraction, normal, outward));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if index == to.index {
+            break;
+        }
+        index = if forward {
+            (index + 1) % segments
+        } else {
+            (index + segments - 1) % segments
+        };
+    }
+    hit.map(|(fraction, normal, outward)| (before.lerp(after, fraction), normal, outward))
 }
 
 fn tire_force(slip_angle: f32, stiffness: f32, available_grip: f32) -> f32 {
@@ -1188,6 +1298,151 @@ mod tests {
             assert!(car.impact > 0.1);
             assert!((car.position.y - 8.0 - RIDE_HEIGHT).abs() < 0.03);
         }
+    }
+
+    #[test]
+    fn narrowing_guardrails_keep_cars_on_the_deck() {
+        for kind in ["bridge", "tunnel"] {
+            for bank in [-30, 0, 30] {
+                for side in [-1.0, 1.0] {
+                    for direction in [-1.0, 1.0] {
+                        let (start_width, end_width, start) = if direction > 0.0 {
+                            (40, 4, 29.9)
+                        } else {
+                            (4, 40, 31.1)
+                        };
+                        let track = Track::parse(&format!(
+                            "width {start_width}\n{kind} 30 bank {bank}\nwidth {end_width}\n{kind} 1\n{kind} 100"
+                        ))
+                        .unwrap();
+                        for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                            let mut car = Car::new(&track);
+                            car.reset(&track, start);
+                            let sample = track.sample_at(start);
+                            car.position += sample.right * side * 10.0;
+                            car.velocity = sample.forward * direction * 40.0;
+                            let initial_x = car.position.x;
+                            for _ in 0..10 {
+                                car.update(&track, Control::default(), dt);
+                                let sample = track.sample_at(car.distance);
+                                let lateral = (car.position - Vec3::Y * RIDE_HEIGHT - sample.pos)
+                                    .dot(sample.right);
+                                assert!(
+                                    lateral.abs() <= sample.width * 0.5 - CAR_HALF_WIDTH + 0.01,
+                                    "escaped taper on {kind}, bank {bank}, side {side}, direction {direction}, dt {dt}: {car:?}"
+                                );
+                                assert!(car.grounded && !car.offroad);
+                                if car.impact > 0.0 {
+                                    break;
+                                }
+                            }
+                            assert!(car.impact > 0.0);
+                            assert!(car.velocity.z * direction < 0.0);
+                            assert!((car.position.x - initial_x).abs() < 0.2);
+                            assert!((car.position.z - car.distance).abs() < 0.01);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn taper_collision_precedes_an_open_road_or_gap_in_the_same_step() {
+        for kind in ["bridge", "tunnel"] {
+            for exit in ["straight 100", "gap 20\nstraight 100"] {
+                let track =
+                    Track::parse(&format!("width 40\n{kind} 30\nwidth 4\n{kind} 1\n{exit}"))
+                        .unwrap();
+                for side in [-1.0, 1.0] {
+                    for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                        let mut car = Car::new(&track);
+                        car.reset(&track, 30.8);
+                        car.position.x = side * 4.0;
+                        car.velocity = Vec3::Z * 40.0;
+                        car.update(&track, Control::default(), dt);
+                        assert!(car.position.z < 31.0);
+                        assert!(car.velocity.z < 0.0 && car.impact > 0.0);
+                        assert!(car.grounded && !car.offroad);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guardrail_sweep_requires_the_height_of_the_crossed_deck() {
+        let track = Track::parse("start 0 8 0\nbridge 100").unwrap();
+        for side in [-1.0, 1.0] {
+            let before = vec3(side * 4.8, 8.0 + RIDE_HEIGHT, 20.0);
+            let after = vec3(side * 5.5, 8.0 + RIDE_HEIGHT, 20.5);
+            let query = |position| {
+                nearest_road(&track, position, 20.0, 9.0, track.ground_height(), None).unwrap()
+            };
+            let from = query(before);
+            let to = query(after);
+            assert!(guardrail_sweep(&track, from, to, before, after).is_some());
+            assert!(
+                guardrail_sweep(
+                    &track,
+                    from,
+                    to,
+                    before - Vec3::Y * 8.0,
+                    after - Vec3::Y * 8.0
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn switching_to_a_disconnected_road_cannot_pull_a_car_inside_its_guardrail() {
+        let track = Track::parse(
+            "width 40\nbridge 100\nwidth 4\nbridge 1\nright 270 radius 30 kind bridge\nbridge 100",
+        )
+        .unwrap();
+        let before = vec3(0.0, RIDE_HEIGHT, 67.0);
+        let after = vec3(0.0, RIDE_HEIGHT, 67.5);
+        let from = nearest_road(&track, before, 67.0, 1.0, track.ground_height(), None).unwrap();
+        let to = nearest_road(
+            &track,
+            after,
+            track.length - 70.0,
+            1.0,
+            track.ground_height(),
+            None,
+        )
+        .unwrap();
+        assert!(to.sample.distance - from.sample.distance > 12.0);
+        assert!(guardrail_sweep(&track, from, to, before, after).is_none());
+        let mut car = Car::new(&track);
+        car.position = after;
+        car.velocity = Vec3::Z * 20.0;
+        car.resolve_guardrail(&track, to, Some(from), before);
+        assert_eq!(car.position, after);
+        assert_eq!(car.velocity, Vec3::Z * 20.0);
+        assert_eq!(car.impact, 0.0);
+    }
+
+    #[test]
+    fn a_shared_seam_sweep_only_checks_its_adjacent_segments() {
+        let mut track = Track::parse(
+            "bridge 40\nright 180 radius 20 kind bridge\nbridge 40\nright 180 radius 20 kind bridge\nclose",
+        )
+        .unwrap();
+        let before = vec3(4.8, RIDE_HEIGHT, 0.0);
+        let after = vec3(5.5, RIDE_HEIGHT, 0.0);
+        let from = nearest_road(&track, before, 0.0, 1.0, track.ground_height(), None).unwrap();
+        assert_eq!(from.index, 0);
+        let mut to = from;
+        to.index = track.samples.len() - 2;
+        to.sample.distance = track.length;
+        // Put an unrelated rail just inside the actual seam rail. Traversing
+        // the whole circuit on a zero-distance tie would hit this one first.
+        track.samples[3].pos = vec3(-0.15, 0.0, -1.0);
+        track.samples[4].pos = vec3(-0.15, 0.0, 1.0);
+        let (hit, _, _) = guardrail_sweep(&track, from, to, before, after).unwrap();
+        assert!((hit.x - (6.0 - CAR_HALF_WIDTH)).abs() < 0.001);
     }
 
     #[test]
