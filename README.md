@@ -14,11 +14,36 @@ limited amount of tire grip. Enter a corner too quickly, brake too hard, or
 apply too much throttle while turning and the tires start to slide. Hills,
 banked corners, and airborne jumps affect how the car moves.
 
-## Run on Linux
+## Run on Windows or Linux
 
-Install a current stable Rust toolchain and a C linker. The renderer uses
-Macroquad and OpenGL; an ordinary graphical Linux desktop is required to play.
-On Debian or Ubuntu, the development packages are:
+Install a current stable [Rust toolchain](https://rust-lang.org/tools/install/).
+The renderer uses Macroquad and OpenGL; playing requires a graphical desktop
+and an OpenGL 2.1-capable graphics driver.
+
+### Windows
+
+Use the native MSVC Rust toolchain (the default Windows installer option).
+Install the **Desktop development with C++** workload in Visual Studio Build
+Tools, including MSVC and a Windows SDK, as described in the
+[Rust Windows prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
+Open a new PowerShell or Windows Terminal after installation.
+
+With Git installed, clone and run from PowerShell:
+
+```powershell
+git clone https://github.com/lab1702/apex-road.git
+cd apex-road
+cargo run --release --locked
+```
+
+Windows runs the game natively; WSL is not required. To run a built executable
+from the project directory, use `.\target\release\apex-road.exe`. Both `/` and
+`\` work in Windows paths; quote paths containing spaces.
+
+### Linux
+
+Install a C linker and the graphical development libraries. On Debian or
+Ubuntu:
 
 ```sh
 sudo apt install build-essential pkg-config libx11-dev libxi-dev libgl1-mesa-dev
@@ -29,12 +54,16 @@ Clone the repository and run:
 ```sh
 git clone https://github.com/lab1702/apex-road.git
 cd apex-road
-cargo run --release
+cargo run --release --locked
 ```
+
+### First launch
 
 Press **Enter** to start. The first build downloads and compiles the Rust
 dependencies; subsequent starts are faster. Run from the project directory so
-the game can find the bundled `tracks/` folder.
+the game can find the bundled `tracks/` folder and save records in `data/`.
+When copying a build to another computer, include `tracks/` and launch from
+the directory containing it.
 
 ## Drive
 
@@ -88,6 +117,8 @@ course map above. A run that misses a checkpoint cannot set a record.
 Best times are saved under `./data/`, keyed by the track file's contents.
 Editing a track starts a separate record history for that version. Restarting
 a run resets its timer and checkpoint progress.
+Track identity includes line endings and any byte-order mark; Git keeps the
+bundled `.track` files as LF on both platforms to preserve their record keys.
 
 ## Bundled courses
 
@@ -216,8 +247,23 @@ the world and renderer, not a racing opponent.
 Run the parser, vehicle, and timing checks with:
 
 ```sh
-cargo test
+cargo test --locked
 ```
+
+The [CI workflow](.github/workflows/ci.yml) runs formatting, Clippy, tests,
+release builds, and all bundled track validations on Windows and Linux.
+Linux also runs the renderer smoke test with Xvfb and Mesa software rendering.
+The Windows renderer smoke test needs a desktop with an OpenGL driver:
+
+```powershell
+cargo run --release --locked -- --smoke-test --capture captures/windows-drive.png
+```
+
+For an interactive check on either desktop, start a run with **Enter**, drive
+with **WASD** and the arrow keys, and toggle mouse driving with right click.
+Check **Esc** pause/resume, **F11** fullscreen, **Tab** course switching,
+**F5** reload, and switching away from the game while mouse driving (it should
+pause and release the cursor). These desktop interactions are checked manually.
 
 ## How it is built
 

@@ -1,0 +1,2 @@
+# Record identities hash track contents; keep bundled files identical on every OS.
+*.track text eol=lf

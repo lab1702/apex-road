@@ -68,7 +68,10 @@ impl Track {
             return Err("Track file exceeds the 1 MB limit".into());
         }
         let mut builder = Builder::new();
-        for (line_index, line) in text.lines().enumerate() {
+        // Some Windows editors prefix UTF-8 files with a byte-order mark.
+        // Ignore it as syntax, but keep the original bytes for record identity.
+        let commands = text.strip_prefix('\u{feff}').unwrap_or(text);
+        for (line_index, line) in commands.lines().enumerate() {
             let line_number = line_index + 1;
             let tokens = tokenize(line).map_err(|e| format!("Line {line_number}: {e}"))?;
             if tokens.is_empty() {
@@ -725,6 +728,35 @@ fn tokenize(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+
+    #[test]
+    fn windows_track_files_accept_bom_crlf_and_unicode_paths() {
+        let directory = TempDir::new("apex-windows-track-test");
+        let file = directory.path().join("My course ü.track");
+        let source = "name \"Hills ü\"\nstraight 40\ncheckpoint\nstraight 60 rise 5\nfinish\n";
+        let expected = Track::parse(source).unwrap();
+        for prefix in ["", "\u{feff}"] {
+            for newline in ["\n", "\r\n"] {
+                let text = format!("{prefix}{}", source.replace('\n', newline));
+                std::fs::write(&file, &text).unwrap();
+                let loaded = Track::load(&file).unwrap();
+                assert_eq!(loaded.name, expected.name);
+                assert_eq!(loaded.length, expected.length);
+                assert_eq!(loaded.checkpoints, expected.checkpoints);
+                assert_eq!(loaded.samples.len(), expected.samples.len());
+                for (actual, expected) in loaded.samples.iter().zip(&expected.samples) {
+                    assert_eq!(actual.pos, expected.pos);
+                }
+                // Encoding changes still identify a different source version.
+                assert_eq!(
+                    loaded.source_hash() == expected.source_hash(),
+                    text == source
+                );
+            }
+        }
+        let error = Track::parse("\u{feff}straight 40\r\nunknown\r\n").unwrap_err();
+        assert!(error.starts_with("Line 2:"), "{error}");
+    }
 
     #[test]
     fn source_identity_belongs_to_the_loaded_version() {

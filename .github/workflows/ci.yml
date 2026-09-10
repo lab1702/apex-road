@@ -1,0 +1,78 @@
+name: Windows and Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      APEX_BINARY: target/${{ matrix.target }}/release/apex-road${{ matrix.extension }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux graphics dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libx11-dev libxi-dev \
+            libgl1-mesa-dev libgl1-mesa-dri xvfb xauth
+
+      - name: Install stable Rust
+        run: >-
+          rustup toolchain install stable --profile minimal
+          --component rustfmt --component clippy --target ${{ matrix.target }}
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+
+      - name: Test
+        run: cargo +stable test --locked --all-targets --target ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo +stable build --locked --release --target ${{ matrix.target }}
+
+      - name: Validate every bundled track without a display
+        run: |
+          for track in tracks/*.track; do
+            "$APEX_BINARY" --validate "$track"
+          done
+
+      # Hosted Windows runners are not required to provide a usable OpenGL GPU.
+      - name: Smoke test the Linux renderer
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          timeout 120s xvfb-run --auto-servernum --server-args="-screen 0 1440x900x24" \
+            "$APEX_BINARY" --smoke-test --capture captures/ci-linux.png
+          test -s captures/ci-linux.png

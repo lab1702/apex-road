@@ -1,6 +1,8 @@
 # Text track format
 
 Tracks are UTF-8 `.track` files containing one road-building command per line.
+Both LF and Windows CRLF line endings are accepted, with or without an initial
+UTF-8 byte-order mark. Save as UTF-8, not UTF-16.
 Use `#` for comments and optional double quotes for names or descriptions.
 Commands are lowercase. Distances are **metres** and angles are **degrees**.
 Numbers can be negative or decimal where appropriate; `NaN` and infinity are
