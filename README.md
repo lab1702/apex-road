@@ -14,7 +14,7 @@ limited amount of tire grip. Enter a corner too quickly, brake too hard, or
 apply too much throttle while turning and the tires start to slide. Hills,
 banked corners, and airborne jumps affect how the car moves.
 
-## Run on Windows or Linux
+## Run on Windows, Linux, or macOS
 
 Install a current stable [Rust toolchain](https://rust-lang.org/tools/install/).
 The renderer uses Macroquad and OpenGL; playing requires a graphical desktop
@@ -57,6 +57,30 @@ cd apex-road
 cargo run --release --locked
 ```
 
+### macOS
+
+Install the [Xcode Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
+for the C compiler and linker:
+
+```sh
+xcode-select --install
+```
+
+Complete the installation dialog, then install the current stable Rust
+toolchain using the link above. Use the native toolchain for your Mac;
+on Apple silicon this is `aarch64-apple-darwin`.
+
+Clone the repository and run from Terminal:
+
+```sh
+git clone https://github.com/lab1702/apex-road.git
+cd apex-road
+cargo run --release --locked
+```
+
+To run the built executable from the project directory, use
+`./target/release/apex-road`.
+
 ### First launch
 
 Press **Enter** to start. The first build downloads and compiles the Rust
@@ -86,6 +110,10 @@ the directory containing it.
 | Tab | Switch to the next bundled track |
 | F11 | Toggle fullscreen |
 | Q, while paused | Quit |
+
+On an Apple keyboard, you may need to hold **Fn** / **Globe** while pressing
+**F1**, **F5**, or **F11**, or enable standard function keys in Keyboard
+settings. See [Apple's function-key instructions](https://support.apple.com/102439).
 
 The HUD starts in US units (**mph** and **miles**). Press **U** at any time to
 switch to metric (**km/h** and **kilometers**) or back. Your selection lasts
@@ -118,7 +146,7 @@ Best times are saved under `./data/`, keyed by the track file's contents.
 Editing a track starts a separate record history for that version. Restarting
 a run resets its timer and checkpoint progress.
 Track identity includes line endings and any byte-order mark; Git keeps the
-bundled `.track` files as LF on both platforms to preserve their record keys.
+bundled `.track` files as LF on all three platforms to preserve their record keys.
 
 ## Bundled courses
 
@@ -251,15 +279,23 @@ cargo test --locked
 ```
 
 The [CI workflow](.github/workflows/ci.yml) runs formatting, Clippy, tests,
-release builds, and all bundled track validations on Windows and Linux.
+release builds, and all bundled track validations on Windows, Linux, and
+Apple silicon macOS.
 Linux also runs the renderer smoke test with Xvfb and Mesa software rendering.
-The Windows renderer smoke test needs a desktop with an OpenGL driver:
+Windows and macOS renderer smoke tests need a graphical desktop with OpenGL.
+On Windows:
 
 ```powershell
 cargo run --release --locked -- --smoke-test --capture captures/windows-drive.png
 ```
 
-For an interactive check on either desktop, start a run with **Enter**, drive
+On macOS:
+
+```sh
+cargo run --release --locked -- --smoke-test --capture captures/macos-drive.png
+```
+
+For an interactive check on each desktop, start a run with **Enter**, drive
 with **WASD** and the arrow keys, and toggle mouse driving with right click.
 Check **Esc** pause/resume, **F11** fullscreen, **Tab** course switching,
 **F5** reload, and switching away from the game while mouse driving (it should

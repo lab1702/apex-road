@@ -1,4 +1,4 @@
-name: Windows and Linux
+name: Windows, Linux, and macOS
 
 on:
   push:
@@ -23,6 +23,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             extension: .exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            extension: ""
     defaults:
       run:
         shell: bash
@@ -66,7 +69,7 @@ jobs:
             "$APEX_BINARY" --validate "$track"
           done
 
-      # Hosted Windows runners are not required to provide a usable OpenGL GPU.
+      # Windows and macOS renderer checks run separately on graphical desktops.
       - name: Smoke test the Linux renderer
         if: runner.os == 'Linux'
         timeout-minutes: 3

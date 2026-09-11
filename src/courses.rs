@@ -141,9 +141,13 @@ mod tests {
             );
             return;
         }
+        // macOS may report /private/var for a fixture created under /var.
+        // Compare directory identities after resolving filesystem aliases.
         assert_eq!(
-            std::env::current_dir().unwrap(),
-            PathBuf::from(std::env::var_os(CHILD).unwrap()),
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            PathBuf::from(std::env::var_os(CHILD).unwrap())
+                .canonicalize()
+                .unwrap(),
             "reload fixture must run in its isolated temporary directory"
         );
 
