@@ -324,23 +324,48 @@ fn guardrail_sweep(
 /// Triangles also retain the tunnel's actual opening instead of extending its
 /// ceiling beyond the final cross-section.
 fn tunnel_roof_sweep(track: &Track, before: Vec3, after: Vec3) -> Option<(Vec3, Vec3)> {
+    #[cfg(test)]
+    {
+        use super::contact::index_check::{self, Mode};
+        match index_check::mode() {
+            Mode::Scan => return roof_sweep(track, before, after, false),
+            Mode::Verify => {
+                let found = roof_sweep(track, before, after, true);
+                let bits = |hit: Option<(Vec3, Vec3)>| {
+                    hit.map(|(at, normal)| [at, normal].map(|v| v.to_array().map(f32::to_bits)))
+                };
+                assert_eq!(
+                    bits(found),
+                    bits(roof_sweep(track, before, after, false)),
+                    "indexed roof sweep from {before:?} to {after:?} differs from the full scan"
+                );
+                return found;
+            }
+            Mode::Indexed => {}
+        }
+    }
+    roof_sweep(track, before, after, true)
+}
+
+/// [`tunnel_roof_sweep`], through the spatial index if `indexed`.
+fn roof_sweep(track: &Track, before: Vec3, after: Vec3, indexed: bool) -> Option<(Vec3, Vec3)> {
     let before = before + Vec3::Y * 0.7;
     let after = after + Vec3::Y * 0.7;
     let path_min = before.min(after);
     let path_max = before.max(after);
     let mut hit: Option<(f32, Vec3)> = None;
-    for pair in track.samples.windows(2) {
-        let a = pair[0];
-        let b = pair[1];
+    let mut sweep_segment = |segment: usize| {
+        let a = track.samples[segment];
+        let b = track.samples[segment + 1];
         if a.kind != RoadKind::Tunnel {
-            continue;
+            return;
         }
         // A conservative bound is cheap even for a long, densely sampled route.
         let radius = a.width.max(b.width) * 0.5 + TUNNEL_ARCH_REACH;
         let bounds_min = a.pos.min(b.pos) - Vec3::splat(radius);
         let bounds_max = a.pos.max(b.pos) + Vec3::splat(radius);
         if path_max.cmplt(bounds_min).any() || path_min.cmpgt(bounds_max).any() {
-            continue;
+            return;
         }
         let arch = |sample: RoadSample, index: usize| {
             let angle = tunnel_arch_angle(index);
@@ -388,6 +413,17 @@ fn tunnel_roof_sweep(track: &Track, before: Vec3, after: Vec3) -> Option<(Vec3, 
                 }
             }
         }
+    };
+    // Only segments near the path can pass the bound above. Visiting them
+    // in index order keeps the earliest of equal hits, as a full scan does.
+    match track.segment_index().filter(|_| indexed) {
+        Some(index) if path_min.is_finite() && path_max.is_finite() => {
+            let reach = index.max_half_width() + TUNNEL_ARCH_REACH;
+            for segment in index.segments_near(path_min.xz(), path_max.xz(), reach) {
+                sweep_segment(segment);
+            }
+        }
+        _ => (0..track.samples.len().saturating_sub(1)).for_each(sweep_segment),
     }
     hit.map(|(fraction, normal)| (before.lerp(after, fraction), normal))
 }

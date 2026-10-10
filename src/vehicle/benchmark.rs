@@ -90,45 +90,69 @@ pub(super) fn long_course() -> Track {
     Track::parse(&source).unwrap()
 }
 
+/// Drive four 90-second runs (one plain, three disturbed) on `track` and
+/// return the digest of every step.
+fn drive(track: &Track) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for (run, noisy) in [(0_u64, false), (1, true), (2, true), (3, true)] {
+        let mut seed = run.wrapping_mul(0x2545f4914f6cdd1d) ^ 0x1234_5678;
+        let mut car = Car::new(track);
+        for step in 0..(120 * 90) {
+            let control = control(&car, track, &mut seed, noisy, step);
+            car.update(track, control, STEP);
+            digest_car(&mut hash, &car);
+            if noisy && step % 3600 == 3599 {
+                // Restart mid-course so every run covers more track.
+                car.reset(track, (seed % 997) as f32 / 997.0 * track.length);
+            }
+        }
+    }
+    hash
+}
+
+/// Times the same runs with road queries through the spatial index and
+/// through the full scan of every segment; both must agree bit for bit.
 #[test]
 #[ignore = "benchmark; run in --release with --ignored --nocapture"]
 fn autodrive_benchmark() {
+    use super::contact::index_check::{Mode, with_mode};
     let mut tracks: Vec<(String, Track)> = crate::courses::BUNDLED_PATHS
         .iter()
         .map(|path| (path.to_string(), Track::load(path).unwrap()))
         .collect();
     tracks.push(("long (generated)".into(), long_course()));
+    let mut totals = [std::time::Duration::ZERO; 2];
     let mut total_hash = 0xcbf29ce484222325u64;
-    let mut total_time = std::time::Duration::ZERO;
+    println!(
+        "{:>28}  {:>7}  {:>11}  {:>11}  {:>7}  digest",
+        "course", "samples", "indexed ms", "scan ms", "speedup"
+    );
     for (name, track) in &tracks {
-        let start = std::time::Instant::now();
-        let mut hash = 0xcbf29ce484222325u64;
-        for (run, noisy) in [(0_u64, false), (1, true), (2, true), (3, true)] {
-            let mut seed = run.wrapping_mul(0x2545f4914f6cdd1d) ^ 0x1234_5678;
-            let mut car = Car::new(track);
-            for step in 0..(120 * 90) {
-                let control = control(&car, track, &mut seed, noisy, step);
-                car.update(track, control, STEP);
-                digest_car(&mut hash, &car);
-                if noisy && step % 3600 == 3599 {
-                    // Restart mid-course so every run covers more track.
-                    car.reset(track, (seed % 997) as f32 / 997.0 * track.length);
-                }
-            }
+        let mut times = [std::time::Duration::ZERO; 2];
+        let mut hashes = [0; 2];
+        for (slot, mode) in [Mode::Indexed, Mode::Scan].into_iter().enumerate() {
+            let start = std::time::Instant::now();
+            hashes[slot] = with_mode(mode, || drive(track));
+            times[slot] = start.elapsed();
+            totals[slot] += times[slot];
         }
-        let elapsed = start.elapsed();
-        total_time += elapsed;
-        total_hash = (total_hash ^ hash).wrapping_mul(0x100000001b3);
+        assert_eq!(hashes[0], hashes[1], "{name}: the index changed the result");
+        total_hash = (total_hash ^ hashes[0]).wrapping_mul(0x100000001b3);
         println!(
-            "{name:>28}: {:>6} samples, {:>9.1} ms, digest {hash:016x}",
+            "{name:>28}  {:>7}  {:>11.1}  {:>11.1}  {:>6.1}x  {:016x}",
             track.samples.len(),
-            elapsed.as_secs_f64() * 1000.0
+            times[0].as_secs_f64() * 1000.0,
+            times[1].as_secs_f64() * 1000.0,
+            times[1].as_secs_f64() / times[0].as_secs_f64(),
+            hashes[0]
         );
     }
     println!(
-        "{:>28}: {:>6} {:>17.1} ms, digest {total_hash:016x}",
+        "{:>28}  {:>7}  {:>11.1}  {:>11.1}  {:>6.1}x  {total_hash:016x}",
         "total",
         "",
-        total_time.as_secs_f64() * 1000.0
+        totals[0].as_secs_f64() * 1000.0,
+        totals[1].as_secs_f64() * 1000.0,
+        totals[1].as_secs_f64() / totals[0].as_secs_f64()
     );
 }

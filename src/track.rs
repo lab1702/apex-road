@@ -3,6 +3,9 @@ use macroquad::prelude::*;
 use std::io::Read;
 use std::path::Path;
 
+mod segment_index;
+pub use segment_index::SegmentIndex;
+
 const SAMPLE_SPACING: f32 = 2.0;
 const MAX_TILT_STEP: f32 = 5.0_f32.to_radians();
 const MAX_SAMPLES: usize = 25_001;
@@ -116,12 +119,16 @@ pub fn shoulder_curve_error(a: RoadSample, b: RoadSample, sides: &[f32], ground:
 pub struct Track {
     pub name: String,
     pub description: String,
+    /// Road queries index these samples on first use (see
+    /// [`Track::segment_index`]). Edit them only before driving on the
+    /// course, or parse a new one.
     pub samples: Vec<RoadSample>,
     pub length: f32,
     pub closed: bool,
     /// Ordered interior checkpoint distances; start and finish are implicit.
     pub checkpoints: Vec<f32>,
     source_hash: u64,
+    segment_index: segment_index::SegmentIndexCache,
 }
 
 impl Track {
@@ -191,6 +198,14 @@ impl Track {
         self.source_hash
     }
 
+    /// A spatial index of the segments between samples, built on the first
+    /// call and kept with this course; a reloaded course builds its own.
+    /// `None` if samples were added or removed after it was built.
+    pub fn segment_index(&self) -> Option<&SegmentIndex> {
+        let index = self.segment_index.get_or_build(&self.samples);
+        (index.segment_count() + 1 == self.samples.len()).then_some(index)
+    }
+
     /// Timing and gate location: the circuit seam or 3 m before a sprint's end.
     pub fn finish_distance(&self) -> f32 {
         if self.closed {
@@ -204,12 +219,7 @@ impl Track {
     /// Deriving this from the route keeps negative-elevation tracks above
     /// their terrain instead of burying them under a fixed world plane.
     pub fn ground_height(&self) -> f32 {
-        self.samples
-            .iter()
-            .map(|sample| sample.pos.y - sample.right.y.abs() * sample.width * 0.5)
-            .reduce(f32::min)
-            .unwrap_or(0.0)
-            - 3.0
+        ground_height(&self.samples)
     }
 
     /// Closed courses wrap in either direction; point-to-point courses clamp.
@@ -248,6 +258,15 @@ impl Track {
     }
 }
 
+fn ground_height(samples: &[RoadSample]) -> f32 {
+    samples
+        .iter()
+        .map(|sample| sample.pos.y - sample.right.y.abs() * sample.width * 0.5)
+        .reduce(f32::min)
+        .unwrap_or(0.0)
+        - 3.0
+}
+
 struct Builder {
     track: Track,
     heading: f32,
@@ -283,6 +302,7 @@ impl Builder {
                 closed: false,
                 checkpoints: Vec::new(),
                 source_hash: 0,
+                segment_index: Default::default(),
             },
             heading: 0.0,
             grade: 0.0,

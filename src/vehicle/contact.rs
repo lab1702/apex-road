@@ -4,7 +4,7 @@
 
 use super::landing::{landing_velocity, surface_vertical_speed};
 use super::*;
-use crate::track::RoadSample;
+use crate::track::{RoadSample, SegmentIndex};
 
 /// The road cross-section through a position: the interpolated sample, the
 /// segment that contains it, and the position's place on its plane.
@@ -264,6 +264,22 @@ pub(super) fn nearest_road(
     )
 }
 
+/// [`Track::ground_height`], as cached by the course's spatial index.
+pub(super) fn ground_height(track: &Track) -> f32 {
+    let cached = track.segment_index().map(SegmentIndex::ground_height);
+    #[cfg(test)]
+    match index_check::mode() {
+        index_check::Mode::Scan => return track.ground_height(),
+        index_check::Mode::Verify => {
+            if let Some(cached) = cached {
+                assert_eq!(cached.to_bits(), track.ground_height().to_bits());
+            }
+        }
+        index_check::Mode::Indexed => {}
+    }
+    cached.unwrap_or_else(|| track.ground_height())
+}
+
 /// [`nearest_road`] with an explicit tolerance for snapping a position just
 /// outside a segment's end cross-sections onto that segment.
 pub(super) fn nearest_road_with_tolerance(
@@ -275,14 +291,243 @@ pub(super) fn nearest_road_with_tolerance(
     sweep: Option<RoadSweep>,
     segment_tolerance: f32,
 ) -> Option<RoadPoint> {
-    let mut best: Option<(f32, RoadPoint)> = None;
-    for (index, pair) in track.samples.windows(2).enumerate() {
-        let a = pair[0];
-        let b = pair[1];
+    let query = RoadQuery {
+        track,
+        position,
+        previous_distance,
+        max_surface_height,
+        ground_height,
+        sweep,
+        segment_tolerance,
+    };
+    #[cfg(test)]
+    match index_check::mode() {
+        index_check::Mode::Scan => return query.brute_force(),
+        index_check::Mode::Verify => {
+            let found = query.indexed();
+            assert!(
+                index_check::same_road(found, query.brute_force()),
+                "indexed road query at {position:?} differs from the full scan"
+            );
+            return found;
+        }
+        index_check::Mode::Indexed => {}
+    }
+    query.indexed()
+}
+
+/// Tests with debug assertions run every road query through both the spatial
+/// index and the full scan, and require bit-identical results. Optimized
+/// test builds use the index alone, so they time it as the game runs it;
+/// benchmarks can select either path.
+#[cfg(test)]
+pub(super) mod index_check {
+    use super::RoadPoint;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::vehicle) enum Mode {
+        Verify,
+        Indexed,
+        Scan,
+    }
+
+    thread_local! {
+        static MODE: Cell<Mode> = const {
+            Cell::new(if cfg!(debug_assertions) { Mode::Verify } else { Mode::Indexed })
+        };
+    }
+
+    pub(in crate::vehicle) fn mode() -> Mode {
+        MODE.with(Cell::get)
+    }
+
+    /// Run `f` with road queries on this thread using `mode`.
+    pub(in crate::vehicle) fn with_mode<T>(mode: Mode, f: impl FnOnce() -> T) -> T {
+        let previous = MODE.replace(mode);
+        let result = f();
+        MODE.set(previous);
+        result
+    }
+
+    /// Bitwise equality, so that even the sign of a zero must match.
+    pub(in crate::vehicle) fn same_road(a: Option<RoadPoint>, b: Option<RoadPoint>) -> bool {
+        let bits = |road: RoadPoint| {
+            let s = road.sample;
+            let vectors = [s.pos, s.forward, s.right, s.up].map(|v| v.to_array().map(f32::to_bits));
+            (
+                vectors,
+                [s.width, s.bank, s.distance, road.lateral, road.plane_height].map(f32::to_bits),
+                s.kind,
+                road.index,
+                road.swept_contact,
+            )
+        };
+        a.map(bits) == b.map(bits)
+    }
+}
+
+/// The arguments of one road query.
+#[derive(Clone, Copy)]
+struct RoadQuery<'a> {
+    track: &'a Track,
+    position: Vec3,
+    previous_distance: f32,
+    max_surface_height: f32,
+    ground_height: f32,
+    sweep: Option<RoadSweep>,
+    segment_tolerance: f32,
+}
+
+/// A segment's score is at least the square of the position's horizontal
+/// distance outside its deck and shoulder footprint. The spatial index
+/// bounds that distance from below by the gap between the position and the
+/// segment's centerline bounds, less its half width and shoulder. The two
+/// differ only by the position's tiny longitudinal offset from the solved
+/// cross-section (seam snapping, root-finding and rounding: millimetres on
+/// legal courses), which this margin, with a relative allowance for rounding
+/// far from the route, covers many times over. Tests check every query
+/// against the full scan.
+const INDEX_GAP_MARGIN: f32 = 0.5;
+const INDEX_GAP_SCALE: f32 = 1.001;
+
+/// The best road point found so far by an indexed query.
+#[derive(Default)]
+struct IndexedBest {
+    road: Option<(f32, usize, RoadPoint)>,
+    /// A NaN score never compares; only the full scan's order defines its
+    /// effect, so the query falls back to that scan.
+    unordered: bool,
+}
+
+impl IndexedBest {
+    /// Keep the lower score, or the lower segment index at equal scores.
+    fn offer(&mut self, segment: usize, scored: Option<(f32, RoadPoint)>) {
+        let Some((score, point)) = scored else {
+            return;
+        };
+        if score.is_nan() {
+            self.unordered = true;
+        } else if self.road.is_none_or(|(best_score, best_segment, _)| {
+            score < best_score || (score == best_score && segment < best_segment)
+        }) {
+            self.road = Some((score, segment, point));
+        }
+    }
+
+    /// The largest footprint gap that could still score at or below the
+    /// best score.
+    fn limit(&self) -> f32 {
+        match self.road {
+            Some((score, ..)) if !self.unordered => {
+                (score.sqrt() + INDEX_GAP_MARGIN) * INDEX_GAP_SCALE
+            }
+            _ => f32::INFINITY,
+        }
+    }
+}
+
+impl RoadQuery<'_> {
+    /// Score every segment in index order; the earliest of equal scores wins.
+    fn brute_force(&self) -> Option<RoadPoint> {
+        let mut best: Option<(f32, RoadPoint)> = None;
+        for index in 0..self.track.samples.len().saturating_sub(1) {
+            let Some((score, point)) = self.evaluate(index) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score < *best_score)
+            {
+                best = Some((score, point));
+            }
+        }
+        best.map(|(_, point)| point)
+    }
+
+    /// The result of [`Self::brute_force`], scoring only the segments that
+    /// the course's spatial index cannot rule out. A segment is skipped only
+    /// when its footprint gap proves a score above the best one found, so it
+    /// could neither win nor tie; ties keep the lowest index, as in the scan.
+    fn indexed(&self) -> Option<RoadPoint> {
+        let Some(index) = self.track.segment_index() else {
+            return self.brute_force();
+        };
+        let segments = index.segment_count();
+        if segments == 0 || !self.position.is_finite() {
+            return self.brute_force();
+        }
+        let mut best = IndexedBest::default();
+        // The segment at the previous progress is usually the answer.
+        // Scoring it first bounds the search from the start.
+        let seed = self
+            .track
+            .samples
+            .partition_point(|sample| sample.distance <= self.previous_distance)
+            .saturating_sub(1)
+            .min(segments - 1);
+        let normals = index.cross_section_normals();
+        if self.may_contain(seed, normals) {
+            best.offer(seed, self.evaluate(seed));
+        }
+        let complete = index.visit_nearby(self.position.xz(), best.limit(), |segment| {
+            if segment != seed && self.may_contain(segment, normals) {
+                best.offer(segment, self.evaluate(segment));
+            }
+            best.limit()
+        });
+        if !complete {
+            // Nothing nearby bounded the search. Offering a segment twice
+            // changes nothing, so check them all, in index order.
+            for segment in 0..segments {
+                if self.may_contain(segment, normals) {
+                    best.offer(segment, self.evaluate(segment));
+                }
+            }
+        }
+        if best.unordered {
+            return self.brute_force();
+        }
+        best.road.map(|(.., point)| point)
+    }
+
+    /// False only where [`Self::evaluate`] returns `None` because the
+    /// position lies beyond both end cross-sections of the segment and
+    /// outside its seam tolerance. This repeats evaluate's own first test,
+    /// with the index's copies of the cross-section normals.
+    #[inline(always)]
+    fn may_contain(&self, index: usize, normals: &[Vec3]) -> bool {
+        let a = self.track.samples[index];
+        let b = self.track.samples[index + 1];
+        let start_offset = horizontal(self.position - a.pos).dot(normals[index]);
+        let end_offset = horizontal(self.position - b.pos).dot(normals[index + 1]);
+        let bracketed = (start_offset >= 0.0 && end_offset <= 0.0)
+            || (start_offset <= 0.0 && end_offset >= 0.0);
+        bracketed
+            || !(start_offset.abs() > self.segment_tolerance
+                && end_offset.abs() > self.segment_tolerance)
+    }
+
+    /// Score segment `index` for this query; lower scores are better.
+    /// `None` where the position lies outside the segment's end
+    /// cross-sections, or the segment is an overpass above the car.
+    #[inline(always)]
+    fn evaluate(&self, index: usize) -> Option<(f32, RoadPoint)> {
+        let RoadQuery {
+            track,
+            position,
+            previous_distance,
+            max_surface_height,
+            ground_height,
+            sweep,
+            segment_tolerance,
+        } = *self;
+        let a = track.samples[index];
+        let b = track.samples[index + 1];
         let chord = horizontal(b.pos - a.pos);
         let chord_length_squared = chord.length_squared();
         if chord_length_squared < 0.00001 {
-            continue;
+            return None;
         }
         // Bound every segment by its rendered cross-sections, including the
         // edges of gaps. Chord projections alone leave holes on the outside
@@ -311,7 +556,7 @@ pub(super) fn nearest_road_with_tolerance(
         {
             1.0
         } else if !bracketed {
-            continue;
+            return None;
         } else {
             // Interpolate the cross-section that contains the car. On a
             // banked hill, the road's right vector has a longitudinal
@@ -467,17 +712,11 @@ pub(super) fn nearest_road_with_tolerance(
             // Run the sweep in that interval too, while keeping the same
             // one-sided bound for route selection.
             if !point.swept_contact && surface_height > max_surface_height {
-                continue;
+                return None;
             }
         }
-        if best
-            .as_ref()
-            .is_none_or(|(best_score, _)| score < *best_score)
-        {
-            best = Some((score, point));
-        }
+        Some((score, point))
     }
-    best.map(|(_, point)| point)
 }
 
 /// Crossing an extended road or shoulder plane outside its footprint is not a
@@ -1529,5 +1768,149 @@ mod tests {
         let mut distant = before_boundary;
         distant.index = 9;
         assert_eq!(route_walk(&track, after_boundary, distant), None);
+    }
+
+    /// Positions spread over and around a course: random points, every
+    /// cross-section's deck edges, shoulder edges and seams (exactly and
+    /// just beside them), and every point where one pass of the route lies
+    /// over another, at both decks' heights.
+    /// Also returns how many positions lie where the route is stacked.
+    fn query_positions(track: &Track, seed: u64) -> (Vec<Vec3>, usize) {
+        let mut state = seed;
+        let mut random = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let ground = track.ground_height();
+        let (min, max) = track.samples.iter().fold(
+            (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+            |(min, max), sample| (min.min(sample.pos), max.max(sample.pos)),
+        );
+        let (min, max) = (
+            min - vec3(200.0, 0.0, 200.0),
+            max + vec3(200.0, 20.0, 200.0),
+        );
+        let mut positions = Vec::new();
+        for _ in 0..400 {
+            positions.push(vec3(
+                min.x + (max.x - min.x) * random(),
+                ground - 2.0 + (max.y - ground + 2.0) * random(),
+                min.z + (max.z - min.z) * random(),
+            ));
+        }
+        let lift = Vec3::Y * RIDE_HEIGHT;
+        for (index, sample) in track.samples.iter().enumerate().step_by(3) {
+            let half = sample.width * 0.5;
+            for lateral in [
+                0.0,
+                half,
+                half + 0.005,
+                half + SHOULDER_WIDTH,
+                half + SHOULDER_WIDTH + 0.02,
+                half + SHOULDER_WIDTH + 30.0,
+            ] {
+                let side = if index % 2 == 0 { 1.0 } else { -1.0 };
+                positions.push(sample.pos + sample.right * lateral * side + lift);
+            }
+            // Seams: on the cross-section, and just either side of it.
+            for along in [-0.02, -0.005, 0.0, 0.005, 0.02] {
+                positions.push(sample.pos + sample.forward * along + lift);
+            }
+            positions.push(sample.pos + Vec3::Y * (2.0 + 6.0 * random()));
+        }
+        // Stacked roads: wherever another part of the route passes within
+        // a few metres horizontally at a different height.
+        let unstacked = positions.len();
+        for (index, sample) in track.samples.iter().enumerate().step_by(2) {
+            for other in &track.samples[index + 1..] {
+                if (other.pos.xz() - sample.pos.xz()).length() < 3.0
+                    && (other.pos.y - sample.pos.y).abs() > 2.0
+                {
+                    for height in [sample.pos.y, other.pos.y] {
+                        let position = vec3(sample.pos.x, height, sample.pos.z) + lift;
+                        positions.extend([position, position - Vec3::Y * 0.4, position + Vec3::Y]);
+                    }
+                }
+            }
+        }
+        let stacked = positions.len() - unstacked;
+        (positions, stacked)
+    }
+
+    #[test]
+    fn indexed_road_queries_match_the_full_scan_on_every_course() {
+        use super::index_check::{Mode, same_road, with_mode};
+        let mut tracks: Vec<Track> = crate::courses::BUNDLED_PATHS
+            .iter()
+            .map(|path| Track::load(path).unwrap())
+            .collect();
+        // Far from the origin, where rounding is coarsest, and with a road
+        // passing beneath a bridge deck.
+        tracks.push(
+            Track::parse(
+                "start 9000 400 -9000 30\nwidth 9\nstraight 120\nright 270 radius 40 rise 12\n\
+                 bridge 120 rise -2\nright 90 radius 40 kind road\nstraight 60",
+            )
+            .unwrap(),
+        );
+        let mut missed = 0;
+        for (number, track) in tracks.iter().enumerate() {
+            let ground = track.ground_height();
+            let (positions, stacked) = query_positions(track, number as u64 + 1);
+            if track.name == "Skyline Eight" {
+                assert!(stacked > 0, "the viaduct crosses the lower road");
+            }
+            let mut found = 0;
+            for (index, &position) in positions.iter().enumerate() {
+                let nearest = track.samples[(index * 7) % track.samples.len()].distance;
+                let before = position + vec3(0.3, 1.5, -0.2);
+                let sweep = RoadSweep {
+                    before,
+                    support: with_mode(Mode::Indexed, || {
+                        nearest_road(track, before, nearest, f32::INFINITY, ground, None)
+                    }),
+                };
+                for (previous_distance, max_surface_height, sweep, segment_tolerance) in [
+                    (
+                        nearest,
+                        position.y - RIDE_HEIGHT + 0.3,
+                        None,
+                        SEGMENT_TOLERANCE,
+                    ),
+                    (0.0, f32::INFINITY, None, SEGMENT_TOLERANCE),
+                    (
+                        track.length * 0.5,
+                        position.y - RIDE_HEIGHT,
+                        Some(sweep),
+                        0.00001,
+                    ),
+                ] {
+                    let query = RoadQuery {
+                        track,
+                        position,
+                        previous_distance,
+                        max_surface_height,
+                        ground_height: ground,
+                        sweep,
+                        segment_tolerance,
+                    };
+                    let (indexed, scanned) =
+                        with_mode(Mode::Indexed, || (query.indexed(), query.brute_force()));
+                    assert!(
+                        same_road(indexed, scanned),
+                        "{}: query at {position:?} from {previous_distance} differs",
+                        track.name
+                    );
+                    found += usize::from(indexed.is_some());
+                }
+            }
+            assert!(found > 0, "{}", track.name);
+            missed += positions.len() * 3 - found;
+        }
+        // Some positions lie beyond every segment's end cross-sections,
+        // where the search cannot bound itself and checks every segment.
+        assert!(missed > 0);
     }
 }

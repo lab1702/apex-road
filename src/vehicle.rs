@@ -186,7 +186,7 @@ impl Car {
         }
         // Bound public calls as well as the application's fixed-step loop.
         let dt = dt.min(1.0 / 30.0);
-        let ground_height = track.ground_height();
+        let ground_height = contact::ground_height(track);
         self.impact = (self.impact - dt * 2.8).max(0.0);
         let speed = horizontal(self.velocity).length();
         self.apply_controls(control, speed, dt);
