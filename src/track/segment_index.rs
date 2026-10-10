@@ -150,25 +150,29 @@ impl SegmentIndex {
         self.max_half_width
     }
 
-    /// In ascending order, every segment whose centerline bounds lie within
-    /// `margin` of the horizontal rectangle from `min` to `max`, and perhaps
-    /// a few more.
-    pub fn segments_near(&self, min: Vec2, max: Vec2, margin: f32) -> Vec<usize> {
+    /// Call `visit` once for every segment whose centerline bounds lie
+    /// within `margin` of the horizontal rectangle from `min` to `max`, and
+    /// perhaps a few more, in no particular order. Nothing is allocated, so
+    /// physics can call it every step.
+    pub fn for_each_near(&self, min: Vec2, max: Vec2, margin: f32, mut visit: impl FnMut(usize)) {
         let margin = Vec2::splat(margin + CELL_SLACK);
         let [x0, z0] = self.clamped_cell(min - margin);
         let [x1, z1] = self.clamped_cell(max + margin);
-        let mut found = Vec::new();
         for z in z0..=z1 {
-            let row = z * self.columns;
-            for cell in row + x0..=row + x1 {
+            for x in x0..=x1 {
+                let cell = z * self.columns + x;
                 let entries =
                     &self.entries[self.starts[cell] as usize..self.starts[cell + 1] as usize];
-                found.extend(entries.iter().map(|&id| id as usize));
+                for &id in entries {
+                    // A segment spanning several cells is visited only from
+                    // the lowest of its cells inside the rectangle.
+                    let [sx, sz, _, _] = self.segments[id as usize].cells;
+                    if [x, z] == [sx.max(x0), sz.max(z0)] {
+                        visit(id as usize);
+                    }
+                }
             }
         }
-        found.sort_unstable();
-        found.dedup();
-        found
     }
 
     /// The cell containing `point`, which may lie outside the grid.
@@ -347,11 +351,12 @@ mod tests {
                     }
                 }
                 let margin = 50.0 * random();
-                let near = index.segments_near(point, point, margin);
-                assert!(near.is_sorted());
+                let mut near = vec![0; index.segment_count()];
+                index.for_each_near(point, point, margin, |segment| near[segment] += 1);
                 for (id, segment) in index.segments.iter().enumerate() {
+                    assert!(near[id] <= 1, "{path}: a segment was visited twice");
                     if gap(segment) + segment.reach <= margin {
-                        assert!(near.binary_search(&id).is_ok(), "{path}: {point}");
+                        assert_eq!(near[id], 1, "{path}: {point}");
                     }
                 }
             }

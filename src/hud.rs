@@ -456,7 +456,7 @@ fn optional_time(seconds: Option<f32>) -> String {
 }
 
 fn track_map(track: &Track, position: Vec3, heading: f32, origin: Vec2, u: f32, units: Units) {
-    if track.samples.is_empty() {
+    if track.samples().is_empty() {
         return;
     }
     let width = 224.0 * u;
@@ -481,7 +481,7 @@ fn track_map(track: &Track, position: Vec3, heading: f32, origin: Vec2, u: f32, 
 
     let mut min = vec2(f32::INFINITY, f32::INFINITY);
     let mut max = vec2(f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for sample in &track.samples {
+    for sample in track.samples() {
         let p = vec2(sample.pos.x, sample.pos.z);
         min = min.min(p);
         max = max.max(p);
@@ -492,13 +492,13 @@ fn track_map(track: &Track, position: Vec3, heading: f32, origin: Vec2, u: f32, 
     let center = (min + max) * 0.5;
     let map_center = vec2(x + width * 0.5, y + 42.0 * u + (height - 54.0 * u) * 0.5);
     let project = |p: Vec3| map_center + vec2(p.x - center.x, -(p.z - center.y)) * map_scale;
-    for pair in track.samples.windows(2) {
+    for pair in track.samples().windows(2) {
         let a = project(pair[0].pos);
         let b = project(pair[1].pos);
         draw_line(a.x, a.y, b.x, b.y, 5.0 * u, alpha(BLACK, 0.40));
         draw_line(a.x, a.y, b.x, b.y, 2.3 * u, alpha(PAPER, 0.56));
     }
-    let start = project(track.samples[0].pos);
+    let start = project(track.samples()[0].pos);
     draw_circle(start.x, start.y, 3.0 * u, PAPER);
     // Keep the entire marker within the map when the car drives beyond the
     // course bounds. The projection's padding also contains its 9 px halo.

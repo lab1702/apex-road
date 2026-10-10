@@ -140,7 +140,7 @@ fn autodrive_benchmark() {
         total_hash = (total_hash ^ hashes[0]).wrapping_mul(0x100000001b3);
         println!(
             "{name:>28}  {:>7}  {:>11.1}  {:>11.1}  {:>6.1}x  {:016x}",
-            track.samples.len(),
+            track.samples().len(),
             times[0].as_secs_f64() * 1000.0,
             times[1].as_secs_f64() * 1000.0,
             times[1].as_secs_f64() / times[0].as_secs_f64(),

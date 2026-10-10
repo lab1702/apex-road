@@ -56,6 +56,9 @@ pub struct Car {
     /// Distance along the nearest road segment, wrapped for a closed track.
     pub distance: f32,
     pub offroad: bool,
+    /// Airborne within a gap's route guide: off the pavement, but jumping
+    /// the course as it was authored rather than cutting it.
+    over_gap: bool,
     /// Nose-up angle in radians.
     pub pitch: f32,
     /// Positive roll follows positive bank: the right side is raised.
@@ -100,6 +103,7 @@ impl Car {
             road_index: 0,
             distance: 0.0,
             offroad: false,
+            over_gap: false,
             pitch: 0.0,
             roll: 0.0,
             throttle: 0.0,
@@ -124,7 +128,7 @@ impl Car {
     }
 
     pub fn reset(&mut self, track: &Track, distance: f32) {
-        if track.samples.is_empty() {
+        if track.samples().is_empty() {
             self.position = vec3(0.0, track.ground_height() + RIDE_HEIGHT, 0.0);
             self.velocity = Vec3::ZERO;
             return;
@@ -138,7 +142,7 @@ impl Car {
         // A reset in a jump returns to its last solid approach.
         if matches!(sample.kind, RoadKind::Gap)
             && let Some(solid) = track
-                .samples
+                .samples()
                 .iter()
                 .rev()
                 .find(|s| s.distance <= distance && !matches!(s.kind, RoadKind::Gap))
@@ -154,11 +158,12 @@ impl Car {
         self.slip = 0.0;
         self.distance = sample.distance;
         self.road_index = track
-            .samples
+            .samples()
             .partition_point(|s| s.distance <= sample.distance)
             .saturating_sub(1)
-            .min(track.samples.len().saturating_sub(2));
+            .min(track.samples().len().saturating_sub(2));
         self.offroad = false;
+        self.over_gap = false;
         self.pitch = sample.forward.y.clamp(-1.0, 1.0).asin();
         self.roll = sample.bank;
         self.throttle = 0.0;
@@ -167,6 +172,12 @@ impl Car {
         self.reversing = false;
         self.longitudinal_acceleration = 0.0;
         self.reverse_hold = 0.0;
+    }
+
+    /// Whether course progress made now counts as driving the course: on the
+    /// pavement, or in the air over a gap. Landing in a gap's pit is off it.
+    pub fn on_course(&self) -> bool {
+        !self.offroad || (self.over_gap && !self.grounded)
     }
 
     /// Road speed: along the surface while grounded (the velocity is tangent
@@ -356,7 +367,7 @@ mod tests {
         assert_eq!(car.distance, 0.0);
         assert!(
             car.position
-                .distance(track.samples[0].pos + Vec3::Y * RIDE_HEIGHT)
+                .distance(track.samples()[0].pos + Vec3::Y * RIDE_HEIGHT)
                 < 0.001
         );
     }

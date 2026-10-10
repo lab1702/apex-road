@@ -244,12 +244,12 @@ fn road_entry_contact_before_exit(
     if delta.abs() > 12.0 {
         return None;
     }
-    let segments = track.samples.len() - 1;
+    let segments = track.samples().len() - 1;
     let mut index = from.index;
     let mut hit: Option<(Vec3, Surface, f32)> = None;
     loop {
-        let a = track.samples[index];
-        let b = track.samples[index + 1];
+        let a = track.samples()[index];
+        let b = track.samples()[index + 1];
         if a.kind != RoadKind::Gap {
             // Refine twisting strips so each triangle stays within 1 cm of
             // the interpolated road frame, including changing road width.
@@ -410,8 +410,8 @@ fn refine_road_entry_contact(
         // Differentiate at the contact's actual lateral coordinate. A triangle
         // spanning the full width has the slope of an outer edge, which can
         // launch a centerline approach even though its surface remains level.
-        let a = track.samples[road.index];
-        let b = track.samples[road.index + 1];
+        let a = track.samples()[road.index];
+        let b = track.samples()[road.index + 1];
         let along =
             ((road.sample.distance - a.distance) / (b.distance - a.distance)).clamp(0.0, 1.0);
         let lower = (along - 0.01).max(0.0);
@@ -790,9 +790,9 @@ mod tests {
                 ))
                 .unwrap();
                 let endpoint = if entering_finish {
-                    *track.samples.last().unwrap()
+                    *track.samples().last().unwrap()
                 } else {
-                    track.samples[0]
+                    track.samples()[0]
                 };
                 let mut car = Car::new(&track);
                 car.position = endpoint.pos + vec3(side * 5.85, RIDE_HEIGHT + 0.6, -0.1);
@@ -811,7 +811,7 @@ mod tests {
         let track = Track::parse(
             "start 0 20 0\nbridge 20\nright 180 radius 8 kind bridge\nbridge 20\nright 180 radius 16 rise -20 kind bridge\nbridge 20\nright 180 radius 8 kind bridge\nbridge 19.95",
         ).unwrap();
-        let endpoint = *track.samples.last().unwrap();
+        let endpoint = *track.samples().last().unwrap();
         let mut car = Car::new(&track);
         car.position = endpoint.pos + vec3(5.85, RIDE_HEIGHT + 0.6, -0.1);
         car.distance = endpoint.distance;
@@ -1150,12 +1150,12 @@ mod tests {
     fn bundled_alpine_gap_is_passable_at_ninety_kmh() {
         let track = Track::parse(include_str!("../../tracks/alpine.track")).unwrap();
         let ramp = track
-            .samples
+            .samples()
             .iter()
             .find(|s| s.kind == RoadKind::Ramp)
             .unwrap();
         let landing = track
-            .samples
+            .samples()
             .iter()
             .find(|s| s.distance > ramp.distance + 25.0 && s.kind == RoadKind::Road)
             .unwrap();

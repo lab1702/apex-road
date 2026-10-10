@@ -7,6 +7,12 @@ use crate::track::Track;
 /// the road; driving across an infield or the inside of a bend is not.
 pub const CUT_ALLOWANCE: f32 = 30.0;
 
+/// Total course progress (m) a lap or run may gain off the paved road,
+/// repaid or not. Several cuts that each stay under [`CUT_ALLOWANCE`] add up
+/// here; the auto driver, which only drops a wheel now and then, stays far
+/// below it.
+pub const OFFROAD_LIMIT: f32 = 2.0 * CUT_ALLOWANCE;
+
 /// The first rule a lap or run broke. Later violations keep the first reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvalidReason {
@@ -39,12 +45,13 @@ pub struct Race {
     pub best: Option<f32>,
     pub last: Option<f32>,
     pub next_checkpoint: usize,
-    pub invalid: bool,
-    /// Why `invalid` is set; `None` exactly when the lap or run is valid.
+    /// The first rule this lap or run broke; `None` while it is valid.
     pub invalid_reason: Option<InvalidReason>,
     previous: f32,
     /// Off-road progress not yet repaid by on-road progress, in metres.
     cut_debt: f32,
+    /// All off-road progress this lap or run, in metres.
+    offroad_progress: f32,
     /// A circuit car went back across the start line. Its next forward
     /// crossing restarts the lap instead of completing one.
     behind_line: bool,
@@ -59,28 +66,30 @@ impl Race {
             best: best.filter(|time| time.is_finite() && *time > 0.0),
             last: None,
             next_checkpoint: 0,
-            invalid: false,
             invalid_reason: None,
             previous: if start.is_finite() { start } else { 0.0 },
             cut_debt: 0.0,
+            offroad_progress: 0.0,
             behind_line: false,
         }
     }
 
+    /// Whether this lap or run has broken a rule and cannot set a time.
+    pub fn invalid(&self) -> bool {
+        self.invalid_reason.is_some()
+    }
+
     fn invalidate(&mut self, reason: InvalidReason) {
-        if !self.invalid {
-            self.invalid_reason = Some(reason);
-        }
-        self.invalid = true;
+        self.invalid_reason.get_or_insert(reason);
     }
 
     /// Start a new lap at the line. Only circuits use this.
     fn reset_lap(&mut self, elapsed: f64) {
         self.elapsed = elapsed;
         self.next_checkpoint = 0;
-        self.invalid = false;
         self.invalid_reason = None;
         self.cut_debt = 0.0;
+        self.offroad_progress = 0.0;
         self.behind_line = false;
     }
 
@@ -147,7 +156,8 @@ impl Race {
             self.cut_debt = (self.cut_debt - delta.max(0.0)).max(0.0);
         } else {
             self.cut_debt += delta.max(0.0);
-            if self.cut_debt > CUT_ALLOWANCE {
+            self.offroad_progress += delta.max(0.0);
+            if self.cut_debt > CUT_ALLOWANCE || self.offroad_progress > OFFROAD_LIMIT {
                 self.invalidate(InvalidReason::CutCourse);
             }
         }
@@ -172,13 +182,13 @@ impl Race {
                 }
                 let completed_time = self.elapsed - remainder;
                 let record_time = completed_time as f32;
-                let result = if !self.invalid && self.best.is_none_or(|best| record_time < best) {
+                let result = if !self.invalid() && self.best.is_none_or(|best| record_time < best) {
                     self.best = Some(record_time);
                     Some(record_time)
                 } else {
                     None
                 };
-                self.last = if self.invalid {
+                self.last = if self.invalid() {
                     None
                 } else {
                     Some(record_time)
@@ -245,7 +255,7 @@ mod tests {
                     .is_none()
             );
         }
-        assert!(r.finished && r.invalid);
+        assert!(r.finished && r.invalid());
         assert_eq!(r.invalid_reason, Some(InvalidReason::MissedCheckpoint));
         assert_eq!(r.completed_runs, 1);
         assert!(r.best.is_none());
@@ -256,7 +266,7 @@ mod tests {
         let mut r = Race::new(None, 5.);
         r.started = true;
         r.update(&t, 1., 150., true);
-        assert!(r.invalid);
+        assert!(r.invalid());
         assert_eq!(r.completed_runs, 0);
     }
     #[test]
@@ -293,10 +303,10 @@ mod tests {
         race.started = true;
         race.update(&track, 0.1, gate - 2.0, true);
         assert_eq!(race.next_checkpoint, 0);
-        assert!(!race.invalid);
+        assert!(!race.invalid());
         race.update(&track, 0.1, gate + 2.0, true);
         assert_eq!(race.next_checkpoint, 1);
-        assert!(!race.invalid);
+        assert!(!race.invalid());
 
         let mut race = Race::new(None, 2.0);
         race.started = true;
@@ -304,7 +314,7 @@ mod tests {
         race.update(&track, 0.1, track.length - 2.0, true);
         assert!(race.last.is_none());
         assert!(race.best.is_none());
-        assert!(race.invalid);
+        assert!(race.invalid());
         assert_eq!(race.next_checkpoint, track.checkpoints.len());
         assert_eq!(race.completed_runs, 0);
     }
@@ -325,12 +335,12 @@ mod tests {
         for distance in (-1..=21).rev() {
             assert!(race.update(&track, 0.1, distance as f32, true).is_none());
         }
-        assert!(race.invalid);
+        assert!(race.invalid());
         assert_eq!(race.invalid_reason, Some(InvalidReason::WrongWay));
         assert!(race.update(&track, 0.1, 0.0, true).is_none());
         assert_eq!(race.best, Some(100.0));
         assert!(race.last.is_none());
-        assert!(!race.invalid && race.invalid_reason.is_none());
+        assert!(!race.invalid() && race.invalid_reason.is_none());
         assert_eq!(race.next_checkpoint, 0);
         // Driving back over the line restarts the lap; it completes none.
         assert_eq!(race.completed_runs, 0);
@@ -350,7 +360,7 @@ mod tests {
         let speed = 10.0;
         let records = advance(&mut race, &track, 0.0, track.length * 2.0 + 3.0, speed);
         assert!(!records.is_empty());
-        assert!(!race.finished && !race.invalid);
+        assert!(!race.finished && !race.invalid());
         assert_eq!(race.completed_runs, 2);
         assert!((race.last.unwrap() - track.length / speed).abs() < 0.001);
         assert!((race.elapsed - 0.3).abs() < 0.001);
@@ -373,7 +383,7 @@ mod tests {
             cursor = next;
         }
         assert!(race.best.is_none() && race.last.is_none());
-        assert!(!race.invalid);
+        assert!(!race.invalid());
         assert_eq!(race.completed_runs, 1);
         assert_eq!(
             advance(&mut race, &track, track.length, track.length * 2.0, 10.0).len(),
@@ -389,7 +399,7 @@ mod tests {
         let mut race = Race::new(Some(100.0), 0.0);
         race.started = true;
         race.update(&track, 0.1, 30.0, true);
-        assert!(race.invalid);
+        assert!(race.invalid());
         assert!(advance(&mut race, &track, 30.0, track.length, 10.0).is_empty());
         assert_eq!(race.best, Some(100.0));
         assert!(race.last.is_none());
@@ -419,13 +429,13 @@ mod tests {
         race.started = true;
         race.last = Some(30.0);
         race.update(&track, 0.25, track.length - 0.05, true);
-        assert!(!race.invalid && race.invalid_reason.is_none());
+        assert!(!race.invalid() && race.invalid_reason.is_none());
         race.update(&track, 0.25, track.length - 0.10, true);
         // Forward again across the line: 0.05 m of this 0.15 m step remains.
         assert!(race.update(&track, 0.3, 0.05, true).is_none());
         assert_eq!(race.completed_runs, 0);
         assert_eq!(race.last, Some(30.0));
-        assert!(!race.invalid);
+        assert!(!race.invalid());
         assert!((race.elapsed - 0.1).abs() < 0.0001);
         let records = advance(&mut race, &track, 0.05, track.length, 10.0);
         assert_eq!(records.len(), 1);
@@ -443,7 +453,7 @@ mod tests {
         race.last = Some(60.0);
         race.elapsed = 30.0;
         assert!(race.update(&track, 0.1, 199.0, true).is_none());
-        assert!(race.finished && race.invalid);
+        assert!(race.finished && race.invalid());
         assert_eq!(race.invalid_reason, Some(InvalidReason::CutCourse));
         assert_eq!(race.completed_runs, 1);
         assert!(race.last.is_none());
@@ -470,11 +480,12 @@ mod tests {
 
     #[test]
     fn brief_excursions_are_repaid_by_driving_on_the_road() {
-        // Many short slides add up to far more than the allowance.
-        let race = sprint_with_excursions(|d| d < 190.0 && d % 40.0 < 15.0);
-        assert!(!race.invalid && race.last.is_some());
+        // Several short slides add up to more than the allowance, but stay
+        // within the lap's total.
+        let race = sprint_with_excursions(|d| d < 190.0 && d % 40.0 < 8.0);
+        assert!(!race.invalid() && race.last.is_some());
         let race = sprint_with_excursions(|d| (100.0..100.0 + CUT_ALLOWANCE - 1.0).contains(&d));
-        assert!(!race.invalid && race.last.is_some());
+        assert!(!race.invalid() && race.last.is_some());
     }
 
     #[test]
@@ -486,6 +497,18 @@ mod tests {
         let race =
             sprint_with_excursions(|d| (100.0..120.0).contains(&d) || (124.0..140.0).contains(&d));
         assert_eq!(race.invalid_reason, Some(InvalidReason::CutCourse));
+    }
+
+    #[test]
+    fn repeated_cuts_under_the_allowance_add_up_to_a_cut() {
+        // Each 25 m cut is repaid by the road before the next one starts.
+        let cut = |d: f32| d < 190.0 && d % 60.0 < 25.0;
+        let race = sprint_with_excursions(cut);
+        assert!(race.finished && race.last.is_none());
+        assert_eq!(race.invalid_reason, Some(InvalidReason::CutCourse));
+        // Two of them stay within the lap's total.
+        let race = sprint_with_excursions(|d| d < 120.0 && cut(d));
+        assert!(!race.invalid() && race.last.is_some());
     }
 
     #[test]
@@ -502,7 +525,7 @@ mod tests {
             cursor = next;
         }
         assert_eq!(race.completed_runs, 1);
-        assert!(race.last.is_none() && !race.invalid);
+        assert!(race.last.is_none() && !race.invalid());
         assert_eq!(advance(&mut race, &track, 0.0, track.length, 10.0).len(), 1);
         assert!(race.last.is_some());
     }
@@ -537,7 +560,7 @@ mod tests {
         for distance in 6..=197 {
             record = race.update(&track, dt, distance as f32, true).or(record);
         }
-        assert!(race.finished && !race.invalid);
+        assert!(race.finished && !race.invalid());
         assert!((race.elapsed - 1800.0).abs() < 0.001);
         assert!((record.unwrap() - 1800.0).abs() < 0.001);
         assert_eq!(race.last, record);
@@ -554,7 +577,7 @@ mod tests {
         race.update(&track, -1.0, 6.0, true);
         assert_eq!(race.elapsed, 0.0);
         race.update(&track, 0.1, f32::NAN, true);
-        assert!(race.invalid);
+        assert!(race.invalid());
         assert_eq!(race.previous, 5.0);
         assert!(race.elapsed.is_finite());
     }
@@ -590,7 +613,7 @@ mod corner_cutting {
                 car.velocity = direction * speed + Vec3::Y * car.velocity.y;
                 let before = car.distance;
                 car.update(track, Control::default(), STEP);
-                race.update(track, STEP, car.distance, !car.offroad);
+                race.update(track, STEP, car.distance, car.on_course());
                 largest_step = largest_step.max((car.distance - before).abs());
             }
         }
@@ -632,5 +655,52 @@ mod corner_cutting {
                 "radius {radius}"
             );
         }
+    }
+
+    #[test]
+    fn jumping_a_gap_longer_than_the_cut_allowance_is_not_a_cut() {
+        let track =
+            Track::parse("straight 60\nramp 30 rise 6\ngap 40 rise -6\nstraight 160\n").unwrap();
+        const { assert!(40.0 > CUT_ALLOWANCE) };
+        let mut car = Car::new(&track);
+        car.reset(&track, 40.0);
+        car.velocity = track.sample_at(40.0).forward * 35.0;
+        let mut race = Race::new(None, car.distance);
+        race.started = true;
+        let mut airborne_over_gap = 0.0;
+        for _ in 0..(12.0 / STEP) as usize {
+            let before = car.distance;
+            car.update(
+                &track,
+                Control {
+                    throttle: 1.0,
+                    ..Control::default()
+                },
+                STEP,
+            );
+            if !car.grounded && car.offroad {
+                assert!(car.on_course(), "off the route guide at {}", car.distance);
+                airborne_over_gap += car.distance - before;
+            }
+            race.update(&track, STEP, car.distance, car.on_course());
+            if race.finished {
+                break;
+            }
+        }
+        assert!(airborne_over_gap > CUT_ALLOWANCE, "{airborne_over_gap}");
+        assert!(race.finished, "never landed and finished: {car:?}");
+        assert_eq!(race.invalid_reason, None);
+    }
+
+    #[test]
+    fn landing_in_a_gaps_pit_is_off_the_course() {
+        let track = Track::parse("straight 60\ngap 40\nstraight 60\n").unwrap();
+        let mut car = Car::new(&track);
+        car.reset(&track, 50.0);
+        car.velocity = track.sample_at(50.0).forward * 8.0;
+        for _ in 0..(6.0 / STEP) as usize {
+            car.update(&track, Control::default(), STEP);
+        }
+        assert!(car.grounded && car.offroad && !car.on_course(), "{car:?}");
     }
 }

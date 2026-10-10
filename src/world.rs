@@ -234,7 +234,7 @@ fn shoulder_segment(
 fn checkerboard(track: &Track, distance: f32) -> Vec<Mesh> {
     let mut meshes = Vec::new();
     let mut builder = Builder::new();
-    for pair in track.samples.windows(2) {
+    for pair in track.samples().windows(2) {
         let [a, b] = [pair[0], pair[1]];
         if b.distance <= distance || a.distance >= distance + 1.4 || a.kind == RoadKind::Gap {
             continue;
@@ -449,18 +449,18 @@ impl World {
 
     fn build_chunks(track: &Track) -> Vec<Chunk> {
         let ground_y = track.ground_height();
-        let tree_exclusions: Vec<_> = (0..track.samples.len() - 1)
+        let tree_exclusions: Vec<_> = (0..track.samples().len() - 1)
             .step_by(48)
             .map(|first| {
                 TreeExclusion::new(
-                    &track.samples[first..=(first + 48).min(track.samples.len() - 1)],
+                    &track.samples()[first..=(first + 48).min(track.samples().len() - 1)],
                 )
             })
             .collect();
         let mut chunks = vec![];
         // Road, shoulders and architecture are spatially batched for cheap distance culling.
         for (chunk_index, points) in track
-            .samples
+            .samples()
             .windows(2)
             .collect::<Vec<_>>()
             .chunks(48)
@@ -594,7 +594,7 @@ impl World {
                     if i % 8 == 0 {
                         arch_rib(&mut b, a);
                     }
-                    if i == 0 || track.samples[i - 1].kind != RoadKind::Tunnel {
+                    if i == 0 || track.samples()[i - 1].kind != RoadKind::Tunnel {
                         arch_rib(&mut b, a);
                     }
                 }
@@ -734,11 +734,11 @@ impl World {
         }
         push_chunks(&mut chunks, gates, true);
         let min = track
-            .samples
+            .samples()
             .iter()
             .fold(Vec3::splat(f32::MAX), |a, s| a.min(s.pos));
         let max = track
-            .samples
+            .samples()
             .iter()
             .fold(Vec3::splat(f32::MIN), |a, s| a.max(s.pos));
         let mid = (min + max) * 0.5;
@@ -998,7 +998,7 @@ mod tests {
     /// Vertex and index counts, an exact bit digest, and the summed distance
     /// of every vertex from the course's first sample for all scenery.
     fn scenery_summary(track: &Track) -> (usize, usize, u64, f64) {
-        let origin = track.samples[0].pos;
+        let origin = track.samples()[0].pos;
         let mut vertices = 0;
         let mut indices = 0;
         let mut digest = 0xcbf29ce484222325u64;
@@ -1064,7 +1064,7 @@ mod tests {
 
     fn road_mesh(track: &Track) -> Mesh {
         let mut builder = Builder::new();
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             if pair[0].kind != RoadKind::Gap {
                 road_segment(&mut builder, track, pair[0], pair[1], ASPHALT);
             }
@@ -1096,7 +1096,7 @@ mod tests {
             Track::parse("width 40\nstraight 20 bank 60\nstraight 1 bank -60\nstraight 20 bank 0")
                 .unwrap();
         let mut coarse = Builder::new();
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             let [a, b] = [pair[0], pair[1]];
             coarse.quad(
                 edge(a, -a.width * 0.5, 0.),
@@ -1137,7 +1137,7 @@ mod tests {
         );
         let flat = Track::parse("straight 40").unwrap();
         assert!(
-            flat.samples
+            flat.samples()
                 .windows(2)
                 .all(|pair| surface_steps(pair[0], pair[1]) == 1)
         );
@@ -1151,7 +1151,7 @@ mod tests {
                     "width 40\nstraight 20 bank {bank}\nstraight 1 rise {rise}\nstraight 20"
                 ))
                 .unwrap();
-                for pair in track.samples.windows(2) {
+                for pair in track.samples().windows(2) {
                     let [a, b] = [pair[0], pair[1]];
                     let mut builder = Builder::new();
                     road_segment(&mut builder, &track, a, b, ASPHALT);
@@ -1261,7 +1261,7 @@ mod tests {
         let track = Track::parse("width 40\nstraight 20\nstraight 1 bank 60\nstraight 20").unwrap();
         let ground = track.ground_height();
         let mut builder = Builder::new();
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             for side in [-1.0, 1.0] {
                 shoulder_segment(
                     &mut builder,
@@ -1303,7 +1303,7 @@ mod tests {
         let ground = track.ground_height();
         let chunks = World::build_chunks(&track);
         let mut checked = 0;
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             // Inspect the level curve, whose complete shoulders fit outside
             // its center of curvature and do not overlap another road.
             if pair[0].pos.y < 499.9 || pair[0].forward.distance(pair[1].forward) < 0.01 {
@@ -1453,7 +1453,7 @@ mod tests {
                 "straight 100\nstraight 1000 rise 500 bank {bank}\nstraight 100"
             ))
             .unwrap();
-            let pair = &track.samples[300..302];
+            let pair = &track.samples()[300..302];
             let sample = surface_sample(&track, pair[0], pair[1], 0.5);
             for side in [-1., 1.] {
                 let mut shoulder = Builder::new();

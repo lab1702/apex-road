@@ -44,19 +44,52 @@ pub fn root_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-/// The first root candidate whose `tracks/` folder holds every bundled course.
-/// On failure, returns every location that was tried.
+/// The first root candidate whose `tracks/` folder holds every bundled course,
+/// or failing that, the first holding any of them: a copy missing a course
+/// still keeps its records together. On failure, returns every location
+/// that was tried.
 pub fn game_root() -> Result<PathBuf, Vec<PathBuf>> {
     let candidates = root_candidates();
-    // Any inspection error, including a file named `tracks`, is "no match".
-    match candidates.iter().find(|directory| {
-        BUNDLED_PATHS
-            .iter()
-            .all(|path| directory.join(path).is_file())
-    }) {
+    match root_among(&candidates) {
         Some(root) => Ok(root.clone()),
         None => Err(candidates),
     }
+}
+
+fn root_among(candidates: &[PathBuf]) -> Option<&PathBuf> {
+    // Any inspection error, including a file named `tracks`, is "no match".
+    let found = |directory: &Path| -> Vec<bool> {
+        BUNDLED_PATHS
+            .iter()
+            .map(|path| directory.join(path).is_file())
+            .collect()
+    };
+    candidates
+        .iter()
+        .find(|directory| !found(directory).contains(&false))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|directory| found(directory).contains(&true))
+        })
+}
+
+/// The first bundled course from `start` onward, wrapping, that can be
+/// found, so the switcher skips a course missing from this copy. If none
+/// can, `start` itself, whose load then reports why.
+fn first_available(start: usize) -> PathBuf {
+    first_available_where(start, |path| {
+        resolve_track(Path::new(path)).is_ok_and(|resolved| resolved.is_file())
+    })
+}
+
+fn first_available_where(start: usize, available: impl Fn(&str) -> bool) -> PathBuf {
+    let count = BUNDLED_PATHS.len();
+    (0..count)
+        .map(|offset| BUNDLED_PATHS[(start + offset) % count])
+        .find(|path| available(path))
+        .unwrap_or(BUNDLED_PATHS[start % count])
+        .into()
 }
 
 /// The bundled entry a relative path names, such as `./tracks/club.track`.
@@ -141,7 +174,7 @@ pub fn next_path(current: &Path) -> Result<PathBuf, String> {
     let identity = |path: PathBuf| path.canonicalize().unwrap_or(path);
     let Ok(current) = resolve_track(current).map(identity) else {
         // Resolving the first course reports why nothing could be found.
-        return Ok(BUNDLED_PATHS[0].into());
+        return Ok(first_available(0));
     };
     // Anchor the local candidates before resolving identity. If a loaded
     // override has since disappeared, a relative candidate would fall back
@@ -151,11 +184,11 @@ pub fn next_path(current: &Path) -> Result<PathBuf, String> {
     for directory in directories.iter().flatten() {
         for (index, path) in BUNDLED_PATHS.iter().enumerate() {
             if current == identity(directory.join(path)) {
-                return Ok(BUNDLED_PATHS[(index + 1) % BUNDLED_PATHS.len()].into());
+                return Ok(first_available(index + 1));
             }
         }
     }
-    Ok(BUNDLED_PATHS[0].into())
+    Ok(first_available(0))
 }
 
 #[cfg(test)]
@@ -322,6 +355,52 @@ mod tests {
                 assert!(error.contains(named), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn a_copy_missing_a_bundled_course_is_still_the_game_root() {
+        let fixture = TempDir::new("apex-partial-root-test");
+        let [empty, partial, complete] =
+            ["empty", "partial", "complete"].map(|name| fixture.path().join(name));
+        for (index, path) in BUNDLED_PATHS.iter().enumerate() {
+            for (root, skip) in [(&partial, index == 2), (&complete, false)] {
+                if !skip {
+                    let file = root.join(path);
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(file, "straight 40").unwrap();
+                }
+            }
+        }
+        std::fs::create_dir_all(&empty).unwrap();
+        // A complete copy wins wherever it is; a partial one beats nothing.
+        let candidates = [empty.clone(), partial.clone(), complete.clone()];
+        assert_eq!(root_among(&candidates), Some(&complete));
+        assert_eq!(root_among(&candidates[..2]), Some(&partial));
+        assert_eq!(root_among(&candidates[..1]), None);
+    }
+
+    #[test]
+    fn the_switcher_skips_a_missing_bundled_course() {
+        let missing = BUNDLED_PATHS[2];
+        let available = |path: &str| path != missing;
+        assert_eq!(
+            first_available_where(2, available),
+            PathBuf::from(BUNDLED_PATHS[3])
+        );
+        assert_eq!(
+            first_available_where(1, available),
+            PathBuf::from(BUNDLED_PATHS[1])
+        );
+        let last = BUNDLED_PATHS.len() - 1;
+        assert_eq!(
+            first_available_where(last + 1, available),
+            PathBuf::from(BUNDLED_PATHS[0])
+        );
+        // With nothing available, the requested course reports the problem.
+        assert_eq!(
+            first_available_where(4, |_| false),
+            PathBuf::from(BUNDLED_PATHS[4])
+        );
     }
 
     #[test]

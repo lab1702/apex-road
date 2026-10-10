@@ -124,6 +124,7 @@ impl Car {
 
         self.grounded = on_same_surface || landed;
         self.offroad = surface.offroad;
+        self.over_gap = over_gap_route(new_road);
         if self.grounded {
             if landed {
                 self.resolve_landing(surface);
@@ -145,13 +146,13 @@ pub(super) fn open_track_entry_roads(
     before: Vec3,
     after: Vec3,
 ) -> [Option<RoadPoint>; 2] {
-    if track.closed || track.samples.len() < 2 {
+    if track.closed || track.samples().len() < 2 {
         return [None, None];
     }
-    let last = track.samples.len() - 1;
+    let last = track.samples().len() - 1;
     [
-        (0, track.samples[0], 1.0),
-        (last - 1, track.samples[last], -1.0),
+        (0, track.samples()[0], 1.0),
+        (last - 1, track.samples()[last], -1.0),
     ]
     .map(|(index, sample, direction)| {
         let normal = sample.cross_section_normal() * direction;
@@ -186,9 +187,9 @@ pub(super) fn guardrail_exit_road(
 ) -> RoadPoint {
     let forward = horizontal(after - before).dot(road.sample.forward) >= 0.0;
     let direction = if forward { 1.0 } else { -1.0 };
-    let segments = track.samples.len() - 1;
+    let segments = track.samples().len() - 1;
     for _ in 0..segments {
-        let boundary = track.samples[road.index + usize::from(forward)];
+        let boundary = track.samples()[road.index + usize::from(forward)];
         let normal = boundary.cross_section_normal();
         let start = horizontal(before - boundary.pos).dot(normal) * direction;
         let end = horizontal(after - boundary.pos).dot(normal) * direction;
@@ -225,7 +226,7 @@ pub(super) fn route_walk(track: &Track, from: RoadPoint, to: RoadPoint) -> Optio
             delta += track.length;
         }
     }
-    let segments = track.samples.len() - 1;
+    let segments = track.samples().len() - 1;
     let forward = if delta == 0.0 && from.index != to.index {
         if (from.index + 1) % segments == to.index {
             true
@@ -431,7 +432,7 @@ impl RoadQuery<'_> {
     /// Score every segment in index order; the earliest of equal scores wins.
     fn brute_force(&self) -> Option<RoadPoint> {
         let mut best: Option<(f32, RoadPoint)> = None;
-        for index in 0..self.track.samples.len().saturating_sub(1) {
+        for index in 0..self.track.samples().len().saturating_sub(1) {
             let Some((score, point)) = self.evaluate(index) else {
                 continue;
             };
@@ -462,7 +463,7 @@ impl RoadQuery<'_> {
         // Scoring it first bounds the search from the start.
         let seed = self
             .track
-            .samples
+            .samples()
             .partition_point(|sample| sample.distance <= self.previous_distance)
             .saturating_sub(1)
             .min(segments - 1);
@@ -497,8 +498,8 @@ impl RoadQuery<'_> {
     /// with the index's copies of the cross-section normals.
     #[inline(always)]
     fn may_contain(&self, index: usize, normals: &[Vec3]) -> bool {
-        let a = self.track.samples[index];
-        let b = self.track.samples[index + 1];
+        let a = self.track.samples()[index];
+        let b = self.track.samples()[index + 1];
         let start_offset = horizontal(self.position - a.pos).dot(normals[index]);
         let end_offset = horizontal(self.position - b.pos).dot(normals[index + 1]);
         let bracketed = (start_offset >= 0.0 && end_offset <= 0.0)
@@ -522,8 +523,8 @@ impl RoadQuery<'_> {
             sweep,
             segment_tolerance,
         } = *self;
-        let a = track.samples[index];
-        let b = track.samples[index + 1];
+        let a = track.samples()[index];
+        let b = track.samples()[index + 1];
         let chord = horizontal(b.pos - a.pos);
         let chord_length_squared = chord.length_squared();
         if chord_length_squared < 0.00001 {
@@ -768,15 +769,15 @@ pub(super) fn crosses_connected_surface(
         return false;
     };
     let direction = if forward { 1.0 } else { -1.0 };
-    let segments = track.samples.len() - 1;
+    let segments = track.samples().len() - 1;
     let mut index = from.index;
     while index != to.index {
-        let boundary = track.samples[index + usize::from(forward)];
+        let boundary = track.samples()[index + usize::from(forward)];
         // At a shared endpoint, the preceding segment can have zero length
         // in this sweep (for example immediately after landing over a gap).
         let starts_at_boundary = index == from.index
             && (from.sample.distance - boundary.distance).abs() <= SEGMENT_TOLERANCE;
-        if track.samples[index].kind == RoadKind::Gap && !starts_at_boundary {
+        if track.samples()[index].kind == RoadKind::Gap && !starts_at_boundary {
             return false;
         }
         let normal = boundary.cross_section_normal();
@@ -797,9 +798,9 @@ pub(super) fn crosses_connected_surface(
         // A shoulder ends when either side of the join is a bridge, tunnel,
         // or gap. Recovery must not extend terrain support across that edge.
         let shoulder_width = if (starts_at_boundary
-            || matches!(track.samples[index].kind, RoadKind::Road | RoadKind::Ramp))
+            || matches!(track.samples()[index].kind, RoadKind::Road | RoadKind::Ramp))
             && matches!(
-                track.samples[next_index].kind,
+                track.samples()[next_index].kind,
                 RoadKind::Road | RoadKind::Ramp
             ) {
             SHOULDER_WIDTH
@@ -815,6 +816,13 @@ pub(super) fn crosses_connected_surface(
     }
     // A sweep may not recover onto a gap, including its exact starting edge.
     to.sample.kind != RoadKind::Gap
+}
+
+/// Within a gap's width: the missing road's route guide, which a jump follows.
+pub(super) fn over_gap_route(road: Option<RoadPoint>) -> bool {
+    road.is_some_and(|road| {
+        matches!(road.sample.kind, RoadKind::Gap) && road.lateral.abs() <= road.sample.width * 0.5
+    })
 }
 
 pub(super) fn contact_surface(
@@ -895,9 +903,9 @@ mod tests {
             let start = approach_segments as f32 * 5000.0;
             let inserted = track.sample_at(start + 0.016);
             let index = track
-                .samples
+                .samples()
                 .partition_point(|sample| sample.distance <= start);
-            track.samples.insert(index, inserted);
+            track.samples_mut().insert(index, inserted);
             for offset in [0.004, 0.008, 0.012] {
                 let distance = start + offset;
                 let position = track.sample_at(distance).pos + Vec3::Y * RIDE_HEIGHT;
@@ -928,7 +936,7 @@ mod tests {
         )
         .unwrap();
         let (distance, contact) = track
-            .samples
+            .samples()
             .windows(2)
             .find_map(|pair| {
                 let [a, b] = [pair[0], pair[1]];
@@ -965,7 +973,8 @@ mod tests {
                     .unwrap();
                     // This interior cross-section changes heading, grade,
                     // and bank together, well away from a segment boundary.
-                    let distance = (track.samples[46].distance + track.samples[47].distance) * 0.5;
+                    let distance =
+                        (track.samples()[46].distance + track.samples()[47].distance) * 0.5;
                     let sample = track.sample_at(distance);
                     for lateral in [-16.0, 0.0, 16.0] {
                         let contact = sample.pos + sample.right * lateral;
@@ -1006,7 +1015,7 @@ mod tests {
                             "start 0 0 0 {heading}\nstraight 50 bank {bank}\n{road} rise {rise}"
                         ))
                         .unwrap();
-                        for distance in [120.2, 121.4, 130.5, track.samples[80].distance] {
+                        for distance in [120.2, 121.4, 130.5, track.samples()[80].distance] {
                             let sample = track.sample_at(distance);
                             for lateral in [-5.0, 0.0, 5.0] {
                                 let position =
@@ -1040,7 +1049,7 @@ mod tests {
                 "width 40\nstraight 20 bank {bank}\nstraight 1 rise 0.6\nstraight 20"
             ))
             .unwrap();
-            for pair in track.samples.windows(2) {
+            for pair in track.samples().windows(2) {
                 for fraction in [0.25, 0.5, 0.75] {
                     let distance =
                         pair[0].distance + (pair[1].distance - pair[0].distance) * fraction;
@@ -1092,7 +1101,7 @@ mod tests {
         ] {
             let track = Track::parse(source).unwrap();
             for pair in track
-                .samples
+                .samples()
                 .windows(2)
                 .filter(|pair| (pair[0].kind == RoadKind::Gap) != (pair[1].kind == RoadKind::Gap))
             {
@@ -1383,17 +1392,17 @@ mod tests {
     #[test]
     fn overpass_query_respects_height_and_does_not_snap_upward() {
         let mut track = Track::parse("straight 200").unwrap();
-        let mut high = track.samples[0];
+        let mut high = track.samples()[0];
         high.pos = vec3(-100.0, 8.0, 100.0);
         high.forward = Vec3::X;
         high.right = -Vec3::Z;
         high.up = Vec3::Y;
         high.distance = 500.0;
         high.kind = RoadKind::Bridge;
-        track.samples.push(high);
+        track.samples_mut().push(high);
         high.pos.x = 100.0;
         high.distance = 700.0;
-        track.samples.push(high);
+        track.samples_mut().push(high);
         track.length = 700.0;
         let lower = nearest_road(
             &track,
@@ -1445,7 +1454,7 @@ mod tests {
             reference.update(&lower, control, STEP);
             let was_grounded = car.grounded;
             car.update(&crossing, control, STEP);
-            race.update(&crossing, STEP, car.distance, !car.offroad);
+            race.update(&crossing, STEP, car.distance, car.on_course());
             assert!(
                 (car.distance - reference.distance).abs() < 0.01,
                 "overhead deck changed progress: lower {}, crossing {} at {:?}",
@@ -1453,7 +1462,7 @@ mod tests {
                 car.distance,
                 car.position
             );
-            assert!(!race.invalid);
+            assert!(!race.invalid());
             assert!(car.position.distance(reference.position) < 0.01);
             if (74.0..86.0).contains(&car.position.z) && !car.grounded {
                 assert!(car.position.y + 0.7 < 9.0);
@@ -1634,10 +1643,10 @@ mod tests {
         car.update(&track, Control::default(), STEP);
         assert_eq!(car.distance, finish);
         assert!(
-            race.update(&track, STEP, car.distance, !car.offroad)
+            race.update(&track, STEP, car.distance, car.on_course())
                 .is_some()
         );
-        assert!(race.finished && !race.invalid);
+        assert!(race.finished && !race.invalid());
     }
 
     #[test]
@@ -1711,13 +1720,13 @@ mod tests {
             "straight 40\nright 180 radius 20\nstraight 40\nright 180 radius 20\nclose",
         )
         .unwrap();
-        let segments = track.samples.len() - 1;
+        let segments = track.samples().len() - 1;
         let query = |position: Vec3, distance: f32| {
             nearest_road(&track, position, distance, 1.0, track.ground_height(), None).unwrap()
         };
         // The circuit seam: segment 0 at its start and the last segment at its
         // end report the same cross-section from either side.
-        let seam = track.samples[0];
+        let seam = track.samples()[0];
         let mut start = query(seam.pos + Vec3::Y * RIDE_HEIGHT, 0.0);
         start.index = 0;
         start.sample = seam;
@@ -1725,7 +1734,7 @@ mod tests {
         end.index = segments - 1;
         end.sample.distance = track.length;
         // An interior sample boundary, reported by its two adjacent segments.
-        let boundary = track.samples[5];
+        let boundary = track.samples()[5];
         let mut after_boundary = query(boundary.pos + Vec3::Y * RIDE_HEIGHT, boundary.distance);
         after_boundary.index = 5;
         after_boundary.sample = boundary;
@@ -1784,7 +1793,7 @@ mod tests {
             (state >> 40) as f32 / (1u64 << 24) as f32
         };
         let ground = track.ground_height();
-        let (min, max) = track.samples.iter().fold(
+        let (min, max) = track.samples().iter().fold(
             (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
             |(min, max), sample| (min.min(sample.pos), max.max(sample.pos)),
         );
@@ -1801,7 +1810,7 @@ mod tests {
             ));
         }
         let lift = Vec3::Y * RIDE_HEIGHT;
-        for (index, sample) in track.samples.iter().enumerate().step_by(3) {
+        for (index, sample) in track.samples().iter().enumerate().step_by(3) {
             let half = sample.width * 0.5;
             for lateral in [
                 0.0,
@@ -1823,8 +1832,8 @@ mod tests {
         // Stacked roads: wherever another part of the route passes within
         // a few metres horizontally at a different height.
         let unstacked = positions.len();
-        for (index, sample) in track.samples.iter().enumerate().step_by(2) {
-            for other in &track.samples[index + 1..] {
+        for (index, sample) in track.samples().iter().enumerate().step_by(2) {
+            for other in &track.samples()[index + 1..] {
                 if (other.pos.xz() - sample.pos.xz()).length() < 3.0
                     && (other.pos.y - sample.pos.y).abs() > 2.0
                 {
@@ -1864,7 +1873,7 @@ mod tests {
             }
             let mut found = 0;
             for (index, &position) in positions.iter().enumerate() {
-                let nearest = track.samples[(index * 7) % track.samples.len()].distance;
+                let nearest = track.samples()[(index * 7) % track.samples().len()].distance;
                 let before = position + vec3(0.3, 1.5, -0.2);
                 let sweep = RoadSweep {
                     before,

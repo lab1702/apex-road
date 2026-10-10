@@ -97,6 +97,9 @@ bundled `.track` files:
    `target/release/apex-road` (or `target\release\apex-road.exe`
    double-clicked in Explorer) finds the checkout that built it.
 
+If none of them has all seven, the first that has any of them is used, and
+**Tab** skips the courses that are missing.
+
 Records are saved in that game folder's `data/` directory, so running from the
 project directory, from `target/release/`, or through `cargo run` all share the
 same records, and `cargo clean` does not delete them. If no game folder is
@@ -194,9 +197,10 @@ record if it:
   grid before you get going does not count.
 - **Cuts the course:** gains more than 30 m of course distance off the paved
   road (the car's centre beyond the road edge) before driving the same distance
-  back on the road, or skips ahead along the course in a single jump. Brief
-  wheel drops and short slides are forgiven; crossing an infield or the inside
-  of a bend is not. A sprint that lands past its finish in such a jump ends
+  back on the road, more than 60 m off the road in total during a lap or run,
+  or skips ahead along the course in a single jump. Brief wheel drops and short
+  slides are forgiven; crossing an infield or the inside of a bend is not.
+  Flying over a `gap` counts as driving the course; landing in it does not. A sprint that lands past its finish in such a jump ends
   there as an invalid run.
 
 The banner above the gauges and the finish panel name the reason.

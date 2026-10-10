@@ -198,7 +198,7 @@ fn main() {
             opts.path.display(),
             track.name,
             track.length,
-            track.samples.len(),
+            track.samples().len(),
             track.checkpoints.len(),
             if track.closed {
                 "circuit"
@@ -868,18 +868,21 @@ impl GameState {
     /// Run the physics steps covered by this frame, saving records and
     /// recovering a car that has fallen off the world.
     fn simulate(&mut self, dt: f32, demo: bool) {
-        self.accumulator += if self.frame_limit.is_some() && self.autodrive {
+        // Frame-limited auto-driven runs advance a fixed time per frame, so
+        // everything timed in simulation follows that clock, not the window's.
+        let dt = if self.frame_limit.is_some() && self.autodrive {
             FIXED_FRAME_TIME
         } else {
             dt
         };
+        self.accumulator += dt;
         while self.accumulator >= PHYSICS_STEP {
             self.car.update(&self.track, self.control, PHYSICS_STEP);
             let candidate = self.race.update(
                 &self.track,
                 PHYSICS_STEP,
                 self.car.distance,
-                !self.car.offroad,
+                self.car.on_course(),
             );
             match self
                 .records
@@ -960,7 +963,7 @@ impl GameState {
             paused: self.paused,
             started: self.race.started,
             finished: self.race.finished,
-            invalid: self.race.invalid_reason.filter(|_| self.race.invalid),
+            invalid: self.race.invalid_reason,
             airborne: !self.car.grounded,
             offroad: self.car.offroad,
             help: self.help,
@@ -1575,13 +1578,13 @@ mod driving_checks {
                 },
                 1. / 120.,
             );
-            let candidate = race.update(track, 1. / 120., car.distance, !car.offroad);
+            let candidate = race.update(track, 1. / 120., car.distance, car.on_course());
             accepted = records.accept(candidate).or(accepted);
             if race.finished {
                 break;
             }
         }
-        assert!(race.finished && !race.invalid);
+        assert!(race.finished && !race.invalid());
         accepted
     }
 
@@ -1634,7 +1637,7 @@ mod driving_checks {
         // A second reset before finishing must retain the same completed time.
         for _ in 0..2 {
             restart_run(&mut car, &track, &mut records, &mut race, false);
-            assert!(race.started && !race.finished && !race.invalid);
+            assert!(race.started && !race.finished && !race.invalid());
             assert_eq!(race.last, completed);
             assert_eq!(race.best, completed);
             assert_eq!(race.elapsed, 0.);
@@ -1726,7 +1729,7 @@ mod driving_checks {
                 let control = demo_control(&car, &track);
                 for _ in 0..2 {
                     car.update(&track, control, 1. / 120.);
-                    let candidate = race.update(&track, 1. / 120., car.distance, !car.offroad);
+                    let candidate = race.update(&track, 1. / 120., car.distance, car.on_course());
                     assert!(records.accept(candidate).is_none());
                     if race.completed_runs > 0 {
                         break;
@@ -1903,7 +1906,7 @@ mod frame_checks {
             }
             state.update(&throttle());
         }
-        assert!(state.race.finished && !state.race.invalid);
+        assert!(state.race.finished && !state.race.invalid());
         let finish_time = state.race.last.unwrap();
         assert_eq!(state.notification(), Some("NEW PERSONAL BEST"));
         assert_eq!(read_record(&state.record_file), Some(finish_time));
@@ -2157,6 +2160,19 @@ mod frame_checks {
         state.update(&frame(&[KeyCode::R]));
         assert_eq!(state.respawn_timer, 0.);
         assert_eq!(state.notification(), Some("NEW RUN"));
+    }
+
+    #[test]
+    fn the_off_course_timer_follows_the_fixed_frame_clock() {
+        // Smoke tests and captures must not depend on the machine's speed.
+        let (_dir, mut state) = game(&["--autodrive", "--frames", "100", "--at", "60"]);
+        state.car.position.x += 25.;
+        state.update(&idle());
+        assert!(state.car.offroad && state.car.speed_kmh() < 4.);
+        let before = state.respawn_timer;
+        state.update(&lasting(0.1));
+        assert!(state.car.offroad && state.car.speed_kmh() < 4.);
+        assert!((state.respawn_timer - before - FIXED_FRAME_TIME).abs() < 1e-6);
     }
 
     #[test]

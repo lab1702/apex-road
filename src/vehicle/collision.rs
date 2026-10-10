@@ -2,7 +2,7 @@
 //! arch. Both are swept along the step's motion, and a car that hits one
 //! slides along it for the rest of the step instead of sticking.
 
-use super::contact::{guardrail_exit_road, open_track_entry_roads, route_walk};
+use super::contact::{guardrail_exit_road, open_track_entry_roads, over_gap_route, route_walk};
 use super::*;
 use crate::track::{
     RAIL_FACE_OFFSET, RoadSample, TUNNEL_ARCH_PANELS, TUNNEL_ARCH_REACH, TUNNEL_ARCH_RISE,
@@ -76,6 +76,7 @@ impl Car {
         self.follow_progress(road);
         let surface = contact_surface(road, max_surface_height, ground_height);
         self.offroad = surface.offroad;
+        self.over_gap = over_gap_route(road);
         self.grounded &= (self.position.y - RIDE_HEIGHT - surface.height).abs() < 0.55;
     }
 
@@ -268,14 +269,14 @@ fn guardrail_sweep(
     if delta.abs() > 12.0 {
         return None;
     }
-    let segments = track.samples.len() - 1;
+    let segments = track.samples().len() - 1;
     let mut index = from.index;
     let motion = horizontal(after - before);
     let cross = |a: Vec3, b: Vec3| a.x * b.z - a.z * b.x;
     let mut hit: Option<(f32, Vec3, Vec3)> = None;
     loop {
-        let a = track.samples[index];
-        let b = track.samples[index + 1];
+        let a = track.samples()[index];
+        let b = track.samples()[index + 1];
         if matches!(a.kind, RoadKind::Bridge | RoadKind::Tunnel) {
             for side in [-1.0, 1.0] {
                 let edge = |sample: RoadSample| {
@@ -353,10 +354,11 @@ fn roof_sweep(track: &Track, before: Vec3, after: Vec3, indexed: bool) -> Option
     let after = after + Vec3::Y * 0.7;
     let path_min = before.min(after);
     let path_max = before.max(after);
-    let mut hit: Option<(f32, Vec3)> = None;
-    let mut sweep_segment = |segment: usize| {
-        let a = track.samples[segment];
-        let b = track.samples[segment + 1];
+    // The earliest contact, and its segment for breaking exact ties.
+    let mut hit: Option<(f32, usize, Vec3)> = None;
+    let sweep_segment = |segment: usize| {
+        let a = track.samples()[segment];
+        let b = track.samples()[segment + 1];
         if a.kind != RoadKind::Tunnel {
             return;
         }
@@ -395,7 +397,11 @@ fn roof_sweep(track: &Track, before: Vec3, after: Vec3, indexed: bool) -> Option
                     continue;
                 }
                 let fraction = (-start / (end - start)).max(0.0);
-                if hit.is_some_and(|(best, _)| fraction >= best) {
+                // Equal hits keep the lowest segment, then its first panel,
+                // as a full scan in index order does, whatever the visit order.
+                if hit.is_some_and(|(best, best_segment, _)| {
+                    (fraction, segment) >= (best, best_segment)
+                }) {
                     continue;
                 }
                 let crossing = before.lerp(after, fraction) - origin;
@@ -409,23 +415,20 @@ fn roof_sweep(track: &Track, before: Vec3, after: Vec3, indexed: bool) -> Option
                 let along_u = (crossing.dot(u) * vv - crossing.dot(v) * uv) / denominator;
                 let along_v = (crossing.dot(v) * uu - crossing.dot(u) * uv) / denominator;
                 if along_u >= -0.0001 && along_v >= -0.0001 && along_u + along_v <= 1.0001 {
-                    hit = Some((fraction, normal));
+                    hit = Some((fraction, segment, normal));
                 }
             }
         }
     };
-    // Only segments near the path can pass the bound above. Visiting them
-    // in index order keeps the earliest of equal hits, as a full scan does.
+    // Only segments near the path can pass the bound above.
     match track.segment_index().filter(|_| indexed) {
         Some(index) if path_min.is_finite() && path_max.is_finite() => {
             let reach = index.max_half_width() + TUNNEL_ARCH_REACH;
-            for segment in index.segments_near(path_min.xz(), path_max.xz(), reach) {
-                sweep_segment(segment);
-            }
+            index.for_each_near(path_min.xz(), path_max.xz(), reach, sweep_segment);
         }
-        _ => (0..track.samples.len().saturating_sub(1)).for_each(sweep_segment),
+        _ => (0..track.samples().len().saturating_sub(1)).for_each(sweep_segment),
     }
-    hit.map(|(fraction, normal)| (before.lerp(after, fraction), normal))
+    hit.map(|(fraction, _, normal)| (before.lerp(after, fraction), normal))
 }
 
 #[cfg(test)]
@@ -691,12 +694,12 @@ mod tests {
         let from = nearest_road(&track, before, 0.0, 1.0, track.ground_height(), None).unwrap();
         assert_eq!(from.index, 0);
         let mut to = from;
-        to.index = track.samples.len() - 2;
+        to.index = track.samples().len() - 2;
         to.sample.distance = track.length;
         // Put an unrelated rail just inside the actual seam rail. Traversing
         // the whole circuit on a zero-distance tie would hit this one first.
-        track.samples[3].pos = vec3(-0.15, 0.0, -1.0);
-        track.samples[4].pos = vec3(-0.15, 0.0, 1.0);
+        track.samples_mut()[3].pos = vec3(-0.15, 0.0, -1.0);
+        track.samples_mut()[4].pos = vec3(-0.15, 0.0, 1.0);
         let (hit, _, _) = guardrail_sweep(&track, from, to, before, after).unwrap();
         assert!((hit.x - rail_limit(12.0)).abs() < 0.001);
     }
@@ -874,7 +877,7 @@ mod tests {
                 let track =
                     Track::parse(&format!("straight 50 bank {bank}\ntunnel 100 rise {rise}"))
                         .unwrap();
-                let sample = track.samples[40];
+                let sample = track.samples()[40];
                 let roof = sample.pos + sample.up * 6.2;
                 let (hit, _) =
                     tunnel_roof_sweep(&track, roof - Vec3::Y * 0.75, roof - Vec3::Y * 0.65)
@@ -971,7 +974,7 @@ mod tests {
             assert_eq!(car.position.z >= track.finish_distance(), reaches);
             assert!((car.distance - car.position.z).abs() < 0.001);
             assert_eq!(
-                race.update(&track, STEP, car.distance, !car.offroad)
+                race.update(&track, STEP, car.distance, car.on_course())
                     .is_some(),
                 reaches
             );
@@ -990,9 +993,9 @@ mod tests {
                     ))
                     .unwrap();
                     let endpoint = if entering_finish {
-                        *track.samples.last().unwrap()
+                        *track.samples().last().unwrap()
                     } else {
-                        track.samples[0]
+                        track.samples()[0]
                     };
                     let mut car = Car::new(&track);
                     car.position = endpoint.pos

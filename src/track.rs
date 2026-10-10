@@ -119,10 +119,10 @@ pub fn shoulder_curve_error(a: RoadSample, b: RoadSample, sides: &[f32], ground:
 pub struct Track {
     pub name: String,
     pub description: String,
-    /// Road queries index these samples on first use (see
-    /// [`Track::segment_index`]). Edit them only before driving on the
-    /// course, or parse a new one.
-    pub samples: Vec<RoadSample>,
+    /// Road queries index these on first use (see [`Track::segment_index`]),
+    /// so outside this module they are read through [`Track::samples`] and
+    /// changed only through [`Track::samples_mut`], which drops the index.
+    samples: Vec<RoadSample>,
     pub length: f32,
     pub closed: bool,
     /// Ordered interior checkpoint distances; start and finish are implicit.
@@ -201,6 +201,18 @@ impl Track {
     /// A spatial index of the segments between samples, built on the first
     /// call and kept with this course; a reloaded course builds its own.
     /// `None` if samples were added or removed after it was built.
+    pub fn samples(&self) -> &[RoadSample] {
+        &self.samples
+    }
+
+    /// Edit the samples directly. Any built segment index is discarded, so
+    /// the next road query indexes the edited course.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn samples_mut(&mut self) -> &mut Vec<RoadSample> {
+        self.segment_index = Default::default();
+        &mut self.samples
+    }
+
     pub fn segment_index(&self) -> Option<&SegmentIndex> {
         let index = self.segment_index.get_or_build(&self.samples);
         (index.segment_count() + 1 == self.samples.len()).then_some(index)
@@ -895,6 +907,18 @@ fn tokenize(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use crate::test_support::TempDir;
+
+    #[test]
+    fn editing_samples_rebuilds_the_segment_index() {
+        let mut track = Track::parse("straight 100").unwrap();
+        let before = track.segment_index().unwrap().ground_height();
+        assert_eq!(before, ground_height(track.samples()));
+        // An edit that keeps the sample count used to leave a stale index.
+        track.samples_mut()[1].pos.y -= 50.0;
+        let after = track.segment_index().unwrap().ground_height();
+        assert_eq!(after, ground_height(track.samples()));
+        assert!(after < before - 40.0, "{before} -> {after}");
+    }
 
     #[test]
     fn windows_track_files_accept_bom_crlf_and_unicode_paths() {
