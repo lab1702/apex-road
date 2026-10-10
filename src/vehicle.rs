@@ -16,6 +16,15 @@ const FRONT_ARM: f32 = 1.36;
 const REAR_ARM: f32 = 1.29;
 const INERTIA_PER_MASS: f32 = 2.45;
 const CAR_HALF_WIDTH: f32 = 0.85;
+// The rendered guardrail's inner face (its cap) stands this far outside the
+// deck edge; the body stops against it rather than at the deck edge itself.
+const RAIL_FACE_OFFSET: f32 = 0.20;
+// A change of contact plane at a shallower incidence than this is part of one
+// continuous surface (sampled hill curvature): the car keeps its speed. From
+// the sharper limit on, a crease is an impact, such as an embankment's toe or
+// crest, and the velocity component into the new surface is lost.
+const SMOOTH_CREASE_SIN: f32 = 0.087; // about 5 degrees
+const SHARP_CREASE_SIN: f32 = 0.259; // about 15 degrees
 // Keep shared segment edges watertight despite rounded track coordinates.
 const SEGMENT_TOLERANCE: f32 = 0.01;
 const CONTACT_TOLERANCE: f32 = 0.30;
@@ -172,8 +181,14 @@ impl Car {
         self.reverse_hold = 0.0;
     }
 
+    /// Road speed: along the surface while grounded (the velocity is tangent
+    /// to it), and horizontal in the air so a fall does not read as speed.
     pub fn speed_kmh(&self) -> f32 {
-        self.velocity.length() * 3.6
+        if self.grounded {
+            self.velocity.length() * 3.6
+        } else {
+            horizontal(self.velocity).length() * 3.6
+        }
     }
 
     /// Advance one small fixed step (the game uses 1/120 s).
@@ -342,7 +357,7 @@ impl Car {
                     ),
                 };
             } else {
-                self.velocity.y = surface_vertical_speed(self.velocity, surface.normal);
+                self.velocity = landing_velocity(self.velocity, surface.normal);
             }
             self.position = crossing + self.velocity * (dt * (1.0 - fraction));
             max_surface_height =
@@ -360,7 +375,14 @@ impl Car {
             self.road_index = road.index;
             self.distance = road.sample.distance;
         }
-        self.resolve_guardrail(track, new_road, old_road, before);
+        self.resolve_guardrail(
+            track,
+            new_road,
+            old_road,
+            before,
+            max_surface_height,
+            ground_height,
+        );
         // Do not attach to an overpass that is above the car. The preceding
         // position provides a swept, one-sided contact test at landings.
         let new_road = nearest_road(
@@ -384,24 +406,37 @@ impl Car {
         // precedence over the cross-section velocity test, which does not
         // include longitudinal changes in bank. Falling-away surfaces still
         // use the ordinary clearance/velocity check and can launch the car.
+        let clearance = current_bottom - surface.height;
+        // Even a small height correction must follow a solid surface. A short
+        // gap can be crossed in a single step, and its landing can lie within
+        // the contact tolerance.
+        let connected = || {
+            old_surface.finite
+                && old_road.zip(new_road).is_some_and(|(from, to)| {
+                    crosses_connected_surface(track, from, to, before, self.position)
+                })
+        };
+        // An embankment's top edge is not a launch ramp: climbing a shoulder
+        // onto its own deck keeps the tires on the road, and the crest
+        // absorbs the climb's vertical motion (see `follow_surface`). The car
+        // moved along the shoulder this step, so it can overshoot the deck
+        // by at most that step's rise.
+        let shoulder_crest = old_surface.finite
+            && old_surface.offroad
+            && surface.finite
+            && !surface.offroad
+            && clearance > -CONTACT_TOLERANCE
+            && clearance < CONTACT_TOLERANCE + self.velocity.y.max(0.0) * dt
+            && connected();
         let on_same_surface = was_grounded
             && (new_road.is_some_and(|road| road.swept_contact)
-                || ((current_bottom - surface.height).abs() < CONTACT_TOLERANCE
-                    && self.velocity.y - required_vertical <= GRAVITY * dt + 0.025
-                    // Even a small height correction must follow a solid
-                    // surface. A short gap can be crossed in a single step,
-                    // and its landing can lie within the contact tolerance.
-                    && (!surface.finite
-                        || (old_surface.finite
-                            && old_road.zip(new_road).is_some_and(|(from, to)| {
-                                crosses_connected_surface(
-                                    track,
-                                    from,
-                                    to,
-                                    before,
-                                    self.position,
-                                )
-                            })))));
+                || shoulder_crest
+                || (clearance.abs() < CONTACT_TOLERANCE
+                    // A crest launches once it falls away faster than
+                    // gravity can follow; the slack is a rate, so the
+                    // threshold matches across fixed-step sizes.
+                    && self.velocity.y - required_vertical <= (GRAVITY + 3.0) * dt
+                    && (!surface.finite || connected())));
         // A step can leave one supporting surface and strike another: a steep
         // downhill shoulder can cross the terrain before the car is airborne.
         // Keep the one-sided sweep valid for those transitions as well.
@@ -431,9 +466,11 @@ impl Car {
         if self.grounded {
             if landed {
                 self.resolve_landing(surface);
+                self.velocity = landing_velocity(self.velocity, surface.normal);
+            } else {
+                self.follow_surface(surface.normal);
             }
             self.position.y = surface.height + RIDE_HEIGHT;
-            self.velocity.y = surface_vertical_speed(self.velocity, surface.normal);
             let heading_forward = vec3(self.heading.sin(), 0.0, self.heading.cos());
             let heading_right = vec3(self.heading.cos(), 0.0, -self.heading.sin());
             let pitch = (-surface.normal.dot(heading_forward) / surface.normal.y.max(0.2)).atan();
@@ -451,13 +488,43 @@ impl Car {
         // The tunnel roof is also a physical boundary; falling onto a roof
         // from outside is intentionally not treated as driving on its deck.
         if let Some((hit, normal)) = tunnel_roof_sweep(track, before, self.position) {
+            let unconstrained = self.position;
             self.position = hit - Vec3::Y * 0.7 - normal * 0.0001;
-            self.velocity -= normal * self.velocity.dot(normal).max(0.0);
-            // Downward motion stays inside an upward-facing ceiling. On a
-            // banked side panel that faces down, removing an upward tangent
-            // would instead put outward velocity back into the wall.
-            if normal.y >= 0.0 {
-                self.velocity.y = self.velocity.y.min(0.0);
+            let first_stop = self.position;
+            self.resolve_roof_velocity(normal);
+            // Slide the rest of this step along the arch rather than
+            // stopping at the hit, which would make it sticky. Each further
+            // panel crossed by the slide redirects it; between two panels
+            // (the arch's crown is a ridge) it follows their crease.
+            let mut remaining = unconstrained - self.position;
+            let mut normal = normal;
+            let mut previous: Option<Vec3> = None;
+            for _ in 0..3 {
+                let mut slide = remaining - normal * remaining.dot(normal).max(0.0);
+                if let Some(previous) = previous
+                    && slide.dot(previous) > 0.0
+                {
+                    let crease = previous.cross(normal).normalize_or_zero();
+                    slide = crease * remaining.dot(crease);
+                }
+                let target = self.position + slide;
+                let Some((hit, next)) = tunnel_roof_sweep(track, self.position, target) else {
+                    self.position = target;
+                    break;
+                };
+                let stop = hit - Vec3::Y * 0.7 - next * 0.0001;
+                remaining = target - stop;
+                self.position = stop;
+                self.resolve_roof_velocity(next);
+                previous = Some(normal);
+                normal = next;
+            }
+            // A slide that starts exactly on a panel edge can pass between
+            // the triangles' tolerances. Over one step the arch's inside is
+            // convex, so a slid position outside it is crossed by the direct
+            // path from the step's start; keep the first contact instead.
+            if tunnel_roof_sweep(track, before, self.position).is_some() {
+                self.position = first_stop;
             }
             self.impact = 0.6;
             // The sweep can stop before a gate that the unconstrained step
@@ -480,9 +547,47 @@ impl Car {
         }
     }
 
+    fn resolve_roof_velocity(&mut self, normal: Vec3) {
+        self.velocity -= normal * self.velocity.dot(normal).max(0.0);
+        // Downward motion stays inside an upward-facing ceiling. On a
+        // banked side panel that faces down, removing an upward tangent
+        // would instead put outward velocity back into the wall.
+        if normal.y >= 0.0 {
+            self.velocity.y = self.velocity.y.min(0.0);
+        }
+    }
+
+    /// Move a grounded car onto a new contact plane without creating speed.
+    /// The velocity is tangent to the previous plane; keeping its horizontal
+    /// part and deriving a new vertical part would add v·tanθ of vertical
+    /// speed at every upward crease (and v·tanθ rather than v·sinθ at a ramp
+    /// lip). Gentle creases are sampled curvature and keep the speed; sharp
+    /// ones are impacts and lose the component into the new surface.
+    fn follow_surface(&mut self, normal: Vec3) {
+        let speed = self.velocity.length();
+        let into = self.velocity.dot(normal);
+        let tangent = tangent_component(self.velocity, normal);
+        let tangent_speed = tangent.length();
+        if speed <= 0.0001 || tangent_speed <= 0.0001 {
+            self.velocity = tangent;
+            return;
+        }
+        let incidence =
+            ((into.abs() / speed) - SMOOTH_CREASE_SIN) / (SHARP_CREASE_SIN - SMOOTH_CREASE_SIN);
+        let incidence = incidence.clamp(0.0, 1.0);
+        let keep = 1.0 - incidence * incidence * (3.0 - 2.0 * incidence);
+        let new_speed = tangent_speed + (speed - tangent_speed) * keep;
+        self.velocity = tangent * (new_speed / tangent_speed);
+        // Running into an embankment, or over its crest, is felt as a jolt.
+        self.impact = self
+            .impact
+            .max(((speed - new_speed) / 11.0).clamp(0.0, 1.0));
+    }
+
     fn resolve_landing(&mut self, surface: Surface) {
-        let vertical_impact =
-            (self.velocity.y - surface_vertical_speed(self.velocity, surface.normal)).abs();
+        // Measure the speed into the surface, which is the vertical speed on
+        // level ground. On a slope the vertical difference overstates it.
+        let vertical_impact = self.velocity.dot(surface.normal).abs();
         self.impact = self.impact.max((vertical_impact / 11.0).clamp(0.0, 1.0));
         // A firm landing scrubs speed, but does not reset steering or
         // horizontal momentum and therefore still rewards alignment.
@@ -524,11 +629,15 @@ impl Car {
         })
         .min(longitudinal.abs() / dt);
         let brake_sign = longitudinal.signum();
+        let gravity = vec3(0.0, -GRAVITY, 0.0);
+        let slope_gravity = horizontal(gravity - surface.normal * gravity.dot(surface.normal));
         let front_demand = -braking * 0.65 * brake_sign;
+        // Locked rear wheels resist the slope as well as the motion, so a
+        // car parked on a hill stays put as far as the rear tires can hold.
         let rear_demand = engine
             - braking * 0.35 * brake_sign
             - if handbrake {
-                (longitudinal.abs() / dt).min(8.0) * brake_sign
+                (longitudinal / dt + slope_gravity.dot(forward)).clamp(-8.0, 8.0)
             } else {
                 0.0
             };
@@ -564,15 +673,15 @@ impl Car {
         let rolling_resistance = longitudinal.signum()
             * (if surface.offroad { 0.6 } else { 0.16 })
             * (longitudinal.abs() / 0.6).min(1.0);
-        let gravity = vec3(0.0, -GRAVITY, 0.0);
-        let slope_gravity = gravity - surface.normal * gravity.dot(surface.normal);
-        let acceleration = forward * (total_long - drag - rolling_resistance)
-            + right * total_side
-            + horizontal(slope_gravity);
+        let applied_long = total_long - drag - rolling_resistance;
+        let acceleration = forward * applied_long + right * total_side + slope_gravity;
         self.velocity += acceleration * dt;
-        self.longitudinal_acceleration += (acceleration.dot(forward)
-            - self.longitudinal_acceleration)
-            * (1.0 - (-9.0 * dt).exp());
+        // Load transfer follows the applied drive, brake and resistance
+        // forces, not the kinematic acceleration. Gravity acts at the center
+        // of mass and has no pitch moment about it, so coasting downhill does
+        // not unload the rear; the tire force holding a car on a hill does.
+        self.longitudinal_acceleration +=
+            (applied_long - self.longitudinal_acceleration) * (1.0 - (-9.0 * dt).exp());
 
         let yaw_acceleration =
             (front_side * FRONT_ARM - rear_lateral * REAR_ARM) / INERTIA_PER_MASS;
@@ -606,72 +715,117 @@ impl Car {
         road: Option<RoadPoint>,
         previous_road: Option<RoadPoint>,
         before: Vec3,
+        max_surface_height: f32,
+        ground_height: f32,
     ) {
         // The barrier follows the banked road frame. Both its correction and
         // impulse must stay in the road plane, or an uphill impact launches
         // the car by retaining its old upward velocity after the rebound.
-        // An inward path can traverse a short endpoint deck and its rail in
-        // one step while neither endpoint has a road contact. Seed that sweep
-        // from the crossed open endpoint, as for finite road-surface landings.
-        let swept_hit = previous_road
-            .into_iter()
-            .chain(
-                open_track_entry_roads(track, before, self.position)
-                    .into_iter()
-                    .flatten(),
-            )
-            .filter_map(|prior| {
-                let destination = road
-                    .unwrap_or_else(|| guardrail_exit_road(track, prior, before, self.position));
-                guardrail_sweep(track, prior, destination, before, self.position)
-            })
-            .min_by(|a, b| {
-                a.0.distance_squared(before)
-                    .total_cmp(&b.0.distance_squared(before))
-            });
-        let (normal, outward) = if let Some((hit, normal, outward)) = swept_hit {
+        if let Some((hit, normal, outward)) =
+            swept_guardrail_hit(track, previous_road, road, before, self.position)
+        {
             // Stop at the wall that was crossed. On a taper, shunting all
             // the way to the final narrow cross-section would teleport
             // the car sideways and leave its forward speed unchanged.
+            let unconstrained = self.position;
             self.position = hit - outward * 0.001;
-            (normal, outward)
-        } else {
-            let Some(road) = road else {
-                return;
+            let first_stop = self.position;
+            self.guardrail_impulse(normal, outward);
+            // Then slide the rest of this step along that wall, so steering
+            // into a rail does not make it sticky. A further rail crossed by
+            // the slide (the outside of a bend) redirects it again; a corner
+            // that the new wall would push back into the old one (a taper)
+            // stops the car there.
+            let distance = self.distance;
+            let query = |position| {
+                nearest_road(
+                    track,
+                    position,
+                    distance,
+                    max_surface_height,
+                    ground_height,
+                    None,
+                )
             };
-            if !matches!(road.sample.kind, RoadKind::Bridge | RoadKind::Tunnel) {
-                return;
+            let mut remaining = unconstrained - self.position;
+            let mut outward = outward;
+            let mut previous: Option<Vec3> = None;
+            for _ in 0..3 {
+                let slide = remaining - outward * remaining.dot(outward).max(0.0);
+                if previous.is_some_and(|previous| slide.dot(previous) > 0.0) {
+                    break;
+                }
+                let target = self.position + slide;
+                let Some((hit, normal, next)) = swept_guardrail_hit(
+                    track,
+                    query(self.position),
+                    query(target),
+                    self.position,
+                    target,
+                ) else {
+                    self.position = target;
+                    break;
+                };
+                let stop = hit - next * 0.001;
+                remaining = target - stop;
+                self.position = stop;
+                self.guardrail_impulse(normal, next);
+                previous = Some(outward);
+                outward = next;
             }
-            let clearance = self.position.y - RIDE_HEIGHT - road.plane_height;
-            // Terrain beneath an overpass cannot hit its guardrails.
-            if !(-0.45..0.85).contains(&clearance) {
-                return;
+            // As for the tunnel arch, never let a slide end beyond a rail
+            // that the direct path from the step's start would cross.
+            if self.position != first_stop
+                && swept_guardrail_hit(
+                    track,
+                    previous_road,
+                    query(self.position),
+                    before,
+                    self.position,
+                )
+                .is_some()
+            {
+                self.position = first_stop;
             }
-            let limit = (road.sample.width * 0.5 - CAR_HALF_WIDTH).max(0.5);
-            if road.lateral.abs() <= limit {
-                return;
-            }
-            let side = road.lateral.signum();
-            // Without a proven wall crossing, retain the local correction
-            // for a car already touching the rail. An outside approach
-            // must not teleport through the bridge to its inside edge.
-            // Measure the prior horizontal footprint on the deck plane.
-            // Airborne clearance otherwise moves this coordinate inward on
-            // the downhill side of a bank even while the car stays outside.
-            let old_offset = horizontal(before - road.sample.pos);
-            let old_contact =
-                old_offset - Vec3::Y * old_offset.dot(road.sample.up) / road.sample.up.y.max(0.15);
-            let old_lateral = old_contact.dot(road.sample.right);
-            if old_lateral.abs() > road.sample.width * 0.5 + SEGMENT_TOLERANCE {
-                return;
-            }
-            let normal = road.sample.up;
-            let lateral_axis =
-                (road.sample.right - normal * road.sample.right.dot(normal)).normalize();
-            self.position += lateral_axis
-                * ((side * limit - road.lateral) / lateral_axis.dot(road.sample.right));
-            (normal, lateral_axis * side)
+            return;
+        }
+        let Some(road) = road else {
+            return;
         };
+        if !matches!(road.sample.kind, RoadKind::Bridge | RoadKind::Tunnel) {
+            return;
+        }
+        let clearance = self.position.y - RIDE_HEIGHT - road.plane_height;
+        // Terrain beneath an overpass cannot hit its guardrails.
+        if !(-0.45..0.85).contains(&clearance) {
+            return;
+        }
+        let limit = rail_limit(road.sample.width);
+        if road.lateral.abs() <= limit {
+            return;
+        }
+        let side = road.lateral.signum();
+        // Without a proven wall crossing, retain the local correction
+        // for a car already touching the rail. An outside approach
+        // must not teleport through the bridge to its inside edge.
+        // Measure the prior horizontal footprint on the deck plane.
+        // Airborne clearance otherwise moves this coordinate inward on
+        // the downhill side of a bank even while the car stays outside.
+        let old_offset = horizontal(before - road.sample.pos);
+        let old_contact =
+            old_offset - Vec3::Y * old_offset.dot(road.sample.up) / road.sample.up.y.max(0.15);
+        let old_lateral = old_contact.dot(road.sample.right);
+        if old_lateral.abs() > road.sample.width * 0.5 + SEGMENT_TOLERANCE {
+            return;
+        }
+        let normal = road.sample.up;
+        let lateral_axis = (road.sample.right - normal * road.sample.right.dot(normal)).normalize();
+        self.position +=
+            lateral_axis * ((side * limit - road.lateral) / lateral_axis.dot(road.sample.right));
+        self.guardrail_impulse(normal, lateral_axis * side);
+    }
+
+    fn guardrail_impulse(&mut self, normal: Vec3, outward: Vec3) {
         let outward_speed = self.velocity.dot(outward);
         if outward_speed > 0.0 {
             self.velocity -= outward * outward_speed * 1.12;
@@ -682,6 +836,41 @@ impl Car {
             self.impact = self.impact.max((outward_speed / 10.0).clamp(0.08, 1.0));
         }
     }
+}
+
+/// The chassis center's lateral limit on a deck with guardrails, placing the
+/// body's side against the rendered rail face (see `world.rs`).
+fn rail_limit(width: f32) -> f32 {
+    (width * 0.5 + RAIL_FACE_OFFSET - CAR_HALF_WIDTH).max(0.5)
+}
+
+/// The earliest guardrail crossed between two positions. An inward path can
+/// traverse a short endpoint deck and its rail in one step while neither
+/// endpoint has a road contact. Seed that sweep from the crossed open
+/// endpoint, as for finite road-surface landings.
+fn swept_guardrail_hit(
+    track: &Track,
+    previous_road: Option<RoadPoint>,
+    road: Option<RoadPoint>,
+    before: Vec3,
+    after: Vec3,
+) -> Option<(Vec3, Vec3, Vec3)> {
+    previous_road
+        .into_iter()
+        .chain(
+            open_track_entry_roads(track, before, after)
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(|prior| {
+            let destination =
+                road.unwrap_or_else(|| guardrail_exit_road(track, prior, before, after));
+            guardrail_sweep(track, prior, destination, before, after)
+        })
+        .min_by(|a, b| {
+            a.0.distance_squared(before)
+                .total_cmp(&b.0.distance_squared(before))
+        })
 }
 
 /// Seed inward sweeps at open endpoints even when the preceding position has
@@ -748,15 +937,13 @@ fn guardrail_exit_road(track: &Track, mut road: RoadPoint, before: Vec3, after: 
     road
 }
 
-/// Sweep the chassis center against the inset edges of the intervening road
-/// segments. The wall tangent includes width changes as well as road curvature.
-fn guardrail_sweep(
-    track: &Track,
-    from: RoadPoint,
-    to: RoadPoint,
-    before: Vec3,
-    after: Vec3,
-) -> Option<(Vec3, Vec3, Vec3)> {
+/// The signed progress from one road point to another, wrapped on a circuit,
+/// and whether to walk the intervening segments forward. The same
+/// cross-section may be reported from either adjacent segment; at the circuit
+/// seam (or any sample boundary) a zero delta alone would choose a full lap
+/// instead of the single boundary between them. Such a tie between segments
+/// that are not adjacent has no route.
+fn route_walk(track: &Track, from: RoadPoint, to: RoadPoint) -> Option<(f32, bool)> {
     let mut delta = to.sample.distance - from.sample.distance;
     if track.closed {
         if delta > track.length * 0.5 {
@@ -765,15 +952,8 @@ fn guardrail_sweep(
             delta += track.length;
         }
     }
-    // Route selection can jump between nearby but disconnected roads. Such a
-    // jump is not evidence that the intervening guardrails were traversed.
-    if delta.abs() > 12.0 {
-        return None;
-    }
     let segments = track.samples.len() - 1;
     let forward = if delta == 0.0 && from.index != to.index {
-        // The same cross-section may be reported from either adjacent
-        // segment. At the circuit seam, +0 alone would choose a full lap.
         if (from.index + 1) % segments == to.index {
             true
         } else if (to.index + 1) % segments == from.index {
@@ -784,6 +964,25 @@ fn guardrail_sweep(
     } else {
         delta >= 0.0
     };
+    Some((delta, forward))
+}
+
+/// Sweep the chassis center against the inset edges of the intervening road
+/// segments. The wall tangent includes width changes as well as road curvature.
+fn guardrail_sweep(
+    track: &Track,
+    from: RoadPoint,
+    to: RoadPoint,
+    before: Vec3,
+    after: Vec3,
+) -> Option<(Vec3, Vec3, Vec3)> {
+    let (delta, forward) = route_walk(track, from, to)?;
+    // Route selection can jump between nearby but disconnected roads. Such a
+    // jump is not evidence that the intervening guardrails were traversed.
+    if delta.abs() > 12.0 {
+        return None;
+    }
+    let segments = track.samples.len() - 1;
     let mut index = from.index;
     let motion = horizontal(after - before);
     let cross = |a: Vec3, b: Vec3| a.x * b.z - a.z * b.x;
@@ -794,8 +993,7 @@ fn guardrail_sweep(
         if matches!(a.kind, RoadKind::Bridge | RoadKind::Tunnel) {
             for side in [-1.0, 1.0] {
                 let edge = |sample: RoadSample| {
-                    sample.pos
-                        + sample.right * side * (sample.width * 0.5 - CAR_HALF_WIDTH).max(0.5)
+                    sample.pos + sample.right * side * rail_limit(sample.width)
                 };
                 let start = edge(a);
                 let tangent = edge(b) - start;
@@ -1172,29 +1370,11 @@ fn road_entry_contact_before_exit(
     ground_height: f32,
 ) -> Option<(Vec3, Surface, f32)> {
     let destination = to.unwrap_or_else(|| guardrail_exit_road(track, from, before, after));
-    let mut delta = destination.sample.distance - from.sample.distance;
-    if track.closed {
-        if delta > track.length * 0.5 {
-            delta -= track.length;
-        } else if delta < -track.length * 0.5 {
-            delta += track.length;
-        }
-    }
+    let (delta, forward) = route_walk(track, from, destination)?;
     if delta.abs() > 12.0 {
         return None;
     }
     let segments = track.samples.len() - 1;
-    let forward = if delta == 0.0 && from.index != destination.index {
-        if (from.index + 1) % segments == destination.index {
-            true
-        } else if (destination.index + 1) % segments == from.index {
-            false
-        } else {
-            return None;
-        }
-    } else {
-        delta >= 0.0
-    };
     let mut index = from.index;
     let mut hit: Option<(Vec3, Surface, f32)> = None;
     loop {
@@ -1434,15 +1614,9 @@ fn crosses_connected_surface(
     before: Vec3,
     after: Vec3,
 ) -> bool {
-    let mut delta = to.sample.distance - from.sample.distance;
-    if track.closed {
-        if delta > track.length * 0.5 {
-            delta -= track.length;
-        } else if delta < -track.length * 0.5 {
-            delta += track.length;
-        }
-    }
-    let forward = delta >= 0.0;
+    let Some((_, forward)) = route_walk(track, from, to) else {
+        return false;
+    };
     let direction = if forward { 1.0 } else { -1.0 };
     let segments = track.samples.len() - 1;
     let mut index = from.index;
@@ -1625,10 +1799,37 @@ fn tunnel_roof_sweep(track: &Track, before: Vec3, after: Vec3) -> Option<(Vec3, 
     hit.map(|(fraction, normal)| (before.lerp(after, fraction), normal))
 }
 
+/// The vertical speed that keeps this horizontal velocity on a plane. Only
+/// valid within one plane: at a change of plane it would keep the horizontal
+/// speed and create vertical speed, so use `follow_surface` there.
 fn surface_vertical_speed(velocity: Vec3, normal: Vec3) -> f32 {
     // Tall embankments can be much steeper than the road's allowed grade.
     // Preserve their actual slope so tangential motion stays on the shoulder.
     -horizontal(velocity).dot(normal) / normal.y.max(0.0001)
+}
+
+/// Remove the velocity component along a contact normal, as an inelastic
+/// impact does. The result is never faster than the input.
+fn tangent_component(velocity: Vec3, normal: Vec3) -> Vec3 {
+    velocity - normal * velocity.dot(normal)
+}
+
+/// The velocity after landing on a plane. A purely normal impulse would make
+/// a car landing on a cross slope skid sideways; tire friction can instead
+/// keep its horizontal velocity, as long as that is not the faster result
+/// (keeping the horizontal speed on an upward slope would create speed).
+fn landing_velocity(velocity: Vec3, normal: Vec3) -> Vec3 {
+    let projected = tangent_component(velocity, normal);
+    let level = vec3(
+        velocity.x,
+        surface_vertical_speed(velocity, normal),
+        velocity.z,
+    );
+    if level.length_squared() <= projected.length_squared() {
+        level
+    } else {
+        projected
+    }
 }
 
 fn horizontal(v: Vec3) -> Vec3 {
@@ -2069,7 +2270,7 @@ mod tests {
             car.position.x = 4.9;
             car.velocity = vec3(8.0, 0.0, 22.0);
             advance(&mut car, &track, Control::default(), 0.15);
-            assert!(car.position.x <= 6.0 - CAR_HALF_WIDTH + 0.01);
+            assert!(car.position.x <= rail_limit(12.0) + 0.01);
             assert!(car.velocity.x < 0.0);
             assert!(car.velocity.z > 17.0);
             assert!(car.impact > 0.1);
@@ -2105,7 +2306,7 @@ mod tests {
                                 let lateral = (car.position - Vec3::Y * RIDE_HEIGHT - sample.pos)
                                     .dot(sample.right);
                                 assert!(
-                                    lateral.abs() <= sample.width * 0.5 - CAR_HALF_WIDTH + 0.01,
+                                    lateral.abs() <= rail_limit(sample.width) + 0.01,
                                     "escaped taper on {kind}, bank {bank}, side {side}, direction {direction}, dt {dt}: {car:?}"
                                 );
                                 assert!(car.grounded && !car.offroad);
@@ -2176,22 +2377,26 @@ mod tests {
                     for below_deck in [false, true] {
                         let mut car = Car::new(&track);
                         car.reset(&track, start);
-                        car.position.x = side * 5.1;
+                        car.position.x = side * (rail_limit(12.0) - 0.05);
                         if below_deck {
                             car.position.y = track.ground_height() + RIDE_HEIGHT;
                         }
                         car.velocity = vec3(side * 20.0, 0.0, direction * 40.0);
                         car.update(&track, Control::default(), STEP);
                         if below_deck {
-                            assert!(car.position.x.abs() > 5.2);
+                            assert!(car.position.x.abs() > rail_limit(12.0) + 0.05);
                             assert!(!(0.0..=100.0).contains(&car.position.z));
                             assert_eq!(car.impact, 0.0);
                             assert!(car.grounded && car.offroad);
                         } else {
-                            assert!(car.position.x.abs() <= 6.0 - CAR_HALF_WIDTH);
-                            assert!((0.0..100.0).contains(&car.position.z));
+                            assert!(car.position.x.abs() <= rail_limit(12.0));
                             assert!(car.velocity.x * side < 0.0 && car.impact > 0.0);
-                            assert!(car.grounded && !car.offroad);
+                            // The rest of the step slides along the rail, so
+                            // the car keeps its forward travel past the end.
+                            assert!(
+                                (car.position.z - start) * direction > 40.0 * STEP * 0.95,
+                                "{car:?}"
+                            );
                         }
                     }
                 }
@@ -2255,7 +2460,14 @@ mod tests {
         let mut car = Car::new(&track);
         car.position = after;
         car.velocity = Vec3::Z * 20.0;
-        car.resolve_guardrail(&track, Some(to), Some(from), before);
+        car.resolve_guardrail(
+            &track,
+            Some(to),
+            Some(from),
+            before,
+            1.0,
+            track.ground_height(),
+        );
         assert_eq!(car.position, after);
         assert_eq!(car.velocity, Vec3::Z * 20.0);
         assert_eq!(car.impact, 0.0);
@@ -2314,7 +2526,7 @@ mod tests {
         track.samples[3].pos = vec3(-0.15, 0.0, -1.0);
         track.samples[4].pos = vec3(-0.15, 0.0, 1.0);
         let (hit, _, _) = guardrail_sweep(&track, from, to, before, after).unwrap();
-        assert!((hit.x - (6.0 - CAR_HALF_WIDTH)).abs() < 0.001);
+        assert!((hit.x - rail_limit(12.0)).abs() < 0.001);
     }
 
     #[test]
@@ -2477,10 +2689,29 @@ mod tests {
             car.grounded = false;
             car.distance = sample.distance;
             car.update(&track, Control::default(), STEP);
+            // The chassis top stops on the rendered arch. A tilted panel
+            // lets the rest of the step slide along it, so check every panel
+            // of the cross-section rather than the crown's height alone.
+            let top = car.position + Vec3::Y * 0.7 - sample.pos;
+            let point = vec2(top.dot(sample.right), top.dot(sample.up));
+            let arch = |index: usize| {
+                let angle = index as f32 / 10.0 * std::f32::consts::PI;
+                vec2(
+                    angle.cos() * (sample.width * 0.5 + 0.65),
+                    1.0 + angle.sin() * 5.2,
+                )
+            };
+            let outside = (0..10)
+                .map(|index| {
+                    let edge = arch(index + 1) - arch(index);
+                    (point - arch(index)).dot(vec2(edge.y, -edge.x).normalize())
+                })
+                .fold(f32::MIN, f32::max);
             assert!(
-                (car.position.y + 0.7 - roof.y).abs() < 0.001,
-                "wrong roof contact at bank {bank}: {car:?}, roof {roof:?}"
+                (-0.001..=0.001).contains(&outside),
+                "wrong roof contact at bank {bank} ({outside}): {car:?}, roof {roof:?}"
             );
+            assert!((top - (roof - sample.pos)).length() < 20.0 * STEP);
             assert!(car.velocity.y <= 0.0 && car.impact > 0.0);
         }
     }
@@ -2585,7 +2816,8 @@ mod tests {
             let track = Track::parse(source).unwrap();
             for direction in [-1.0, 1.0] {
                 let mut car = Car::new(&track);
-                car.reset(&track, if direction > 0.0 { 99.8 } else { 0.2 });
+                let start = if direction > 0.0 { 99.8 } else { 0.2 };
+                car.reset(&track, start);
                 car.position.y = 5.49;
                 car.velocity = vec3(0.0, 20.0, 40.0 * direction);
                 car.grounded = false;
@@ -2595,7 +2827,15 @@ mod tests {
                     "missed roof on exit: {car:?}"
                 );
                 assert!(car.velocity.y <= 0.0 && car.impact > 0.0);
-                assert!((car.distance - car.position.z).abs() < 0.001);
+                // The rest of the step slides along the roof and out of the
+                // tunnel. Progress follows the car wherever a route continues.
+                assert!((car.position.z - start) * direction > 40.0 * STEP * 0.95);
+                if direction > 0.0 && source != "tunnel 100" {
+                    assert!((car.distance - car.position.z).abs() < 0.001);
+                } else {
+                    // Beyond an open end, progress stays on the course.
+                    assert!((0.0..=100.0).contains(&car.distance));
+                }
             }
         }
     }
@@ -2618,23 +2858,29 @@ mod tests {
     #[test]
     fn tunnel_roof_impact_cannot_award_an_unreached_finish() {
         let track = Track::parse("tunnel 100").unwrap();
-        let mut car = Car::new(&track);
-        car.reset(&track, track.finish_distance() - 0.1);
-        car.position.y = 5.49;
-        car.velocity = vec3(0.0, 20.0, 40.0);
-        car.grounded = false;
-        let mut race = crate::race::Race::new(None, car.distance);
-        race.started = true;
-        race.next_checkpoint = track.checkpoints.len();
-        car.update(&track, Control::default(), STEP);
-        assert!(car.impact > 0.0);
-        assert!(car.position.z < track.finish_distance());
-        assert!((car.distance - car.position.z).abs() < 0.001);
-        assert!(
-            race.update(&track, STEP, car.distance, !car.offroad)
-                .is_none()
-        );
-        assert!(!race.finished);
+        // The car slides along the roof for the rest of the step, so timing
+        // must follow its corrected position: short of the line at a low
+        // speed, across it at a high one.
+        for (speed, reaches) in [(10.0, false), (40.0, true)] {
+            let mut car = Car::new(&track);
+            car.reset(&track, track.finish_distance() - 0.1);
+            car.position.y = 5.49;
+            car.velocity = vec3(0.0, 20.0, speed);
+            car.grounded = false;
+            let mut race = crate::race::Race::new(None, car.distance);
+            race.started = true;
+            race.next_checkpoint = track.checkpoints.len();
+            car.update(&track, Control::default(), STEP);
+            assert!(car.impact > 0.0);
+            assert_eq!(car.position.z >= track.finish_distance(), reaches);
+            assert!((car.distance - car.position.z).abs() < 0.001);
+            assert_eq!(
+                race.update(&track, STEP, car.distance, !car.offroad)
+                    .is_some(),
+                reaches
+            );
+            assert_eq!(race.finished, reaches);
+        }
     }
 
     #[test]
@@ -2991,15 +3237,19 @@ mod tests {
                         track.samples[0]
                     };
                     let mut car = Car::new(&track);
-                    car.position = endpoint.pos + vec3(side * 5.05, RIDE_HEIGHT + 0.2, -0.09);
+                    car.position = endpoint.pos
+                        + vec3(side * (rail_limit(12.0) - 0.1), RIDE_HEIGHT + 0.2, -0.09);
                     car.distance = endpoint.distance;
                     car.velocity = vec3(side * 28.0, 0.0, 28.0);
                     car.grounded = false;
                     car.update(&track, Control::default(), STEP);
                     assert!(car.velocity.x * side < 0.0 && car.impact > 0.0, "{car:?}");
-                    // Stop forward progress at the wall crossing; a local
-                    // correction at the endpoint leaves the car past it.
-                    assert!(car.position.z < endpoint.pos.z + 0.05, "{car:?}");
+                    // The car is held inside the crossed wall and slides
+                    // along it for the rest of the step.
+                    assert!(
+                        (car.position.x - endpoint.pos.x) * side <= rail_limit(12.0),
+                        "{car:?}"
+                    );
                 }
             }
         }
@@ -3030,7 +3280,7 @@ mod tests {
                         car.update(&track, Control::default(), 1.0 / 30.0);
                         let hit = clearance == 0.2;
                         assert_eq!(
-                            car.position.x.abs() <= 5.15,
+                            car.position.x.abs() <= rail_limit(12.0),
                             hit,
                             "{kind}, direction {direction}, side {side}, clearance {clearance}: {car:?}"
                         );
@@ -3934,8 +4184,12 @@ mod tests {
                                     car.position.y - RIDE_HEIGHT >= surface_height - 0.05,
                                     "passed through shoulder: bank {bank}, side {side}, speed {speed}, dt {dt}, car {car:?}"
                                 );
+                                // Driving on the embankment itself, not just
+                                // beside it. A steep one is only climbed as
+                                // far as the entry speed carries the car.
+                                climbed |=
+                                    car.grounded && car.position.y - RIDE_HEIGHT > ground + 0.1;
                             }
-                            climbed |= car.position.y > ground + RIDE_HEIGHT + 1.0;
                         }
                         assert!(
                             climbed,
@@ -4154,5 +4408,281 @@ mod tests {
         );
         assert!(car.grounded && car.offroad);
         assert!(car.speed_kmh() > 10.0);
+    }
+
+    #[test]
+    fn coasting_up_a_shoulder_never_gains_speed_or_launches_off_the_deck() {
+        for rise in [3, 6, 20] {
+            for bank in [-30, 0, 30] {
+                let track = Track::parse(&format!(
+                    "straight 50 rise {rise} bank {bank}\nstraight 200"
+                ))
+                .unwrap();
+                let sample = track.sample_at(70.0);
+                let ground = track.ground_height();
+                let half_width = sample.width * 0.5;
+                for side in [-1.0, 1.0] {
+                    for speed in [10.0, 20.0, 40.0] {
+                        for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                            let mut car = Car::new(&track);
+                            car.reset(&track, sample.distance);
+                            car.position = sample.pos
+                                + sample.right * side * (half_width + SHOULDER_WIDTH + 1.0);
+                            car.position.y = ground + RIDE_HEIGHT;
+                            car.heading = -side * std::f32::consts::FRAC_PI_2;
+                            car.velocity = -Vec3::X * side * speed;
+                            let energy = |car: &Car| {
+                                0.5 * car.velocity.length_squared()
+                                    + GRAVITY * (car.position.y - RIDE_HEIGHT - ground)
+                            };
+                            let initial_energy = energy(&car);
+                            for _ in 0..(3.0 / dt) as usize {
+                                car.update(&track, Control::default(), dt);
+                                let context = format!(
+                                    "rise {rise}, bank {bank}, side {side}, speed {speed}, dt {dt}: {car:?}"
+                                );
+                                // The car starts on the terrain, the lowest
+                                // ground, so no reachable height allows a
+                                // faster speed, nor any added energy.
+                                assert!(
+                                    car.velocity.length() <= speed + 0.01,
+                                    "gained speed at {context}"
+                                );
+                                assert!(
+                                    energy(&car) <= initial_energy + 0.5,
+                                    "gained energy at {context}"
+                                );
+                                let lateral = car.position.x / sample.right.x;
+                                if lateral.abs() <= half_width {
+                                    let deck = sample.pos.y + lateral * sample.right.y;
+                                    assert!(
+                                        car.position.y - RIDE_HEIGHT - deck < 0.5,
+                                        "launched off the shoulder crest at {context}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_shallow_shoulder_is_climbed_onto_the_deck_and_a_steep_one_rolls_back() {
+        for (rise, reaches_deck) in [(3, true), (20, false)] {
+            let track = Track::parse(&format!("straight 50 rise {rise}\nstraight 200")).unwrap();
+            let sample = track.sample_at(70.0);
+            let mut car = Car::new(&track);
+            car.reset(&track, sample.distance);
+            car.position = sample.pos + sample.right * (sample.width * 0.5 + SHOULDER_WIDTH + 1.0);
+            car.position.y = track.ground_height() + RIDE_HEIGHT;
+            car.heading = -std::f32::consts::FRAC_PI_2;
+            car.velocity = -Vec3::X * 20.0;
+            let mut on_deck = false;
+            for _ in 0..360 {
+                car.update(&track, Control::default(), STEP);
+                on_deck |= car.grounded && !car.offroad;
+                if on_deck {
+                    break;
+                }
+                assert!(car.grounded, "left the embankment: {car:?}");
+            }
+            assert_eq!(on_deck, reaches_deck, "rise {rise}: {car:?}");
+            if !reaches_deck {
+                // Tire grip cannot hold the car on a steep embankment.
+                assert!(car.position.x > sample.width * 0.5 + 2.0, "{car:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ramp_take_off_follows_the_lip_without_gaining_energy() {
+        let track =
+            Track::parse("straight 40\nramp 20 rise 3\ngap 14 rise -3\nstraight 180").unwrap();
+        for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+            let mut car = Car::new(&track);
+            car.reset(&track, 35.0);
+            car.velocity = vec3(0.0, 0.0, 29.0);
+            let energy = |car: &Car| {
+                0.5 * car.velocity.length_squared() + GRAVITY * (car.position.y - RIDE_HEIGHT)
+            };
+            let mut previous = energy(&car);
+            for _ in 0..(1.5 / dt) as usize {
+                let was_grounded = car.grounded;
+                car.update(&track, Control::default(), dt);
+                // Climbing the ramp only converts speed into height.
+                assert!(energy(&car) <= previous + 0.05, "dt {dt}: {car:?}");
+                previous = energy(&car);
+                if was_grounded && !car.grounded {
+                    // The take-off speed is the speed along the lip, |v|·sinθ
+                    // upward, not the horizontal speed times tanθ.
+                    let lip = track.sample_at(60.0).forward;
+                    let direction = car.velocity.normalize();
+                    assert!(direction.dot(lip) > 0.9995, "dt {dt}: {car:?}");
+                    break;
+                }
+            }
+            assert!(!car.grounded, "no take-off at dt {dt}");
+        }
+    }
+
+    #[test]
+    fn route_walk_crosses_a_shared_boundary_in_either_direction() {
+        let track = Track::parse(
+            "straight 40\nright 180 radius 20\nstraight 40\nright 180 radius 20\nclose",
+        )
+        .unwrap();
+        let segments = track.samples.len() - 1;
+        let query = |position: Vec3, distance: f32| {
+            nearest_road(&track, position, distance, 1.0, track.ground_height(), None).unwrap()
+        };
+        // The circuit seam: segment 0 at its start and the last segment at its
+        // end report the same cross-section from either side.
+        let seam = track.samples[0];
+        let mut start = query(seam.pos + Vec3::Y * RIDE_HEIGHT, 0.0);
+        start.index = 0;
+        start.sample = seam;
+        let mut end = start;
+        end.index = segments - 1;
+        end.sample.distance = track.length;
+        // An interior sample boundary, reported by its two adjacent segments.
+        let boundary = track.samples[5];
+        let mut after_boundary = query(boundary.pos + Vec3::Y * RIDE_HEIGHT, boundary.distance);
+        after_boundary.index = 5;
+        after_boundary.sample = boundary;
+        let mut before_boundary = after_boundary;
+        before_boundary.index = 4;
+        for (ahead, behind, sample) in [
+            (start, end, seam),
+            (after_boundary, before_boundary, boundary),
+        ] {
+            assert_eq!(route_walk(&track, behind, ahead), Some((0.0, true)));
+            assert_eq!(route_walk(&track, ahead, behind), Some((0.0, false)));
+            let forward = horizontal(sample.forward).normalize() * 0.3;
+            let at = sample.pos + Vec3::Y * RIDE_HEIGHT;
+            // Backing across the boundary walks one segment back rather than
+            // a full lap forward, and moving ahead walks one segment forward.
+            assert!(crosses_connected_surface(
+                &track,
+                ahead,
+                behind,
+                at + forward * 0.01,
+                at - forward
+            ));
+            assert!(crosses_connected_surface(
+                &track,
+                behind,
+                ahead,
+                at - forward * 0.01,
+                at + forward
+            ));
+            // The walk still requires the motion to cross that boundary.
+            assert!(!crosses_connected_surface(
+                &track,
+                ahead,
+                behind,
+                at + forward,
+                at + forward * 2.0
+            ));
+        }
+        // A tie between segments that do not meet has no route.
+        let mut distant = before_boundary;
+        distant.index = 9;
+        assert_eq!(route_walk(&track, after_boundary, distant), None);
+    }
+
+    #[test]
+    fn handbrake_holds_a_stopped_car_on_a_hill() {
+        let track = Track::parse("straight 100\nstraight 100 rise 20\nstraight 100").unwrap();
+        let sample = track.sample_at(150.0);
+        assert!(sample.forward.y / horizontal(sample.forward).length() > 0.29);
+        for heading in [0.0, std::f32::consts::PI] {
+            let mut car = Car::new(&track);
+            car.reset(&track, sample.distance);
+            car.heading = heading;
+            let start = car.position;
+            advance(
+                &mut car,
+                &track,
+                Control {
+                    handbrake: true,
+                    ..Control::default()
+                },
+                5.0,
+            );
+            assert!(
+                car.position.distance(start) < 0.01,
+                "crept {} m facing {heading}: {car:?}",
+                car.position.distance(start)
+            );
+            assert!(car.grounded && !car.offroad);
+        }
+    }
+
+    #[test]
+    fn coasting_downhill_does_not_shift_load_like_braking() {
+        let flat = Track::parse("straight 300").unwrap();
+        let hill = Track::parse("straight 50\nstraight 200 rise -40\nstraight 50").unwrap();
+        let coast = |track: &Track| {
+            let mut car = Car::new(track);
+            car.reset(track, 140.0);
+            car.velocity = track.sample_at(140.0).forward * 15.0;
+            advance(&mut car, track, Control::default(), 0.6);
+            car
+        };
+        let on_flat = coast(&flat);
+        let on_hill = coast(&hill);
+        // Both cars feel only rolling and air resistance; gravity speeds the
+        // hill car up but has no pitch moment about its center of mass.
+        assert!(on_hill.velocity.length() > on_flat.velocity.length() + 1.0);
+        assert!(
+            (on_hill.longitudinal_acceleration - on_flat.longitudinal_acceleration).abs() < 0.1,
+            "hill {} versus flat {}",
+            on_hill.longitudinal_acceleration,
+            on_flat.longitudinal_acceleration
+        );
+    }
+
+    #[test]
+    fn steering_into_a_guardrail_slides_along_it_against_the_visible_rail() {
+        for kind in ["bridge", "tunnel"] {
+            let track = Track::parse(&format!("start 0 8 0\n{kind} 160")).unwrap();
+            for side in [-1.0, 1.0] {
+                for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                    let mut car = Car::new(&track);
+                    car.reset(&track, 40.0);
+                    car.position.x = side * (rail_limit(12.0) - 0.02);
+                    car.velocity = vec3(side * 3.0, 0.0, 30.0);
+                    let start = car.position;
+                    car.update(&track, Control::default(), dt);
+                    assert!(car.impact > 0.0, "{kind}, side {side}, dt {dt}: {car:?}");
+                    // The body's side rests against the rendered rail face.
+                    assert!(
+                        (car.position.x.abs() + CAR_HALF_WIDTH - (6.0 + RAIL_FACE_OFFSET)).abs()
+                            < 0.01
+                    );
+                    // The whole step's forward travel continues along the
+                    // wall instead of stopping at the contact point.
+                    assert!(
+                        car.position.z - start.z > 30.0 * dt * 0.97,
+                        "{kind}, side {side}, dt {dt}: {car:?}"
+                    );
+                    assert!(car.grounded && !car.offroad);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn speed_reading_ignores_a_fall_but_follows_a_slope() {
+        let track = wide_straight();
+        let mut car = Car::new(&track);
+        car.velocity = vec3(0.0, -30.0, 10.0);
+        car.grounded = false;
+        assert!((car.speed_kmh() - 36.0).abs() < 0.001);
+        car.velocity = vec3(0.0, 3.0, 4.0);
+        car.grounded = true;
+        assert!((car.speed_kmh() - 18.0).abs() < 0.001);
     }
 }
