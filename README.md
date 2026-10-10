@@ -85,10 +85,48 @@ To run the built executable from the project directory, use
 ### First launch
 
 Press **Enter** to start. The first build downloads and compiles the Rust
-dependencies; subsequent starts are faster. Run from the project directory so
-the game can find the bundled `tracks/` folder and save records in `data/`.
-When copying a build to another computer, include `tracks/` and launch from
-the directory containing it.
+dependencies; subsequent starts are faster.
+
+The game uses one **game folder** for the bundled courses and saved records.
+It is the first of these that contains a `tracks/` folder holding all seven
+bundled `.track` files:
+
+1. the current working directory;
+2. the directory containing the executable;
+3. each parent of that directory, nearest first. This is how
+   `target/release/apex-road` (or `target\release\apex-road.exe`
+   double-clicked in Explorer) finds the checkout that built it.
+
+Records are saved in that game folder's `data/` directory, so running from the
+project directory, from `target/release/`, or through `cargo run` all share the
+same records, and `cargo clean` does not delete them. If no game folder is
+found, records are saved in `data/` next to the executable.
+
+Track paths you type on the command line are relative to the current
+directory, like any other command-line path, and are never looked up anywhere
+else. The one exception is a bundled path such as `tracks/club.track`: if no
+such file exists in the current directory, the copy in the game folder is used.
+A track that cannot be found is reported with every location that was checked.
+A `tracks/club.track` in the current directory therefore overrides the bundled
+course of the same name.
+
+### Copying a build
+
+To play on another computer, copy the executable together with `tracks/`,
+`LICENSE`, and `assets/DejaVuSans-LICENSE.txt`, keeping their relative layout:
+
+```text
+apex-road/
+  apex-road(.exe)
+  LICENSE
+  assets/DejaVuSans-LICENSE.txt
+  tracks/*.track
+```
+
+The DejaVu Sans font is built into the executable, and its license requires
+that notice to accompany every copy. Because the game folder includes the
+executable's directory, the copy can be launched from anywhere, including by
+double-clicking it; records are created in `data/` beside it.
 
 ## Drive
 
@@ -105,7 +143,7 @@ the directory containing it.
 | Space | Handbrake |
 | R | Restart the current time trial |
 | U | Toggle US / metric HUD units |
-| Esc | Pause / resume |
+| Esc | Close the control guide if it is open; otherwise pause / resume |
 | F1 | Show / hide the control guide |
 | F5 | Reload the current track file |
 | Tab | Switch to the next bundled track |
@@ -143,11 +181,19 @@ Pass the course checkpoints **in order**, then cross the finish. The gauge
 cluster stays low in the windshield, with the timer, checkpoint progress, and
 course map above. A run that misses a checkpoint cannot set a record.
 
-Best times are saved under `./data/`, keyed by the track file's contents.
-Editing a track starts a separate record history for that version. Restarting
-a run resets its timer and checkpoint progress.
+Best times are saved in the game folder's `data/` directory (see
+[First launch](#first-launch)) as `data/<hash>-v2.best`. The hash identifies
+the track file's contents, so editing a track starts a separate record history
+for that version. The `v2` is the record version: it changes whenever the
+car's handling or timing changes enough that older times are no longer
+comparable, and records from other versions are ignored (they stay on disk).
+Restarting a run resets its timer and checkpoint progress.
 Track identity includes line endings and any byte-order mark; Git keeps the
 bundled `.track` files as LF on all three platforms to preserve their record keys.
+
+If another copy of the game is saving the same record, the save waits briefly,
+then reports that the record could not be saved instead of freezing the game;
+the next finished run tries again.
 
 ## Bundled courses
 
@@ -241,14 +287,19 @@ grammar, examples, limits, and track-design notes.
 
 | Argument | Purpose |
 | --- | --- |
-| `--track PATH` | Load a specific `.track` file |
-| `--validate PATH` | Parse and check a track without opening a window |
-| `--smoke-test` | Run a 240-frame automated driving demo, then exit |
+| `--track PATH` | Load a specific `.track` file (default `tracks/alpine.track`) |
+| `PATH` | Same as `--track PATH` |
+| `--validate PATH` | Parse and check a track without opening a window; prints the checked file's full path |
+| `--smoke-test` | Run automated driving and exit after 240 frames (or after `--frames N`, in either order) |
 | `--autodrive` | Enable automated driving on the current course |
 | `--demo` | Auto-drive all bundled courses in sequence, looping indefinitely |
-| `--frames N` | Exit after a specified number of rendered frames |
+| `--frames N` | Exit after N rendered frames; N must be a positive integer |
 | `--at METERS` | Begin the preview at a distance along the track |
-| `--capture PATH` | Write a PNG screenshot |
+| `--capture PATH` | Write a PNG screenshot of the final frame, after 30 frames unless `--frames` or `--smoke-test` is given |
+
+Only one track path may be given: `--validate a.track --track b.track` is an
+error rather than silently checking `b.track`. See [First launch](#first-launch)
+for how relative track paths are resolved.
 
 Validate example bundled tracks without a display:
 
