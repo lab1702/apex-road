@@ -58,6 +58,14 @@ impl Track {
                 path.display()
             ));
         }
+        // Notepad's "Unicode" option writes UTF-16 with a byte-order mark,
+        // which would otherwise surface as an opaque UTF-8 decoding error.
+        if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+            return Err(format!(
+                "Cannot read track '{}': the file is saved as UTF-16 (Notepad calls this \"Unicode\"); save it as UTF-8 instead",
+                path.display()
+            ));
+        }
         let text = String::from_utf8(bytes)
             .map_err(|e| format!("Cannot read track '{}': {e}", path.display()))?;
         Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
@@ -73,9 +81,19 @@ impl Track {
         let commands = text.strip_prefix('\u{feff}').unwrap_or(text);
         for (line_index, line) in commands.lines().enumerate() {
             let line_number = line_index + 1;
+            // `lines` splits on LF and CRLF only. A remaining CR is a classic
+            // Mac line ending, which would silently merge commands together.
+            if line.contains('\r') {
+                return Err(format!(
+                    "Line {line_number}: Found a carriage return (CR) without a line feed. CR-only line endings are not supported; save the file with LF or Windows CRLF line endings"
+                ));
+            }
             let tokens = tokenize(line).map_err(|e| format!("Line {line_number}: {e}"))?;
             if tokens.is_empty() {
                 continue;
+            }
+            if matches!(tokens[0].as_str(), "finish" | "close") {
+                builder.reject_unused_setting()?;
             }
             builder
                 .command(&tokens, line_number)
@@ -158,6 +176,12 @@ struct Builder {
     target_width: f32,
     default_kind: RoadKind,
     checkpoint_lines: Vec<usize>,
+    /// Source lines of the first and last road-building commands.
+    first_road_line: usize,
+    last_road_line: usize,
+    /// A `width` or `kind` command after the latest road command, which has
+    /// no effect unless another road command follows it.
+    unused_setting: Option<(&'static str, usize)>,
     ended: bool,
 }
 
@@ -186,6 +210,9 @@ impl Builder {
             target_width: 12.0,
             default_kind: RoadKind::Road,
             checkpoint_lines: Vec::new(),
+            first_road_line: 0,
+            last_road_line: 0,
+            unused_setting: None,
             ended: false,
         }
     }
@@ -202,6 +229,9 @@ impl Builder {
                     return Err(format!("'{cmd}' requires text"));
                 }
                 let value = args.join(" ");
+                if value.trim().is_empty() {
+                    return Err(format!("'{cmd}' text cannot be empty"));
+                }
                 if value.len() > 500 {
                     return Err(format!("'{cmd}' text must be 500 bytes or fewer"));
                 }
@@ -241,11 +271,16 @@ impl Builder {
                 self.target_width = bounded(&args[0], "width", 4.0, 40.0)?;
                 if self.track.samples.len() == 1 {
                     self.track.samples[0].width = self.target_width;
+                } else {
+                    self.unused_setting = Some(("width", line_number));
                 }
             }
             "kind" => {
                 exact_args(cmd, args, 1)?;
                 self.default_kind = parse_kind(&args[0])?;
+                if self.track.samples.len() > 1 {
+                    self.unused_setting = Some(("kind", line_number));
+                }
             }
             "checkpoint" => {
                 exact_args(cmd, args, 0)?;
@@ -276,6 +311,11 @@ impl Builder {
             }
             "straight" | "bridge" | "tunnel" | "ramp" | "gap" | "left" | "right" => {
                 self.road(cmd, args)?;
+                if self.first_road_line == 0 {
+                    self.first_road_line = line_number;
+                }
+                self.last_road_line = line_number;
+                self.unused_setting = None;
             }
             _ => {
                 return Err(format!(
@@ -344,6 +384,13 @@ impl Builder {
             };
             if seen[idx] {
                 return Err(format!("Duplicate '{}' option", pair[0]));
+            }
+            // Another kind would silently turn a ramp into a hill with a level
+            // exit, or a gap into solid road; a matching kind is redundant.
+            if idx == 2 && (cmd == "ramp" || cmd == "gap") {
+                return Err(format!(
+                    "'{cmd}' always builds a {cmd}; remove its 'kind' option (for a curved {cmd}, use left or right with 'kind {cmd}')"
+                ));
             }
             seen[idx] = true;
             match idx {
@@ -556,21 +603,42 @@ impl Builder {
         Ok(())
     }
 
+    fn reject_unused_setting(&self) -> Result<(), String> {
+        match self.unused_setting {
+            Some((setting, line_number)) => Err(format!(
+                "Line {line_number}: '{setting}' is not followed by a road command, so it has no effect; move it before a road command or remove it"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Whole-route validation. Errors name the most relevant source line, or
+    /// begin with "Whole course" when no single line is responsible.
     fn finish(mut self) -> Result<Track, String> {
+        self.reject_unused_setting()?;
         if self.track.length < 20.0 {
-            return Err("Track needs at least 20 m of road".into());
+            return Err(format!(
+                "Whole course: Track needs at least 20 m of road; it has {:.1} m",
+                self.track.length
+            ));
         }
         if self.track.samples[0].kind == RoadKind::Gap {
-            return Err("Track must start on a drivable road, not a gap".into());
+            return Err(format!(
+                "Line {}: Track must start on a drivable road, not a gap",
+                self.first_road_line
+            ));
         }
+        let last_road_line = self.last_road_line;
         if self.track.samples[self.track.samples.len() - 2].kind == RoadKind::Gap {
-            return Err("Track must finish on a drivable road, not a gap".into());
+            return Err(format!(
+                "Line {last_road_line}: Track must finish on a drivable road, not a gap"
+            ));
         }
         let finish = self.track.finish_distance();
         if self.track.sample_at(finish).kind == RoadKind::Gap {
-            return Err(
-                "Sprint finish line is 3 m before the endpoint and must be on solid road; extend the landing road".into(),
-            );
+            return Err(format!(
+                "Line {last_road_line}: Sprint finish line is 3 m before the endpoint and must be on solid road; extend the landing road"
+            ));
         }
         // A later road command sets the outgoing kind at an existing gate, so
         // its launch-side validation must wait until the route is complete.
@@ -581,13 +649,13 @@ impl Builder {
                 ));
             }
         }
-        if self
-            .track
-            .checkpoints
-            .last()
-            .is_some_and(|d| finish - d < 10.0)
+        if let (Some(&distance), Some(&line_number)) =
+            (self.track.checkpoints.last(), self.checkpoint_lines.last())
+            && finish - distance < 10.0
         {
-            return Err("The final checkpoint must be at least 10 m before the finish".into());
+            return Err(format!(
+                "Line {line_number}: The final checkpoint must be at least 10 m before the finish"
+            ));
         }
         if self.track.checkpoints.is_empty() {
             // A few implicit gates prevent shortcuts in even the simplest file.
@@ -897,27 +965,57 @@ mod tests {
         assert!(error.contains("collapse or reverse"), "{error}");
     }
 
+    /// Builds an open course for close-seam tests. Turn geometry depends on
+    /// the platform's sin/cos rounding, so tests that need an exact final
+    /// sample position pin it explicitly instead of relying on last-bit luck.
+    fn open_builder(source: &str) -> Builder {
+        let mut builder = Builder::new();
+        for (index, line) in source.lines().enumerate() {
+            builder
+                .command(&tokenize(line).unwrap(), index + 1)
+                .unwrap();
+        }
+        builder
+    }
+
+    // Densely sampled final bank transition: its samples are ~25 cm apart,
+    // well inside the 0.25 m seam tolerance.
+    const SHORT_FINAL_SEGMENT: &str = "straight 20\nright 180 radius 20\nstraight 20.95\nright 180 radius 20 bank 60\nstraight 1 bank 0";
+
     #[test]
     fn close_rejects_collapsing_a_short_final_segment() {
-        let source = "start 0 0 1000\nstraight 20\nright 180 radius 20\nstraight 20.75\nright 180 radius 20 bank 12\nstraight 1 bank 0";
-        let open = Track::parse(source).unwrap();
-        assert_eq!(
-            open.samples[open.samples.len() - 2].pos,
-            open.samples[0].pos
-        );
-        let error = Track::parse(&format!("{source}\nclose")).unwrap_err();
+        let mut builder = open_builder(SHORT_FINAL_SEGMENT);
+        assert!(builder.close().is_ok(), "the unpinned fixture must close");
+
+        // Snapping the endpoint onto the start must not leave a zero-length
+        // final segment when the preceding sample already lies at the start.
+        let mut builder = open_builder(SHORT_FINAL_SEGMENT);
+        let index = builder.track.samples.len() - 2;
+        builder.track.samples[index].pos = builder.track.samples[0].pos;
+        let error = builder.close().unwrap_err();
         assert!(error.contains("collapse or reverse"), "{error}");
     }
 
     #[test]
     fn close_rejects_a_segment_below_cumulative_distance_precision() {
-        let source = "straight 20\nright 180 radius 20\nstraight 20.947372\nright 180 radius 20 bank 60\nstraight 1 bank 0";
-        let open = Track::parse(source).unwrap();
-        let previous = open.samples[open.samples.len() - 2];
-        assert!(previous.pos.z < open.samples[0].pos.z);
-        assert!((previous.pos.z - open.samples[0].pos.z).abs() < 0.000001);
-        let error = Track::parse(&format!("{source}\nclose")).unwrap_err();
+        // The preceding sample lies just behind the start, so the closing
+        // chord points forward but is shorter than the precision of the
+        // cumulative distance; it would duplicate the previous distance.
+        let pinned = |fraction_of_ulp: f32| {
+            let mut builder = open_builder(SHORT_FINAL_SEGMENT);
+            let index = builder.track.samples.len() - 2;
+            let distance = builder.track.samples[index].distance;
+            let ulp = f32::from_bits(distance.to_bits() + 1) - distance;
+            let first = builder.track.samples[0];
+            assert_eq!(first.pos, Vec3::ZERO);
+            assert_eq!(first.forward, Vec3::Z);
+            builder.track.samples[index].pos = vec3(0.0, 0.0, -ulp * fraction_of_ulp);
+            builder.close()
+        };
+        let error = pinned(0.25).unwrap_err();
         assert!(error.contains("collapse or reverse"), "{error}");
+        // A chord long enough to advance the cumulative distance is accepted.
+        assert!(pinned(2.0).is_ok());
     }
 
     #[test]
@@ -1282,8 +1380,197 @@ mod tests {
         assert_eq!(track.checkpoints, vec![10.0, 20.0]);
     }
 
+    /// Every `.track` file in the bundled `tracks/` directory, sorted.
+    fn bundled_track_files() -> Vec<std::path::PathBuf> {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tracks");
+        let mut files: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "track"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no bundled tracks in {directory:?}");
+        files
+    }
+
+    #[test]
+    fn bundled_track_list_matches_the_tracks_directory() {
+        let mut listed: Vec<_> = crate::courses::BUNDLED_PATHS.to_vec();
+        listed.sort_unstable();
+        let count = listed.len();
+        listed.dedup();
+        assert_eq!(listed.len(), count, "BUNDLED_PATHS has duplicates");
+        let on_disk: Vec<_> = bundled_track_files()
+            .iter()
+            .map(|path| format!("tracks/{}", path.file_name().unwrap().to_str().unwrap()))
+            .collect();
+        assert_eq!(listed, on_disk);
+    }
+
+    #[test]
+    fn bundled_track_bytes_are_lf_without_a_byte_order_mark() {
+        // Records are keyed by a hash of the raw bytes. A checkout that
+        // converted line endings or added a BOM would re-key every record.
+        for path in bundled_track_files() {
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(!bytes.contains(&b'\r'), "{path:?} contains CR bytes");
+            assert!(!bytes.starts_with(b"\xef\xbb\xbf"), "{path:?} has a BOM");
+        }
+    }
+
+    #[test]
+    fn kind_options_cannot_cancel_a_ramp_or_gap() {
+        for (input, line) in [
+            (
+                "straight 40\nramp 24 rise 3 kind bridge\ngap 14 rise -3\nstraight 40",
+                2,
+            ),
+            (
+                "straight 40\nramp 24 rise 3 kind ramp\ngap 14 rise -3\nstraight 40",
+                2,
+            ),
+            (
+                "straight 40\nramp 24 rise 3\ngap 14 kind road\nstraight 40",
+                3,
+            ),
+            (
+                "straight 40\nramp 24 rise 3\ngap 14 rise -3 kind gap\nstraight 40",
+                3,
+            ),
+        ] {
+            let error = Track::parse(input).unwrap_err();
+            assert!(error.starts_with(&format!("Line {line}:")), "{error}");
+            assert!(error.contains("remove its 'kind' option"), "{error}");
+        }
+        // Other road commands still accept the option, including a curved gap.
+        assert!(Track::parse("straight 40\nbridge 40 kind tunnel\nstraight 40").is_ok());
+        assert!(
+            Track::parse(
+                "straight 40\nramp 24 rise 3\nleft 10 radius 80 rise -3 kind gap\nstraight 40"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn name_and_description_cannot_be_empty() {
+        for input in [
+            "name \"\"\nstraight 40",
+            "name \"   \"\nstraight 40",
+            "straight 40\ndescription \"\"",
+            "description \"\" \"\"\nstraight 40",
+        ] {
+            let error = Track::parse(input).unwrap_err();
+            assert!(error.contains("text cannot be empty"), "{input}: {error}");
+        }
+        assert_eq!(
+            Track::parse("name \" A \"\nstraight 40").unwrap().name,
+            " A "
+        );
+    }
+
+    #[test]
+    fn settings_after_the_last_road_command_are_errors() {
+        for (input, expected) in [
+            ("straight 40\nwidth 20", "Line 2: 'width'"),
+            ("straight 40\nkind bridge\n# comment\n", "Line 2: 'kind'"),
+            ("straight 40\nwidth 20\nfinish", "Line 2: 'width'"),
+            (
+                "straight 40\nkind tunnel\nwidth 20\nfinish",
+                "Line 3: 'width'",
+            ),
+            (
+                "straight 140\nright 180 radius 55\nstraight 140\nright 180 radius 55\nwidth 20\nclose",
+                "Line 5: 'width'",
+            ),
+        ] {
+            let error = Track::parse(input).unwrap_err();
+            assert!(error.starts_with(expected), "{input}: {error}");
+            assert!(error.contains("not followed by a road command"), "{error}");
+        }
+        // Settings before road commands, or followed by one, take effect.
+        assert!(Track::parse("width 20\nkind bridge\nstraight 40").is_ok());
+        assert!(Track::parse("straight 40\nwidth 20\ncheckpoint\nstraight 40\nfinish").is_ok());
+    }
+
+    #[test]
+    fn whole_route_errors_identify_their_line() {
+        for (input, expected) in [
+            (
+                "width 20\nstraight 10",
+                "Whole course: Track needs at least 20 m",
+            ),
+            ("name Empty", "Whole course: Track needs at least 20 m"),
+            (
+                "# comment\nstraight 30 kind gap\nstraight 40",
+                "Line 2: Track must start on a drivable road",
+            ),
+            (
+                "straight 40\nramp 24 rise 3\nstraight 14 rise -3 kind gap\nfinish",
+                "Line 3: Track must finish on a drivable road",
+            ),
+            (
+                "straight 100\nramp 24 rise 2.5\ngap 14 rise -2.5\nstraight 2\nfinish",
+                "Line 4: Sprint finish line",
+            ),
+            (
+                "straight 30\ncheckpoint\nstraight 11\nfinish",
+                "Line 2: The final checkpoint must be at least 10 m before the finish",
+            ),
+        ] {
+            let error = Track::parse(input).unwrap_err();
+            assert!(error.starts_with(expected), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn unsupported_encodings_and_line_endings_are_explained() {
+        let directory = TempDir::new("apex-road-track-encoding-test");
+        let file = directory.path().join("course.track");
+        let source = "name Test\nstraight 40\n";
+        let little: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(source.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let big: Vec<u8> = [0xfe, 0xff]
+            .into_iter()
+            .chain(source.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        for bytes in [little, big] {
+            std::fs::write(&file, bytes).unwrap();
+            let error = Track::load(&file).unwrap_err();
+            assert!(error.contains("UTF-16"), "{error}");
+            assert!(error.contains("save it as UTF-8"), "{error}");
+            assert!(error.contains(&file.display().to_string()), "{error}");
+        }
+
+        // Classic Mac line endings would otherwise merge the whole file into
+        // one line, silently turning commands into part of the name.
+        std::fs::write(&file, source.replace('\n', "\r")).unwrap();
+        let error = Track::load(&file).unwrap_err();
+        assert!(error.contains("Line 1: Found a carriage return"), "{error}");
+        let error = Track::parse("\u{feff}name Test\r\nstraight 40\rstraight 40\r\n").unwrap_err();
+        assert!(
+            error.starts_with("Line 2: Found a carriage return"),
+            "{error}"
+        );
+        // CRLF and a UTF-8 BOM remain accepted and keep their source identity.
+        let text = "\u{feff}name Test\r\nstraight 40\r\n";
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(
+            Track::load(&file).unwrap().source_hash(),
+            Track::parse(text).unwrap().source_hash()
+        );
+    }
+
     #[test]
     fn bundled_tracks_parse_and_have_required_features() {
+        for path in bundled_track_files() {
+            let track = Track::load(&path).unwrap_or_else(|error| panic!("{error}"));
+            assert!(track.length >= 20.0, "{path:?}");
+            assert_ne!(track.name, "Untitled Track", "{path:?}");
+            assert!(!track.description.is_empty(), "{path:?}");
+        }
         let alpine = Track::parse(include_str!("../tracks/alpine.track")).unwrap();
         assert!(!alpine.closed);
         assert!(alpine.length > 1_500.0);
