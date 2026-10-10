@@ -366,9 +366,11 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
     let mut frames = 0;
     let mut note = String::new();
     let mut note_time: f32 = 0.;
-    let mut camera_pitch = car.pitch;
-    let mut camera_roll = car.roll;
+    let mut camera_attitude = CameraAttitude::new(&car);
     let mut respawn_timer = 0.;
+    // Seconds during which a right click may still be the click that
+    // activated the window, rather than a request to toggle mouse driving.
+    let mut activation_guard: f32 = 0.;
     let mut mouse = input::MouseDriving::default();
     let mut cursor_grabbed = false;
     let mut focus = input::WindowInput::new();
@@ -384,11 +386,21 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
             break;
         }
         macroquad::input::utils::repeat_all_miniquad_input(&mut focus, input_subscriber);
-        if focus.take_loss() && mouse.enabled() {
-            paused = true;
+        if focus.take_loss() {
+            // Keys and mouse motion stop arriving without focus. Hold any
+            // timed run still until the player resumes it deliberately.
+            if race.started && !race.finished && !autodrive {
+                paused = true;
+            }
             mouse.reset();
         }
         let dt = get_frame_time().clamp(0., 0.1);
+        let focus_gained = focus.take_gain();
+        activation_guard = if focus_gained {
+            0.25
+        } else {
+            (activation_guard - dt).max(0.)
+        };
         frames += 1;
         note_time = (note_time - dt).max(0.);
         if is_key_pressed(KeyCode::F11) {
@@ -412,7 +424,13 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
         if paused && is_key_pressed(KeyCode::Q) {
             break;
         }
-        if focus.focused && is_mouse_button_pressed(MouseButton::Right) {
+        // Replayed events report the activating click as focused input, so
+        // ignore right clicks while the window is just regaining focus.
+        if focus.focused
+            && !focus_gained
+            && activation_guard <= 0.
+            && is_mouse_button_pressed(MouseButton::Right)
+        {
             mouse.toggle();
             // A manual takeover ends the demonstration for this session.
             autodrive = false;
@@ -420,6 +438,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
         if is_key_pressed(KeyCode::Enter) {
             if race.finished {
                 restart_run(&mut car, &track, &mut records, &mut race, autodrive);
+                camera_attitude.snap(&car);
                 mouse.reset();
             }
             race.started = true;
@@ -428,6 +447,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
         }
         if is_key_pressed(KeyCode::R) {
             restart_run(&mut car, &track, &mut records, &mut race, autodrive);
+            camera_attitude.snap(&car);
             accumulator = 0.;
             respawn_timer = 0.;
             mouse.reset();
@@ -457,8 +477,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
                     if demo {
                         println!("Demo: {}", track.name);
                     }
-                    camera_pitch = car.pitch;
-                    camera_roll = car.roll;
+                    camera_attitude.snap(&car);
                     accumulator = 0.;
                     paused = false;
                     respawn_timer = 0.;
@@ -534,6 +553,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
                 }
                 if !car.position.is_finite() || car.position.y < track.ground_height() - 30. {
                     restart_run(&mut car, &track, &mut records, &mut race, autodrive);
+                    camera_attitude.snap(&car);
                     mouse.reset();
                     note = "BACK ON THE GRID".into();
                     note_time = 3.;
@@ -558,30 +578,19 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
         } else {
             accumulator = 0.;
         }
-        camera_pitch += (car.pitch - camera_pitch) * (dt * 8.).min(1.);
-        camera_roll += (car.roll - camera_roll) * (dt * 7.).min(1.);
+        camera_attitude.follow(&car, dt);
         let camera = view::DriverCamera::new(
             car.position,
             car.heading,
-            camera_pitch,
-            camera_roll,
+            camera_attitude.pitch,
+            camera_attitude.roll,
             car.speed_kmh(),
             screen_width() / screen_height().max(1.),
         );
         world.draw(&camera);
         let speed = car.speed_kmh();
-        let gear = if car.reversing {
-            7
-        } else if speed < 1. {
-            0
-        } else {
-            (1. + (speed / 42.).floor()).min(6.) as u8
-        };
-        let rpm = if gear == 0 {
-            950. + control.throttle * 1200.
-        } else {
-            1800. + (speed % 42.) / 42. * 4300. + control.throttle * 350.
-        };
+        let gear = hud::gear(speed, car.reversing);
+        let rpm = hud::engine_rpm(speed, gear, control.throttle);
         hud::draw(
             &hud::HudState {
                 track_name: &track.name,
@@ -591,7 +600,8 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
                 gear,
                 throttle: car.throttle,
                 brake: car.brake,
-                steering: car.steering / 0.58,
+                // The input, not the wheel angle: lock narrows with speed.
+                steering: control.steer,
                 slip: car.slip,
                 elapsed: race.elapsed as f32,
                 best: race.best,
@@ -602,7 +612,7 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
                 paused,
                 started: race.started,
                 finished: race.finished,
-                invalid: race.invalid,
+                invalid: race.invalid_reason.filter(|_| race.invalid),
                 airborne: !car.grounded,
                 offroad: car.offroad,
                 help,
@@ -637,6 +647,100 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
     show_mouse(true);
     hud::shutdown();
     result
+}
+
+/// The driver's view follows the car's pitch and roll with a little lag.
+struct CameraAttitude {
+    pitch: f32,
+    roll: f32,
+}
+
+impl CameraAttitude {
+    fn new(car: &Car) -> Self {
+        let mut attitude = Self {
+            pitch: 0.,
+            roll: 0.,
+        };
+        attitude.snap(car);
+        attitude
+    }
+
+    /// Jump straight to the car's attitude after a restart or respawn,
+    /// instead of swinging over from where the previous run ended.
+    fn snap(&mut self, car: &Car) {
+        self.pitch = smooth_toward(f32::NAN, car.pitch, 0., 0.);
+        self.roll = smooth_toward(f32::NAN, car.roll, 0., 0.);
+    }
+
+    fn follow(&mut self, car: &Car, dt: f32) {
+        self.pitch = smooth_toward(self.pitch, car.pitch, 8., dt);
+        self.roll = smooth_toward(self.roll, car.roll, 7., dt);
+    }
+}
+
+/// Exponential smoothing at `rate` per second, independent of frame rate.
+/// A non-finite value never reaches the camera: an invalid current value
+/// adopts the target, and an invalid target holds the current value.
+fn smooth_toward(current: f32, target: f32, rate: f32, dt: f32) -> f32 {
+    match (current.is_finite(), target.is_finite()) {
+        (true, true) => {
+            let blend = 1. - (-rate * dt.max(0.)).exp();
+            current + (target - current) * blend
+        }
+        (false, true) => target,
+        (true, false) => current,
+        (false, false) => 0.,
+    }
+}
+
+#[cfg(test)]
+mod camera_checks {
+    use super::*;
+
+    #[test]
+    fn smoothing_is_independent_of_frame_rate() {
+        let mut fast = 0.;
+        for _ in 0..240 {
+            fast = smooth_toward(fast, 1., 8., 1. / 240.);
+        }
+        let mut slow = 0.;
+        for _ in 0..30 {
+            slow = smooth_toward(slow, 1., 8., 1. / 30.);
+        }
+        assert!((fast - slow).abs() < 1e-4, "{fast} vs {slow}");
+        assert!((fast - (1. - (-8f32).exp())).abs() < 1e-4);
+        // A long frame approaches the target without overshooting it.
+        assert!(smooth_toward(0., 1., 8., 0.5) <= 1.);
+        assert_eq!(smooth_toward(0.25, 1., 8., 0.), 0.25);
+    }
+
+    #[test]
+    fn non_finite_attitudes_never_reach_the_camera() {
+        assert_eq!(smooth_toward(f32::NAN, 0.3, 8., 0.01), 0.3);
+        assert_eq!(smooth_toward(0.2, f32::NAN, 8., 0.01), 0.2);
+        assert_eq!(smooth_toward(0.2, f32::INFINITY, 8., 0.01), 0.2);
+        assert_eq!(smooth_toward(f32::NAN, f32::NAN, 8., 0.01), 0.);
+        assert_eq!(smooth_toward(0.2, 0.3, 8., f32::NAN), 0.2);
+    }
+
+    #[test]
+    fn restarts_snap_the_view_to_the_grid_attitude() {
+        let track = Track::parse("straight 40 rise 6\nstraight 40 bank 10\nstraight 40").unwrap();
+        let mut car = Car::new(&track);
+        let mut attitude = CameraAttitude::new(&car);
+        assert_eq!((attitude.pitch, attitude.roll), (car.pitch, car.roll));
+        car.reset(&track, 60.);
+        attitude.follow(&car, 1. / 60.);
+        assert_ne!(attitude.roll, car.roll);
+        let mut records = RunRecords::new(None);
+        let mut race = records.start_race(car.distance, true);
+        restart_run(&mut car, &track, &mut records, &mut race, false);
+        attitude.snap(&car);
+        assert_eq!((attitude.pitch, attitude.roll), (car.pitch, car.roll));
+        attitude.pitch = f32::NAN;
+        attitude.follow(&car, 1. / 60.);
+        assert_eq!(attitude.pitch, car.pitch);
+    }
 }
 
 #[cfg(test)]

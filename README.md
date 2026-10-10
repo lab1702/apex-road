@@ -124,23 +124,43 @@ pedal pressure, then hold it still to keep those inputs. Move back in the
 opposite direction to straighten the wheel or ease off a pedal. Throttle and
 braking share one range, passing through neutral before the other pedal
 engages. The gauge cluster shows the current steering, throttle, and brake.
+The steering dot shows your steering input across its whole range at any
+speed (the wheels themselves turn less as speed rises), so centring it finds
+neutral.
 
 Right click switches between mouse and keyboard driving. Mouse mode replaces
 the keyboard steering and pedals; **Space** and the other shortcuts still
 work. Toggling modes, restarting, changing tracks, or pausing clears mouse
 inputs. The cursor is released while paused, in the control guide, or at the
-finish; resume with neutral controls. Switching away from the game also pauses
-mouse driving and releases the cursor. The active input method and right-click
-hint stay below the gauges.
+finish; resume with neutral controls. Switching away from the game pauses a
+run in progress with either input method and releases the cursor. The click
+that brings the window back to the front does not toggle mouse driving. The
+active input method and right-click hint stay below the gauges.
 
 Brake before a tight corner, ease off as you turn, and feed the throttle back
 in on the exit. The orange traction indicator shows when the car is losing
 grip; the throttle, brake, steering, and engine indicators show your inputs.
-Use the handbrake sparingly—it makes the rear tires easier to slide.
+At full throttle the tachometer reaches its orange redline near the top of
+each gear. Use the handbrake sparingly—it makes the rear tires easier to slide.
 
-Pass the course checkpoints **in order**, then cross the finish. The gauge
-cluster stays low in the windshield, with the timer, checkpoint progress, and
-course map above. A run that misses a checkpoint cannot set a record.
+Pass the course checkpoints **in order**, on the road, then cross the finish.
+The gauge cluster stays low in the windshield, with the timer, checkpoint
+progress, and course map above. A lap or run is invalid and cannot set a
+record if it:
+
+- **Misses a checkpoint:** skips a gate, or passes a gate or the finish off the
+  paved road.
+- **Goes the wrong way:** reverses back across the start line during a lap. The
+  lap restarts when you cross the line forwards again. Rolling back off the
+  grid before you get going does not count.
+- **Cuts the course:** gains more than 30 m of course distance off the paved
+  road (the car's centre beyond the road edge) before driving the same distance
+  back on the road, or skips ahead along the course in a single jump. Brief
+  wheel drops and short slides are forgiven; crossing an infield or the inside
+  of a bend is not. A sprint that lands past its finish in such a jump ends
+  there as an invalid run.
+
+The banner above the gauges and the finish panel name the reason.
 
 Best times are saved under `./data/`, keyed by the track file's contents.
 Editing a track starts a separate record history for that version. Restarting

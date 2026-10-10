@@ -80,6 +80,7 @@ impl MouseDriving {
 pub struct WindowInput {
     pub focused: bool,
     lost: bool,
+    gained: bool,
     mouse_motion: Vec<Vec2>,
 }
 
@@ -88,12 +89,25 @@ impl WindowInput {
         Self {
             focused: true,
             lost: false,
+            gained: false,
             mouse_motion: Vec::new(),
         }
     }
 
     pub fn take_loss(&mut self) -> bool {
         std::mem::take(&mut self.lost)
+    }
+
+    /// Whether the window became focused since the last call. The click
+    /// that activates a window is replayed after focus is restored, so it
+    /// otherwise looks like an ordinary click in a focused window.
+    pub fn take_gain(&mut self) -> bool {
+        std::mem::take(&mut self.gained)
+    }
+
+    fn mark_focused(&mut self) {
+        self.gained |= !self.focused;
+        self.focused = true;
     }
 
     /// Event coordinates are physical pixels; callers convert them to the same
@@ -116,12 +130,12 @@ impl macroquad::miniquad::EventHandler for WindowInput {
         // a matching restore event. A fresh press proves input is reaching the
         // window again. Keep the loss latched so mouse driving still pauses.
         if !repeat {
-            self.focused = true;
+            self.mark_focused();
         }
     }
 
     fn mouse_button_down_event(&mut self, _button: MouseButton, _x: f32, _y: f32) {
-        self.focused = true;
+        self.mark_focused();
     }
 
     fn window_minimized_event(&mut self) {
@@ -130,7 +144,7 @@ impl macroquad::miniquad::EventHandler for WindowInput {
     }
 
     fn window_restored_event(&mut self) {
-        self.focused = true;
+        self.mark_focused();
     }
 }
 
@@ -309,6 +323,26 @@ mod tests {
             // later focus loss in the same rendered frame.
             focus.window_minimized_event();
             assert!(!focus.focused && focus.take_loss());
+        }
+    }
+
+    #[test]
+    fn the_click_that_activates_the_window_is_reported_as_a_focus_gain() {
+        use macroquad::miniquad::EventHandler;
+        let mut focus = WindowInput::new();
+        // Clicks in a window that already had focus are not activations.
+        focus.mouse_button_down_event(MouseButton::Right, 10.0, 20.0);
+        assert!(!focus.take_gain());
+        for restore_first in [false, true] {
+            focus.window_minimized_event();
+            assert!(!focus.take_gain());
+            if restore_first {
+                focus.window_restored_event();
+            }
+            focus.mouse_button_down_event(MouseButton::Right, 10.0, 20.0);
+            assert!(focus.focused && focus.take_gain());
+            assert!(!focus.take_gain());
+            assert!(focus.take_loss());
         }
     }
 
