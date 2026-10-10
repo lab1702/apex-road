@@ -12,6 +12,7 @@ mod world;
 use courses::resolve_track;
 use macroquad::prelude::*;
 use race::Race;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use track::Track;
 use vehicle::{Car, Control};
@@ -25,15 +26,54 @@ struct Options {
     demo: bool,
     at: Option<f32>,
 }
-fn path_argument(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf, String> {
+const SMOKE_TEST_FRAMES: u64 = 240;
+const CAPTURE_FRAMES: u64 = 30;
+const HELP: &str = "APEX / ROAD
+
+apex-road [PATH | --track PATH] [options]
+  PATH, --track PATH  Drive a .track file (default tracks/alpine.track)
+  --validate PATH     Check a track without opening a window
+  --smoke-test        Auto-drive, exiting after 240 frames unless --frames is given
+  --autodrive         Run the demonstration driver
+  --demo              Auto-play every bundled track in a repeating loop
+  --frames N          Exit after N rendered frames
+  --capture PATH      Save the final frame as PNG (after 30 frames unless --frames is given)
+  --at METERS         Preview a position on the track
+
+Relative track paths are read from the current directory. Bundled
+tracks/*.track paths fall back to the game folder: the first of the current
+directory, the executable's directory, or one of its parents that contains
+the bundled tracks/. Records are saved in that folder's data/.
+
+Enter start · WASD / arrows drive · Space handbrake · R restart
+Right click toggles mouse driving: left/right steer, up adds throttle, down adds brake
+U toggles US / metric HUD units (default: US)
+Esc closes help, otherwise pauses · F1 help · F5 reload · Tab track · F11 fullscreen";
+
+fn starts_with_dash(arg: &OsStr) -> bool {
+    arg.as_encoded_bytes().starts_with(b"-")
+}
+fn path_argument(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<PathBuf, String> {
     args.next()
-        .filter(|value| !value.starts_with('-'))
+        .filter(|value| !starts_with_dash(value))
         .map(PathBuf::from)
         .ok_or_else(|| format!("{flag} needs a path"))
 }
-fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
+fn number_argument<T: std::str::FromStr>(
+    args: &mut impl Iterator<Item = OsString>,
+    missing: &str,
+    invalid: &str,
+) -> Result<T, String> {
+    let value = args.next().ok_or(missing)?;
+    value
+        .to_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("{invalid}: {}", value.to_string_lossy()))
+}
+/// Parse command-line arguments, which need not be valid Unicode paths.
+fn options<T: Into<OsString>>(args: impl IntoIterator<Item = T>) -> Result<Options, String> {
     let mut out = Options {
-        path: "tracks/alpine.track".into(),
+        path: courses::BUNDLED_PATHS[0].into(),
         validate: false,
         frames: None,
         capture: None,
@@ -41,21 +81,44 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         demo: false,
         at: None,
     };
-    let mut args = args.into_iter();
+    let mut path: Option<PathBuf> = None;
+    // `--validate a --track b` must not silently check only b.
+    let mut set_path = |next: PathBuf| {
+        if let Some(previous) = &path {
+            return Err(format!(
+                "Only one track path can be given; got '{}' and '{}'",
+                previous.display(),
+                next.display()
+            ));
+        }
+        path = Some(next);
+        Ok(())
+    };
+    let mut smoke_test = false;
+    let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--track" => out.path = path_argument(&mut args, "--track")?,
+        let Some(flag) = arg.to_str() else {
+            if starts_with_dash(&arg) {
+                return Err(format!(
+                    "Unknown option: {}. Use --help.",
+                    arg.to_string_lossy()
+                ));
+            }
+            set_path(arg.into())?;
+            continue;
+        };
+        match flag {
+            "--track" => set_path(path_argument(&mut args, "--track")?)?,
             "--validate" => {
                 out.validate = true;
-                out.path = path_argument(&mut args, "--validate")?;
+                set_path(path_argument(&mut args, "--validate")?)?;
             }
             "--frames" => {
-                out.frames = Some(
-                    args.next()
-                        .ok_or("--frames needs a positive integer")?
-                        .parse()
-                        .map_err(|_| "invalid frame count")?,
-                )
+                out.frames = Some(number_argument(
+                    &mut args,
+                    "--frames needs a positive integer",
+                    "invalid frame count",
+                )?)
             }
             "--capture" => out.capture = Some(path_argument(&mut args, "--capture")?),
             "--autodrive" => out.autodrive = true,
@@ -64,26 +127,26 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
                 out.autodrive = true;
             }
             "--smoke-test" => {
-                out.frames = Some(240);
+                smoke_test = true;
                 out.autodrive = true;
             }
             "--at" => {
-                out.at = Some(
-                    args.next()
-                        .ok_or("--at needs a distance in meters")?
-                        .parse()
-                        .map_err(|_| "invalid distance")?,
-                )
+                out.at = Some(number_argument(
+                    &mut args,
+                    "--at needs a distance in meters",
+                    "invalid distance",
+                )?)
             }
             "--help" | "-h" => {
-                println!(
-                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --demo            Auto-play every bundled track in a repeating loop\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nRight click toggles mouse driving: left/right steer, up adds throttle, down adds brake\nU toggles US / metric HUD units (default: US)\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
-                );
+                println!("{HELP}");
                 std::process::exit(0);
             }
-            other if !other.starts_with('-') => out.path = other.into(),
-            _ => return Err(format!("Unknown option: {arg}. Use --help.")),
+            other if !other.starts_with('-') => set_path(arg.into())?,
+            _ => return Err(format!("Unknown option: {flag}. Use --help.")),
         }
+    }
+    if let Some(path) = path {
+        out.path = path;
     }
     if out.frames == Some(0) {
         return Err("--frames must be positive".into());
@@ -91,8 +154,12 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     if out.at.is_some_and(|v| !v.is_finite() || v < 0.) {
         return Err("--at must be finite and nonnegative".into());
     }
+    // An explicit --frames wins regardless of its position.
+    if smoke_test && out.frames.is_none() {
+        out.frames = Some(SMOKE_TEST_FRAMES);
+    }
     if out.capture.is_some() && out.frames.is_none() {
-        out.frames = Some(30);
+        out.frames = Some(CAPTURE_FRAMES);
     }
     Ok(out)
 }
@@ -112,7 +179,7 @@ fn config() -> macroquad::conf::Conf {
     }
 }
 fn main() {
-    let mut opts = options(std::env::args().skip(1)).unwrap_or_else(|e| {
+    let mut opts = options(std::env::args_os().skip(1)).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
     });
@@ -127,7 +194,8 @@ fn main() {
         });
     if opts.validate {
         println!(
-            "OK: {} | {:.0} m | {} samples | {} checkpoints | {}",
+            "OK: {} | {} | {:.0} m | {} samples | {} checkpoints | {}",
+            opts.path.display(),
             track.name,
             track.length,
             track.samples.len(),
@@ -147,8 +215,29 @@ fn main() {
         }
     });
 }
+/// Version of the rules that make best times comparable. Bump it whenever
+/// vehicle handling, the physics step, or timing changes enough that older
+/// records would be unfair, so new runs start a fresh record history.
+/// Version 1 files were named `{hash}.best`; they are left on disk unread.
+const RECORD_VERSION: u32 = 2;
+/// Records live in the game root's `data/`, beside the bundled `tracks/`.
+/// Without a game root (only possible with an explicit track path), fall back
+/// to the executable's directory rather than wherever the game was launched.
+fn records_dir() -> PathBuf {
+    courses::game_root()
+        .ok()
+        .or_else(|| Some(std::env::current_exe().ok()?.parent()?.to_owned()))
+        .unwrap_or_default()
+        .join("data")
+}
 fn record_path(track: &Track) -> PathBuf {
-    PathBuf::from(format!("data/{:016x}.best", track.source_hash()))
+    record_path_in(&records_dir(), track)
+}
+fn record_path_in(directory: &Path, track: &Track) -> PathBuf {
+    directory.join(format!(
+        "{:016x}-v{RECORD_VERSION}.best",
+        track.source_hash()
+    ))
 }
 fn read_record(path: &Path) -> Option<f32> {
     try_read_record(path).ok().flatten()
@@ -181,13 +270,14 @@ fn save_record(path: &Path, time: f32) -> std::io::Result<SavedRecord> {
     // The record itself is replaced by rename. Keep a separate, stable lock
     // file so every running game serializes its read/compare/write sequence.
     // Never remove this sidecar: another process may already be waiting on it.
+    // The lock is released when `lock` is dropped at the end of this function.
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path.with_extension("lock"))?;
-    lock.lock()?;
+    let locked = lock_record(&lock)?;
     if let Some(best) = try_read_record(path)?
         && best <= time
     {
@@ -196,15 +286,95 @@ fn save_record(path: &Path, time: f32) -> std::io::Result<SavedRecord> {
             improved: false,
         });
     }
-    // All writers for this record hold the same lock, including while using
-    // its temporary file. The same-directory rename keeps readers atomic.
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, format!("{time}\n"))?;
-    std::fs::rename(temp, path)?;
+    // All locked writers for this record share its temporary file. Without
+    // a lock, a per-process name keeps concurrent writers from interleaving.
+    // The same-directory rename keeps readers atomic.
+    let temp = if locked {
+        path.with_extension("tmp")
+    } else {
+        path.with_extension(format!("{}.tmp", std::process::id()))
+    };
+    let written = write_synced(&temp, format!("{time}\n").as_bytes())
+        .and_then(|()| rename_with_retry(&temp, path));
+    if let Err(error) = written {
+        // Do not leave a partial record behind. This cannot remove a
+        // directory or another writer's file: the name is ours while locked.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
     Ok(SavedRecord {
         best: time,
         improved: true,
     })
+}
+/// Bounded so a stuck writer cannot freeze the render thread, which saves
+/// records; contended saves report an error and retry after the next run.
+const RECORD_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Take the record lock, waiting briefly for another game to finish saving.
+/// Returns false when the filesystem cannot lock files at all; saving then
+/// proceeds unserialized, as it would on a single running game.
+fn lock_record(lock: &std::fs::File) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + RECORD_LOCK_TIMEOUT;
+    let mut delay = std::time::Duration::from_millis(1);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::Error(error)) if locking_unsupported(&error) => {
+                return Ok(false);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "another game is still saving this record",
+                    ));
+                }
+                std::thread::sleep(delay.min(deadline - now));
+                delay = (delay * 2).min(std::time::Duration::from_millis(16));
+            }
+        }
+    }
+}
+fn locking_unsupported(error: &std::io::Error) -> bool {
+    // ENOLCK (for example, NFS without a lock daemon), or Windows
+    // ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED from some network shares.
+    const NO_LOCKS: &[i32] = if cfg!(target_os = "linux") {
+        &[37]
+    } else if cfg!(target_os = "macos") {
+        &[77]
+    } else if cfg!(windows) {
+        &[1, 50]
+    } else {
+        &[]
+    };
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error
+            .raw_os_error()
+            .is_some_and(|code| NO_LOCKS.contains(&code))
+}
+/// Write a complete file and flush it to disk before it can replace a record,
+/// so a crash cannot leave a renamed but empty record.
+fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    std::io::Write::write_all(&mut file, contents)?;
+    file.sync_all()
+}
+/// Antivirus and indexing services on Windows can briefly hold the old record
+/// open, failing the rename with access denied. Retry for at most ~75 ms.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut delay = std::time::Duration::from_millis(5);
+    for _ in 0..4 {
+        match std::fs::rename(from, to) {
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            result => return result,
+        }
+    }
+    std::fs::rename(from, to)
 }
 fn save_capture(path: &Path, screenshot: &Image) -> Result<(), image::ImageError> {
     let mut pixels = image::RgbaImage::from_raw(
@@ -661,6 +831,181 @@ mod driving_checks {
     }
 
     #[test]
+    fn frame_counts_must_be_positive_integers() {
+        for args in [
+            vec!["--frames", "0"],
+            vec!["--smoke-test", "--frames", "0"],
+            vec!["--capture", "x.png", "--frames", "0"],
+        ] {
+            assert_eq!(
+                options(args).err(),
+                Some("--frames must be positive".into())
+            );
+        }
+        assert!(options(["--frames", "-3"]).is_err());
+        assert!(options(["--frames", "many"]).is_err());
+        assert!(options(["--frames"]).is_err());
+        assert_eq!(options(["--frames", "1"]).unwrap().frames, Some(1));
+    }
+
+    #[test]
+    fn explicit_frames_override_the_smoke_test_default_in_any_order() {
+        for args in [
+            vec!["--smoke-test", "--frames", "5"],
+            vec!["--frames", "5", "--smoke-test"],
+        ] {
+            let opts = options(args).unwrap();
+            assert_eq!(opts.frames, Some(5));
+            assert!(opts.autodrive);
+        }
+        let opts = options(["--smoke-test"]).unwrap();
+        assert_eq!(opts.frames, Some(SMOKE_TEST_FRAMES));
+        let opts = options(["--smoke-test", "--capture", "drive.png"]).unwrap();
+        assert_eq!(opts.frames, Some(SMOKE_TEST_FRAMES));
+    }
+
+    #[test]
+    fn capture_without_frames_defaults_to_thirty() {
+        let opts = options(["--capture", "shot.png"]).unwrap();
+        assert_eq!(opts.capture, Some(PathBuf::from("shot.png")));
+        assert_eq!(opts.frames, Some(30));
+        let opts = options(["--frames", "7", "--capture", "shot.png"]).unwrap();
+        assert_eq!(opts.frames, Some(7));
+        assert_eq!(options(["--autodrive"]).unwrap().frames, None);
+    }
+
+    #[test]
+    fn only_one_track_path_is_accepted() {
+        for args in [
+            vec!["--validate", "a.track", "--track", "b.track"],
+            vec!["--track", "a.track", "--validate", "b.track"],
+            vec!["--track", "a.track", "--track", "b.track"],
+            vec!["a.track", "b.track"],
+            vec!["a.track", "--validate", "b.track"],
+        ] {
+            let error = options(args.clone()).err().unwrap();
+            assert!(
+                error.contains("a.track") && error.contains("b.track"),
+                "{args:?}: {error}"
+            );
+        }
+        let opts = options(["my.track"]).unwrap();
+        assert_eq!(opts.path, PathBuf::from("my.track"));
+        assert!(!opts.validate);
+        let opts = options(["--validate", "b.track", "--autodrive"]).unwrap();
+        assert!(opts.validate && opts.autodrive);
+        assert_eq!(opts.path, PathBuf::from("b.track"));
+    }
+
+    #[test]
+    fn unknown_options_are_reported() {
+        for flag in ["--trak", "-x", "--"] {
+            assert_eq!(
+                options(["--autodrive", flag]).err(),
+                Some(format!("Unknown option: {flag}. Use --help."))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_arguments_are_paths_or_clean_errors() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = OsString::from_vec(b"caf\xe9.track".to_vec());
+        assert_eq!(
+            options([path.clone()]).unwrap().path,
+            PathBuf::from(path.clone())
+        );
+        let opts = options([OsString::from("--capture"), path.clone()]).unwrap();
+        assert_eq!(opts.capture, Some(PathBuf::from(path)));
+        let flag = OsString::from_vec(b"--fr\xe9mes".to_vec());
+        assert!(options([flag]).err().unwrap().starts_with("Unknown option"));
+        let number = OsString::from_vec(b"1\xe9".to_vec());
+        assert!(
+            options([OsString::from("--frames"), number])
+                .err()
+                .unwrap()
+                .starts_with("invalid frame count")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_arguments_are_paths_or_clean_errors() {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired surrogate cannot be represented as UTF-8.
+        let wide = |text: &str| {
+            let mut units: Vec<u16> = text.encode_utf16().collect();
+            units.insert(2, 0xd800);
+            OsString::from_wide(&units)
+        };
+        let path = wide("my.track");
+        assert_eq!(options([path.clone()]).unwrap().path, PathBuf::from(path));
+        assert!(
+            options([wide("--frames")])
+                .err()
+                .unwrap()
+                .starts_with("Unknown option")
+        );
+        assert!(
+            options([OsString::from("--at"), wide("12")])
+                .err()
+                .unwrap()
+                .starts_with("invalid distance")
+        );
+    }
+
+    #[test]
+    fn records_are_keyed_by_track_contents_and_record_version() {
+        let directory = Path::new("records");
+        let track = Track::parse("straight 40").unwrap();
+        let path = record_path_in(directory, &track);
+        assert_eq!(
+            path,
+            directory.join(format!(
+                "{:016x}-v{RECORD_VERSION}.best",
+                track.source_hash()
+            ))
+        );
+        assert_ne!(
+            path,
+            directory.join(format!("{:016x}.best", track.source_hash()))
+        );
+        assert_ne!(
+            record_path_in(directory, &Track::parse("straight 41").unwrap()),
+            path
+        );
+        // Records sit beside the bundled tracks, wherever the game started.
+        assert_eq!(
+            record_path(&track),
+            courses::game_root()
+                .unwrap()
+                .join("data")
+                .join(path.file_name().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_held_record_lock_fails_quickly_without_changing_the_record() {
+        let directory = TempDir::new("apex-record-lock-timeout-test");
+        let path = directory.path().join("course.best");
+        save_record(&path, 60.0).unwrap();
+        // A second handle conflicts even within one process.
+        let holder = std::fs::File::create(path.with_extension("lock")).unwrap();
+        holder.lock().unwrap();
+        let started = std::time::Instant::now();
+        let error = save_record(&path, 40.0).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(read_record(&path), Some(60.0));
+        assert!(!path.with_extension("tmp").exists());
+        holder.unlock().unwrap();
+        assert!(save_record(&path, 40.0).unwrap().improved);
+        assert_eq!(read_record(&path), Some(40.0));
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
     fn screenshot_export_is_png_or_reports_io_errors_without_panicking() {
         let dir = TempDir::new("apex-capture-test");
         let path = dir.path().join("nested/capture.without-png-extension");
@@ -787,7 +1132,14 @@ mod driving_checks {
             wait_for_files(&[directory.join("go")]);
             for step in 0..32 {
                 let time = (1000 - step * 4 - writer) as f32;
-                let saved = save_record(&directory.join("course.best"), time).unwrap();
+                // The game gives up on a contended lock after a short wait
+                // and retries after a later run; do the same here.
+                let saved = loop {
+                    match save_record(&directory.join("course.best"), time) {
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+                        result => break result.unwrap(),
+                    }
+                };
                 assert!(saved.best <= time);
                 std::thread::yield_now();
             }
@@ -883,7 +1235,7 @@ mod driving_checks {
             assert_eq!(opts.path, PathBuf::from("tracks/club.track"));
             assert_eq!(opts.frames, Some(180));
         }
-        let opts = options(["--demo".into()]).unwrap();
+        let opts = options(["--demo"]).unwrap();
         assert!(opts.demo && opts.autodrive);
         assert!(opts.frames.is_none());
         assert_eq!(opts.path, PathBuf::from(courses::BUNDLED_PATHS[0]));
@@ -1041,7 +1393,7 @@ mod driving_checks {
 
     #[test]
     fn demo_drives_every_bundled_course_and_repeats_without_saving_records() {
-        let opts = options(["--demo".into()]).unwrap();
+        let opts = options(["--demo"]).unwrap();
         let mut path = opts.path.clone();
         for expected in courses::BUNDLED_PATHS
             .iter()
