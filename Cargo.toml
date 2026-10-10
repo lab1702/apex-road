@@ -2,9 +2,14 @@
 name = "apex-road"
 version = "0.1.0"
 edition = "2024"
+# File::lock is the newest standard-library API in use (stable since 1.89).
+rust-version = "1.89"
 description = "A windshield-view time trial racer with text-authored 3D tracks"
-license = "MIT"
+# The game code is MIT; the bundled DejaVu Sans font in assets/ is under the
+# Bitstream Vera license (see assets/DejaVuSans-LICENSE.txt).
+license = "MIT AND Bitstream-Vera"
 repository = "https://github.com/lab1702/apex-road"
+publish = false
 
 [dependencies]
 macroquad = "=0.4.16"
@@ -18,3 +23,5 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
+codegen-units = 1
+strip = true

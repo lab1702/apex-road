@@ -16,7 +16,8 @@ banked corners, and airborne jumps affect how the car moves.
 
 ## Run on Windows, Linux, or macOS
 
-Install a current stable [Rust toolchain](https://rust-lang.org/tools/install/).
+Install a current stable [Rust toolchain](https://rust-lang.org/tools/install/)
+(Rust 1.89 or newer; run `rustup update` if an older toolchain is installed).
 The renderer uses Macroquad and OpenGL; playing requires a graphical desktop
 and an OpenGL 2.1-capable graphics driver.
 
