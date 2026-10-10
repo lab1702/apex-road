@@ -10,7 +10,7 @@ use super::contact::{
     open_track_entry_roads, plane_height_at, route_walk,
 };
 use super::*;
-use crate::track::RoadSample;
+use crate::track::{RoadSample, deck_twist, frame_change, shoulder_curve_error};
 
 // A change of contact plane at a shallower incidence than this is part of one
 // continuous surface (sampled hill curvature): the car keeps its speed. From
@@ -253,11 +253,11 @@ fn road_entry_contact_before_exit(
         if a.kind != RoadKind::Gap {
             // Refine twisting strips so each triangle stays within 1 cm of
             // the interpolated road frame, including changing road width.
-            let normal = (a.up + b.up).normalize();
-            let twist = (b.right * b.width - a.right * a.width).dot(normal).abs() * 0.25;
-            let frame_change = a.forward.distance(b.forward).max(a.right.distance(b.right));
+            let twist = deck_twist(a, b);
+            let frame = frame_change(a, b);
             // A shoulder also twists on an ordinary hill: its inner edge
-            // changes elevation while the terrain edge remains level.
+            // changes elevation while the terrain edge remains level. This
+            // sweep bounds it more tightly than the rendered mesh does.
             let shoulder_height_change = if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
                 [-1.0_f32, 1.0]
                     .into_iter()
@@ -270,34 +270,17 @@ fn road_entry_contact_before_exit(
             } else {
                 0.0
             };
-            // Curved cross-sections displace a shoulder triangle sideways.
-            // On a tall embankment even a small displacement becomes a large
-            // height error, so refine by the shoulder slope as the mesh does.
-            let shoulder_curve_error = if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
-                let slope = [a, b]
-                    .into_iter()
-                    .flat_map(|sample| {
-                        [-1.0, 1.0].map(|side| {
-                            let edge_height =
-                                sample.pos.y + sample.right.y * sample.width * 0.5 * side;
-                            (edge_height - ground_height).abs()
-                                / (SHOULDER_WIDTH * horizontal(sample.right).length())
-                        })
-                    })
-                    .fold(0.0_f32, f32::max);
-                frame_change
-                    * frame_change
-                    * (a.width.max(b.width) * 0.5 + SHOULDER_WIDTH)
-                    * 0.25
-                    * slope
+            // Refine curved shoulders by their slope, as the mesh does.
+            let curve_error = if matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
+                shoulder_curve_error(a, b, &[-1.0, 1.0], ground_height)
             } else {
                 0.0
             };
             let steps = (twist / 0.01)
                 .ceil()
-                .max((frame_change / 0.05).ceil())
+                .max((frame / 0.05).ceil())
                 .max((shoulder_height_change / 0.04).ceil())
-                .max((shoulder_curve_error / 0.01).sqrt().ceil())
+                .max((curve_error / 0.01).sqrt().ceil())
                 .max(1.0) as usize;
             let sample_at = |step| {
                 if step == 0 {

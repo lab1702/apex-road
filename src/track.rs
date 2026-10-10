@@ -33,6 +33,85 @@ pub struct RoadSample {
     pub kind: RoadKind,
 }
 
+/// Width of the drivable grass shoulder that slopes from each edge of a road
+/// or ramp down to the terrain. Physics and scenery share this surface.
+pub const SHOULDER_WIDTH: f32 = 12.0;
+
+/// How far outside the deck edge the inner face of a bridge or tunnel
+/// guardrail (its rendered cap) stands. Cars stop against this face.
+pub const RAIL_FACE_OFFSET: f32 = 0.20;
+
+/// The tunnel arch has `TUNNEL_ARCH_PANELS` flat panels between the angles
+/// of [`tunnel_arch_angle`]. It springs from `TUNNEL_ARCH_SPRING` above the
+/// deck plane, `TUNNEL_ARCH_SIDE_CLEARANCE` outside each deck edge, and rises
+/// a further `TUNNEL_ARCH_RISE` at its crown. Its rendered panels are also
+/// its collider.
+pub const TUNNEL_ARCH_PANELS: usize = 10;
+pub const TUNNEL_ARCH_SIDE_CLEARANCE: f32 = 0.65;
+pub const TUNNEL_ARCH_SPRING: f32 = 1.0;
+pub const TUNNEL_ARCH_RISE: f32 = 5.2;
+/// Bounds the arch's distance from the centerline beyond half the deck width.
+pub const TUNNEL_ARCH_REACH: f32 =
+    TUNNEL_ARCH_SIDE_CLEARANCE + TUNNEL_ARCH_SPRING + TUNNEL_ARCH_RISE;
+
+/// The angle of the arch's `index`th panel boundary, from 0 at the right
+/// wall to π at the left wall.
+pub fn tunnel_arch_angle(index: usize) -> f32 {
+    index as f32 / TUNNEL_ARCH_PANELS as f32 * std::f32::consts::PI
+}
+
+impl RoadSample {
+    /// Height of the deck edge on `side` (-1 for left, 1 for right).
+    pub fn edge_height(&self, side: f32) -> f32 {
+        self.pos.y + self.right.y * (side * self.width * 0.5)
+    }
+
+    /// The shoulder's drop per metre across, on `side` (-1 or 1), from the
+    /// deck edge down to `ground`.
+    pub fn shoulder_slope(&self, side: f32, ground: f32) -> f32 {
+        (self.edge_height(side) - ground).abs() / (SHOULDER_WIDTH * self.right.xz().length())
+    }
+
+    /// The horizontal unit normal of this cross-section, pointing forward
+    /// along the road. Segments are bounded by these cross-section lines.
+    pub fn cross_section_normal(&self) -> Vec3 {
+        vec3(self.right.x, 0.0, self.right.z)
+            .cross(Vec3::Y)
+            .normalize()
+    }
+}
+
+/// How far the deck's edges twist out of a common plane between two samples,
+/// as the height error of a single diagonal across the segment.
+pub fn deck_twist(a: RoadSample, b: RoadSample) -> f32 {
+    let normal = (a.up + b.up).normalize();
+    let span_change = b.right * b.width - a.right * a.width;
+    span_change.dot(normal).abs() * 0.25
+}
+
+/// The largest change of the road frame between two samples. A straight
+/// chord between them cuts inside the curved, unit-length frame.
+pub fn frame_change(a: RoadSample, b: RoadSample) -> f32 {
+    a.forward.distance(b.forward).max(a.right.distance(b.right))
+}
+
+/// How far a straight shoulder triangle between two samples departs in
+/// height from the curved cross-sections it spans, on the steepest of the
+/// given `sides` (each -1 or 1). Curvature displaces the triangle sideways;
+/// on a tall embankment even a small displacement is a large height error.
+pub fn shoulder_curve_error(a: RoadSample, b: RoadSample, sides: &[f32], ground: f32) -> f32 {
+    let slope = [a, b]
+        .into_iter()
+        .flat_map(|sample| {
+            sides
+                .iter()
+                .map(move |&side| sample.shoulder_slope(side, ground))
+        })
+        .fold(0.0_f32, f32::max);
+    let change = frame_change(a, b);
+    change * change * (a.width.max(b.width) * 0.5 + SHOULDER_WIDTH) * 0.25 * slope
+}
+
 #[derive(Clone, Debug)]
 pub struct Track {
     pub name: String,

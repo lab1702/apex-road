@@ -154,7 +154,7 @@ pub(super) fn open_track_entry_roads(
         (last - 1, track.samples[last], -1.0),
     ]
     .map(|(index, sample, direction)| {
-        let normal = horizontal(sample.right).cross(Vec3::Y).normalize() * direction;
+        let normal = sample.cross_section_normal() * direction;
         let start = horizontal(before - sample.pos).dot(normal);
         let end = horizontal(after - sample.pos).dot(normal);
         if start >= 0.0 || end < 0.0 {
@@ -189,7 +189,7 @@ pub(super) fn guardrail_exit_road(
     let segments = track.samples.len() - 1;
     for _ in 0..segments {
         let boundary = track.samples[road.index + usize::from(forward)];
-        let normal = horizontal(boundary.right).cross(Vec3::Y).normalize();
+        let normal = boundary.cross_section_normal();
         let start = horizontal(before - boundary.pos).dot(normal) * direction;
         let end = horizontal(after - boundary.pos).dot(normal) * direction;
         if start > SEGMENT_TOLERANCE || end < -SEGMENT_TOLERANCE || end <= start {
@@ -287,8 +287,8 @@ pub(super) fn nearest_road_with_tolerance(
         // Bound every segment by its rendered cross-sections, including the
         // edges of gaps. Chord projections alone leave holes on the outside
         // of bends; the banked right vectors also account for sloped joins.
-        let start_normal = horizontal(a.right).cross(Vec3::Y).normalize();
-        let end_normal = horizontal(b.right).cross(Vec3::Y).normalize();
+        let start_normal = a.cross_section_normal();
+        let end_normal = b.cross_section_normal();
         let start_offset = horizontal(position - a.pos).dot(start_normal);
         let end_offset = horizontal(position - b.pos).dot(end_normal);
         // Pitch and bank can turn an offset cross-section against the
@@ -540,7 +540,7 @@ pub(super) fn crosses_connected_surface(
         if track.samples[index].kind == RoadKind::Gap && !starts_at_boundary {
             return false;
         }
-        let normal = horizontal(boundary.right).cross(Vec3::Y).normalize();
+        let normal = boundary.cross_section_normal();
         let start = horizontal(before - boundary.pos).dot(normal);
         let end = horizontal(after - boundary.pos).dot(normal);
         if direction * start > SEGMENT_TOLERANCE
@@ -696,10 +696,8 @@ mod tests {
                 let distance = (a.distance + b.distance) * 0.5;
                 let sample = track.sample_at(distance);
                 let contact = sample.pos + sample.right * 16.0;
-                let start =
-                    horizontal(contact - a.pos).dot(horizontal(a.right).cross(Vec3::Y).normalize());
-                let end =
-                    horizontal(contact - b.pos).dot(horizontal(b.right).cross(Vec3::Y).normalize());
+                let start = horizontal(contact - a.pos).dot(a.cross_section_normal());
+                let end = horizontal(contact - b.pos).dot(b.cross_section_normal());
                 (start < -0.05 && end > 0.05).then_some((distance, contact))
             })
             .expect("the banked hill must reverse its projected cross-sections");
@@ -860,7 +858,7 @@ mod tests {
                 .filter(|pair| (pair[0].kind == RoadKind::Gap) != (pair[1].kind == RoadKind::Gap))
             {
                 let gate = pair[1];
-                let normal = horizontal(gate.right).cross(Vec3::Y).normalize();
+                let normal = gate.cross_section_normal();
                 for side in [-4.5, 0.0, 4.5] {
                     for offset in [-0.1, 0.0, 0.1] {
                         let position =

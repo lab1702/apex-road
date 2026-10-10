@@ -24,12 +24,11 @@ mod landing;
 
 use macroquad::prelude::*;
 
-use crate::track::{RoadKind, Track};
+use crate::track::{RoadKind, SHOULDER_WIDTH, Track};
 use contact::{RoadPoint, RoadSweep, Surface, contact_surface, nearest_road, road_surface};
 
 const GRAVITY: f32 = 9.81;
 const RIDE_HEIGHT: f32 = 0.48;
-const SHOULDER_WIDTH: f32 = 12.0;
 // Keep shared segment edges watertight despite rounded track coordinates.
 const SEGMENT_TOLERANCE: f32 = 0.01;
 const CONTACT_TOLERANCE: f32 = 0.30;

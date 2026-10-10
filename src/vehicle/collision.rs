@@ -4,12 +4,12 @@
 
 use super::contact::{guardrail_exit_road, open_track_entry_roads, route_walk};
 use super::*;
-use crate::track::RoadSample;
+use crate::track::{
+    RAIL_FACE_OFFSET, RoadSample, TUNNEL_ARCH_PANELS, TUNNEL_ARCH_REACH, TUNNEL_ARCH_RISE,
+    TUNNEL_ARCH_SIDE_CLEARANCE, TUNNEL_ARCH_SPRING, tunnel_arch_angle,
+};
 
 const CAR_HALF_WIDTH: f32 = 0.85;
-// The rendered guardrail's inner face (its cap) stands this far outside the
-// deck edge; the body stops against it rather than at the deck edge itself.
-const RAIL_FACE_OFFSET: f32 = 0.20;
 
 impl Car {
     /// The tunnel roof is also a physical boundary; falling onto a roof from
@@ -336,19 +336,19 @@ fn tunnel_roof_sweep(track: &Track, before: Vec3, after: Vec3) -> Option<(Vec3, 
             continue;
         }
         // A conservative bound is cheap even for a long, densely sampled route.
-        let radius = a.width.max(b.width) * 0.5 + 6.85;
+        let radius = a.width.max(b.width) * 0.5 + TUNNEL_ARCH_REACH;
         let bounds_min = a.pos.min(b.pos) - Vec3::splat(radius);
         let bounds_max = a.pos.max(b.pos) + Vec3::splat(radius);
         if path_max.cmplt(bounds_min).any() || path_min.cmpgt(bounds_max).any() {
             continue;
         }
         let arch = |sample: RoadSample, index: usize| {
-            let angle = index as f32 / 10.0 * std::f32::consts::PI;
+            let angle = tunnel_arch_angle(index);
             sample.pos
-                + sample.right * angle.cos() * (sample.width * 0.5 + 0.65)
-                + sample.up * (1.0 + angle.sin() * 5.2)
+                + sample.right * angle.cos() * (sample.width * 0.5 + TUNNEL_ARCH_SIDE_CLEARANCE)
+                + sample.up * (TUNNEL_ARCH_SPRING + angle.sin() * TUNNEL_ARCH_RISE)
         };
-        for index in 0..10 {
+        for index in 0..TUNNEL_ARCH_PANELS {
             let aa = arch(a, index);
             let ab = arch(a, index + 1);
             let ba = arch(b, index);
@@ -755,13 +755,13 @@ mod tests {
             let top = car.position + Vec3::Y * 0.7 - sample.pos;
             let point = vec2(top.dot(sample.right), top.dot(sample.up));
             let arch = |index: usize| {
-                let angle = index as f32 / 10.0 * std::f32::consts::PI;
+                let angle = tunnel_arch_angle(index);
                 vec2(
-                    angle.cos() * (sample.width * 0.5 + 0.65),
-                    1.0 + angle.sin() * 5.2,
+                    angle.cos() * (sample.width * 0.5 + TUNNEL_ARCH_SIDE_CLEARANCE),
+                    TUNNEL_ARCH_SPRING + angle.sin() * TUNNEL_ARCH_RISE,
                 )
             };
-            let outside = (0..10)
+            let outside = (0..TUNNEL_ARCH_PANELS)
                 .map(|index| {
                     let edge = arch(index + 1) - arch(index);
                     (point - arch(index)).dot(vec2(edge.y, -edge.x).normalize())
@@ -782,10 +782,10 @@ mod tests {
             let track = Track::parse(&format!("straight 50 bank {bank}\ntunnel 100")).unwrap();
             let sample = track.sample_at(80.0);
             let arch = |index: usize| {
-                let angle = index as f32 / 10.0 * std::f32::consts::PI;
+                let angle = tunnel_arch_angle(index);
                 sample.pos
-                    + sample.right * angle.cos() * (sample.width * 0.5 + 0.65)
-                    + sample.up * (1.0 + angle.sin() * 5.2)
+                    + sample.right * angle.cos() * (sample.width * 0.5 + TUNNEL_ARCH_SIDE_CLEARANCE)
+                    + sample.up * (TUNNEL_ARCH_SPRING + angle.sin() * TUNNEL_ARCH_RISE)
             };
             let a = arch(panel);
             let b = arch(panel + 1);

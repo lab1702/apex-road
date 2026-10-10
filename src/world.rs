@@ -1,5 +1,9 @@
 //! Procedural, vertex-lit scenery. Every road mesh comes from the same samples as physics.
-use crate::track::{RoadKind, RoadSample, Track};
+use crate::track::{
+    RAIL_FACE_OFFSET, RoadKind, RoadSample, SHOULDER_WIDTH, TUNNEL_ARCH_PANELS, TUNNEL_ARCH_RISE,
+    TUNNEL_ARCH_SIDE_CLEARANCE, TUNNEL_ARCH_SPRING, Track, deck_twist, frame_change,
+    shoulder_curve_error, tunnel_arch_angle,
+};
 use macroquad::miniquad::CullFace;
 use macroquad::prelude::*;
 
@@ -156,18 +160,14 @@ fn edge(s: RoadSample, x: f32, h: f32) -> Vec3 {
 // road far above its driving surface. Refine only twisted sections until the
 // diagonal's departure from the interpolated cross-section is below 2 cm.
 fn surface_steps(a: RoadSample, b: RoadSample) -> usize {
-    let normal = (a.up + b.up).normalize();
-    let span_change = b.right * b.width - a.right * a.width;
-    let twist = span_change.dot(normal).abs() * 0.25;
-    ((twist / 0.02).ceil().max(1.0) as usize).max(frame_steps(a, b))
+    ((deck_twist(a, b) / 0.02).ceil().max(1.0) as usize).max(frame_steps(a, b))
 }
 
 fn frame_steps(a: RoadSample, b: RoadSample) -> usize {
     // A banked hill can curve the road edges without twisting them relative
     // to the average normal. Bound frame changes too: otherwise a straight
     // chord cuts far inside the unit frame used by the driving surface.
-    let change = a.forward.distance(b.forward).max(a.right.distance(b.right));
-    (change / 0.05).ceil().max(1.0) as usize
+    (frame_change(a, b) / 0.05).ceil().max(1.0) as usize
 }
 
 fn surface_sample(track: &Track, a: RoadSample, b: RoadSample, t: f32) -> RoadSample {
@@ -206,28 +206,19 @@ fn shoulder_segment(
     let [a, b] = samples;
     // Even an unbanked hill twists a shoulder: its inner edge climbs while
     // its outer edge stays on the terrain. Bound that vertical error as well.
-    let height_change =
-        (edge(b, side * b.width * 0.5, 0.).y - edge(a, side * a.width * 0.5, 0.).y).abs();
+    let height_change = (b.edge_height(side) - a.edge_height(side)).abs();
     // Curved cross-sections bow away from the straight triangle edges.
     // On a high shoulder even a few millimetres of horizontal displacement
     // becomes a visible height error, proportional to its downhill slope.
-    let frame_change = a.forward.distance(b.forward).max(a.right.distance(b.right));
-    let shoulder_slope = [a, b]
-        .into_iter()
-        .map(|s| {
-            (edge(s, side * s.width * 0.5, 0.).y - ground).abs() / (12.0 * s.right.xz().length())
-        })
-        .fold(0.0_f32, f32::max);
-    let curve_error =
-        frame_change.powi(2) * (a.width.max(b.width) * 0.5 + 12.0) * 0.25 * shoulder_slope;
+    let curve_error = shoulder_curve_error(a, b, &[side], ground);
     let steps = surface_steps(a, b)
         .max((height_change / 0.08).ceil() as usize)
         .max((curve_error / 0.01).sqrt().ceil() as usize);
     for step in 0..steps {
         let start = surface_sample(track, a, b, step as f32 / steps as f32);
         let end = surface_sample(track, a, b, (step + 1) as f32 / steps as f32);
-        let mut far_start = edge(start, side * (start.width * 0.5 + 12.), 0.);
-        let mut far_end = edge(end, side * (end.width * 0.5 + 12.), 0.);
+        let mut far_start = edge(start, side * (start.width * 0.5 + SHOULDER_WIDTH), 0.);
+        let mut far_end = edge(end, side * (end.width * 0.5 + SHOULDER_WIDTH), 0.);
         far_start.y = ground;
         far_end.y = ground;
         builder.quad(
@@ -300,7 +291,7 @@ impl<'a> TreeExclusion<'a> {
             max = max.max(sample.pos.xz());
             half_width = half_width.max(sample.width * 0.5);
         }
-        let padding = Vec2::splat(half_width + 12.0);
+        let padding = Vec2::splat(half_width + SHOULDER_WIDTH);
         Self {
             samples,
             min: min - padding,
@@ -319,7 +310,7 @@ impl<'a> TreeExclusion<'a> {
             let span = pair[1].pos.xz() - a;
             let t = ((position - a).dot(span) / span.length_squared().max(f32::EPSILON))
                 .clamp(0.0, 1.0);
-            let clearance = pair[0].width.max(pair[1].width) * 0.5 + 12.0 + radius;
+            let clearance = pair[0].width.max(pair[1].width) * 0.5 + SHOULDER_WIDTH + radius;
             position.distance_squared(a + span * t) > clearance * clearance
         })
     }
@@ -560,23 +551,23 @@ impl World {
                             Color::new(0.65, 0.70, 0.64, 1.),
                         );
                         b.quad(
-                            edge(a, side * (w + 0.20), 1.0),
+                            edge(a, side * (w + RAIL_FACE_OFFSET), 1.0),
                             edge(a, side * (w + 0.35), 1.0),
                             edge(z, side * (wz + 0.35), 1.0),
-                            edge(z, side * (wz + 0.20), 1.0),
+                            edge(z, side * (wz + RAIL_FACE_OFFSET), 1.0),
                             CREAM,
                         );
                     }
                 }
                 if a.kind == RoadKind::Tunnel {
-                    for j in 0..10 {
-                        let t = j as f32 / 10. * std::f32::consts::PI;
-                        let u = (j + 1) as f32 / 10. * std::f32::consts::PI;
+                    for j in 0..TUNNEL_ARCH_PANELS {
+                        let t = tunnel_arch_angle(j);
+                        let u = tunnel_arch_angle(j + 1);
                         let arch = |s: RoadSample, angle: f32| {
                             edge(
                                 s,
-                                angle.cos() * (s.width * 0.5 + 0.65),
-                                1. + angle.sin() * 5.2,
+                                angle.cos() * (s.width * 0.5 + TUNNEL_ARCH_SIDE_CLEARANCE),
+                                TUNNEL_ARCH_SPRING + angle.sin() * TUNNEL_ARCH_RISE,
                             )
                         };
                         let tone = 0.60 + 0.12 * t.sin();
@@ -654,7 +645,11 @@ impl World {
                 if i % 4 == 0 && matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
                     for side in [-1., 1.] {
                         let seed = i as u32 * 17 + if side > 0. { 11 } else { 79 };
-                        let p = edge(a, side * (w + 15. + noise(seed) * 34.), 0.);
+                        let p = edge(
+                            a,
+                            side * (w + (SHOULDER_WIDTH + 3.) + noise(seed) * 34.),
+                            0.,
+                        );
                         let pos = vec3(p.x, ground_y, p.z);
                         let height = 5. + noise(seed + 7) * 8.;
                         // Keep the entire tree outside nearby road shoulders,
@@ -840,12 +835,13 @@ impl World {
     }
 }
 fn roadside_sign(b: &mut Builder, s: RoadSample, ground_y: f32, side: f32) {
-    let mut p = edge(s, side * (s.width * 0.5 + 9.), 0.);
-    // Signs stand three quarters of the way across the 12 m shoulder.
-    // Its surface descends to terrain, even when the road climbs or banks;
-    // a fixed offset from the road plane would leave the sign floating.
+    // Signs stand three quarters of the way across the shoulder. Its
+    // surface descends to terrain, even when the road climbs or banks; a
+    // fixed offset from the road plane would leave the sign floating.
+    let across = 0.75;
+    let mut p = edge(s, side * (s.width * 0.5 + SHOULDER_WIDTH * across), 0.);
     let road_edge_y = edge(s, side * s.width * 0.5, 0.).y;
-    p.y = road_edge_y + (ground_y - road_edge_y) * 0.75 + 0.45;
+    p.y = road_edge_y + (ground_y - road_edge_y) * across + 0.45;
     b.block(
         p + Vec3::Y * 0.65,
         s.right,
@@ -998,6 +994,73 @@ void main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vertex and index counts, an exact bit digest, and the summed distance
+    /// of every vertex from the course's first sample for all scenery.
+    fn scenery_summary(track: &Track) -> (usize, usize, u64, f64) {
+        let origin = track.samples[0].pos;
+        let mut vertices = 0;
+        let mut indices = 0;
+        let mut digest = 0xcbf29ce484222325u64;
+        let mut spread = 0.0_f64;
+        for chunk in World::build_chunks(track) {
+            vertices += chunk.mesh.vertices.len();
+            indices += chunk.mesh.indices.len();
+            for vertex in &chunk.mesh.vertices {
+                let p = vertex.position;
+                spread += f64::from(p.distance(origin));
+                let words = [
+                    p.x.to_bits(),
+                    p.y.to_bits(),
+                    p.z.to_bits(),
+                    u32::from_le_bytes(vertex.color),
+                ];
+                for word in words {
+                    digest = (digest ^ u64::from(word)).wrapping_mul(0x100000001b3);
+                }
+            }
+            for &index in &chunk.mesh.indices {
+                digest = (digest ^ u64::from(index)).wrapping_mul(0x100000001b3);
+            }
+        }
+        (vertices, indices, digest, spread)
+    }
+
+    /// Shoulders, rails and the tunnel arch take their geometry from
+    /// track.rs, which physics shares. The reference values were recorded
+    /// before that geometry moved there, when every vertex was bit-identical
+    /// (the printed digests match on the recording platform). The tolerances
+    /// allow only for last-bit differences in other platforms' sin and cos.
+    #[test]
+    fn bundled_scenery_matches_its_reference_geometry() {
+        for (path, reference_vertices, reference_indices, reference_spread) in [
+            ("tracks/alpine.track", 126760, 168828, 132780694.644),
+            ("tracks/club.track", 56232, 75912, 20680361.553),
+            ("tracks/camber_loop.track", 89618, 120108, 35141303.648),
+            ("tracks/ridgeway.track", 108332, 144516, 69842010.113),
+            ("tracks/stone_gallery.track", 105022, 146988, 93450544.123),
+            ("tracks/airfield.track", 90564, 118752, 74084725.105),
+            ("tracks/skyline_eight.track", 76808, 104334, 25383067.657),
+        ] {
+            let track = Track::load(path).unwrap();
+            let (vertices, indices, digest, spread) = scenery_summary(&track);
+            println!("{path}: {vertices} vertices, {indices} indices, digest {digest:016x}");
+            let close =
+                |actual: usize, reference: usize| actual.abs_diff(reference) * 1000 <= reference;
+            assert!(
+                close(vertices, reference_vertices),
+                "{path}: {vertices} vertices"
+            );
+            assert!(
+                close(indices, reference_indices),
+                "{path}: {indices} indices"
+            );
+            assert!(
+                (spread - reference_spread).abs() <= reference_spread * 0.00001,
+                "{path}: vertex spread {spread:.3}"
+            );
+        }
+    }
 
     fn road_mesh(track: &Track) -> Mesh {
         let mut builder = Builder::new();
@@ -1215,7 +1278,11 @@ mod tests {
             let sample = track.sample_at(20.0 + step as f32 / 40.0);
             for side in [-1.0, 1.0] {
                 for fraction in [0.2, 0.5, 0.8] {
-                    let point = edge(sample, side * (sample.width * 0.5 + 12.0 * fraction), 0.0);
+                    let point = edge(
+                        sample,
+                        side * (sample.width * 0.5 + SHOULDER_WIDTH * fraction),
+                        0.0,
+                    );
                     let road_edge = edge(sample, side * sample.width * 0.5, 0.0);
                     let contact_y = road_edge.y + (ground - road_edge.y) * fraction;
                     let rendered_y = triangle_height(&mesh, point).unwrap();
@@ -1246,8 +1313,11 @@ mod tests {
                 for fraction in [0.2, 0.5, 0.8] {
                     for t in [0.25, 0.5, 0.75] {
                         let sample = surface_sample(&track, pair[0], pair[1], t);
-                        let point =
-                            edge(sample, side * (sample.width * 0.5 + 12.0 * fraction), 0.0);
+                        let point = edge(
+                            sample,
+                            side * (sample.width * 0.5 + SHOULDER_WIDTH * fraction),
+                            0.0,
+                        );
                         let edge_y = edge(sample, side * sample.width * 0.5, 0.0).y;
                         let expected = edge_y + (ground - edge_y) * fraction;
                         let actual = chunks
