@@ -16,7 +16,8 @@ banked corners, and airborne jumps affect how the car moves.
 
 ## Run on Windows, Linux, or macOS
 
-Install a current stable [Rust toolchain](https://rust-lang.org/tools/install/).
+Install a current stable [Rust toolchain](https://rust-lang.org/tools/install/)
+(Rust 1.89 or newer; run `rustup update` if an older toolchain is installed).
 The renderer uses Macroquad and OpenGL; playing requires a graphical desktop
 and an OpenGL 2.1-capable graphics driver.
 
@@ -84,10 +85,51 @@ To run the built executable from the project directory, use
 ### First launch
 
 Press **Enter** to start. The first build downloads and compiles the Rust
-dependencies; subsequent starts are faster. Run from the project directory so
-the game can find the bundled `tracks/` folder and save records in `data/`.
-When copying a build to another computer, include `tracks/` and launch from
-the directory containing it.
+dependencies; subsequent starts are faster.
+
+The game uses one **game folder** for the bundled courses and saved records.
+It is the first of these that contains a `tracks/` folder holding all seven
+bundled `.track` files:
+
+1. the current working directory;
+2. the directory containing the executable;
+3. each parent of that directory, nearest first. This is how
+   `target/release/apex-road` (or `target\release\apex-road.exe`
+   double-clicked in Explorer) finds the checkout that built it.
+
+If none of them has all seven, the first that has any of them is used, and
+**Tab** skips the courses that are missing.
+
+Records are saved in that game folder's `data/` directory, so running from the
+project directory, from `target/release/`, or through `cargo run` all share the
+same records, and `cargo clean` does not delete them. If no game folder is
+found, records are saved in `data/` next to the executable.
+
+Track paths you type on the command line are relative to the current
+directory, like any other command-line path, and are never looked up anywhere
+else. The one exception is a bundled path such as `tracks/club.track`: if no
+such file exists in the current directory, the copy in the game folder is used.
+A track that cannot be found is reported with every location that was checked.
+A `tracks/club.track` in the current directory therefore overrides the bundled
+course of the same name.
+
+### Copying a build
+
+To play on another computer, copy the executable together with `tracks/`,
+`LICENSE`, and `assets/DejaVuSans-LICENSE.txt`, keeping their relative layout:
+
+```text
+apex-road/
+  apex-road(.exe)
+  LICENSE
+  assets/DejaVuSans-LICENSE.txt
+  tracks/*.track
+```
+
+The DejaVu Sans font is built into the executable, and its license requires
+that notice to accompany every copy. Because the game folder includes the
+executable's directory, the copy can be launched from anywhere, including by
+double-clicking it; records are created in `data/` beside it.
 
 ## Drive
 
@@ -104,7 +146,7 @@ the directory containing it.
 | Space | Handbrake |
 | R | Restart the current time trial |
 | U | Toggle US / metric HUD units |
-| Esc | Pause / resume |
+| Esc | Close the control guide if it is open; otherwise pause / resume |
 | F1 | Show / hide the control guide |
 | F5 | Reload the current track file |
 | Tab | Switch to the next bundled track |
@@ -124,29 +166,58 @@ pedal pressure, then hold it still to keep those inputs. Move back in the
 opposite direction to straighten the wheel or ease off a pedal. Throttle and
 braking share one range, passing through neutral before the other pedal
 engages. The gauge cluster shows the current steering, throttle, and brake.
+The steering dot shows your steering input across its whole range at any
+speed (the wheels themselves turn less as speed rises), so centring it finds
+neutral.
 
 Right click switches between mouse and keyboard driving. Mouse mode replaces
 the keyboard steering and pedals; **Space** and the other shortcuts still
 work. Toggling modes, restarting, changing tracks, or pausing clears mouse
 inputs. The cursor is released while paused, in the control guide, or at the
-finish; resume with neutral controls. Switching away from the game also pauses
-mouse driving and releases the cursor. The active input method and right-click
-hint stay below the gauges.
+finish; resume with neutral controls. Switching away from the game pauses a
+run in progress with either input method and releases the cursor. The click
+that brings the window back to the front does not toggle mouse driving. The
+active input method and right-click hint stay below the gauges.
 
 Brake before a tight corner, ease off as you turn, and feed the throttle back
 in on the exit. The orange traction indicator shows when the car is losing
 grip; the throttle, brake, steering, and engine indicators show your inputs.
-Use the handbrake sparingly—it makes the rear tires easier to slide.
+At full throttle the tachometer reaches its orange redline near the top of
+each gear. Use the handbrake sparingly—it makes the rear tires easier to slide.
 
-Pass the course checkpoints **in order**, then cross the finish. The gauge
-cluster stays low in the windshield, with the timer, checkpoint progress, and
-course map above. A run that misses a checkpoint cannot set a record.
+Pass the course checkpoints **in order**, on the road, then cross the finish.
+The gauge cluster stays low in the windshield, with the timer, checkpoint
+progress, and course map above. A lap or run is invalid and cannot set a
+record if it:
 
-Best times are saved under `./data/`, keyed by the track file's contents.
-Editing a track starts a separate record history for that version. Restarting
-a run resets its timer and checkpoint progress.
+- **Misses a checkpoint:** skips a gate, or passes a gate or the finish off the
+  paved road.
+- **Goes the wrong way:** reverses back across the start line during a lap. The
+  lap restarts when you cross the line forwards again. Rolling back off the
+  grid before you get going does not count.
+- **Cuts the course:** gains more than 30 m of course distance off the paved
+  road (the car's centre beyond the road edge) before driving the same distance
+  back on the road, more than 60 m off the road in total during a lap or run,
+  or skips ahead along the course in a single jump. Brief wheel drops and short
+  slides are forgiven; crossing an infield or the inside of a bend is not.
+  Flying over a `gap` counts as driving the course; landing in it does not. A sprint that lands past its finish in such a jump ends
+  there as an invalid run.
+
+The banner above the gauges and the finish panel name the reason.
+
+Best times are saved in the game folder's `data/` directory (see
+[First launch](#first-launch)) as `data/<hash>-v2.best`. The hash identifies
+the track file's contents, so editing a track starts a separate record history
+for that version. The `v2` is the record version: it changes whenever the
+car's handling or timing changes enough that older times are no longer
+comparable, and records from other versions are ignored (they stay on disk).
+Restarting a run resets its timer and checkpoint progress.
 Track identity includes line endings and any byte-order mark; Git keeps the
 bundled `.track` files as LF on all three platforms to preserve their record keys.
+
+If another copy of the game is saving the same record, the save waits briefly,
+then reports that the record could not be saved instead of freezing the game;
+the next finished run tries again.
 
 ## Bundled courses
 
@@ -240,14 +311,19 @@ grammar, examples, limits, and track-design notes.
 
 | Argument | Purpose |
 | --- | --- |
-| `--track PATH` | Load a specific `.track` file |
-| `--validate PATH` | Parse and check a track without opening a window |
-| `--smoke-test` | Run a 240-frame automated driving demo, then exit |
+| `--track PATH` | Load a specific `.track` file (default `tracks/alpine.track`) |
+| `PATH` | Same as `--track PATH` |
+| `--validate PATH` | Parse and check a track without opening a window; prints the checked file's full path |
+| `--smoke-test` | Run automated driving and exit after 240 frames (or after `--frames N`, in either order) |
 | `--autodrive` | Enable automated driving on the current course |
 | `--demo` | Auto-drive all bundled courses in sequence, looping indefinitely |
-| `--frames N` | Exit after a specified number of rendered frames |
+| `--frames N` | Exit after N rendered frames; N must be a positive integer |
 | `--at METERS` | Begin the preview at a distance along the track |
-| `--capture PATH` | Write a PNG screenshot |
+| `--capture PATH` | Write a PNG screenshot of the final frame, after 30 frames unless `--frames` or `--smoke-test` is given |
+
+Only one track path may be given: `--validate a.track --track b.track` is an
+error rather than silently checking `b.track`. See [First launch](#first-launch)
+for how relative track paths are resolved.
 
 Validate example bundled tracks without a display:
 

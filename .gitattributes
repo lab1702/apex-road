@@ -1,2 +1,9 @@
+# Store text with LF line endings in the repository.
+* text=auto
+
 # Record identities hash track contents; keep bundled files identical on every OS.
 *.track text eol=lf
+
+# Never let line-ending conversion or diffs touch binary assets.
+*.ttf binary
+*.png binary

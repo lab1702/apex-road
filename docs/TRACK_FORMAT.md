@@ -2,11 +2,18 @@
 
 Tracks are UTF-8 `.track` files containing one road-building command per line.
 Both LF and Windows CRLF line endings are accepted, with or without an initial
-UTF-8 byte-order mark. Save as UTF-8, not UTF-16.
+UTF-8 byte-order mark. Save as UTF-8, not UTF-16 (Notepad's "Unicode"); UTF-16
+files are rejected with a message saying so. CR-only line endings (classic Mac)
+are rejected too, because they would otherwise merge the file into one line.
 Use `#` for comments and optional double quotes for names or descriptions.
 Commands are lowercase. Distances are **metres** and angles are **degrees**.
 Numbers can be negative or decimal where appropriate; `NaN` and infinity are
-rejected. Parse errors identify the source line.
+rejected. Parse errors begin with `Line N:` to identify the source line. Checks
+made after the whole file is read name the most relevant line: the first road
+command for a start in a gap, the last road command for a finish in a gap, or
+the final checkpoint for one too close to the finish. Errors that no single
+line causes begin with `Whole course:` instead, for example a route shorter
+than 20 m. File-level problems, such as size or encoding, name the file.
 
 The road begins at `(0, 0, 0)`, pointing along `+Z`. `+Y` is up and `+X` is
 initially right. Road width defaults to 12 m. Commands continue from the exact
@@ -42,9 +49,9 @@ road kinds, multiple jumps, and a grade-separated figure-eight crossing.
 
 | Command | Meaning |
 | --- | --- |
-| `name "Name"` | Display name. Quotes are optional for plain text. |
-| `description "Text"` | Short course description. |
-| `start x y z [heading]` | Initial position and heading, before any road commands. Heading 0 faces +Z; 90 faces +X. |
+| `name "Name"` | Display name. Quotes are optional for plain text. It cannot be empty or only spaces. |
+| `description "Text"` | Short course description. It cannot be empty or only spaces. |
+| `start x y z [heading]` | Initial position and heading, before any road commands. Heading is -360 to 360 degrees; 0 faces +Z and 90 faces +X. |
 | `width metres` | Target width for subsequent road. A change blends smoothly across the next road command. |
 | `straight length [options]` | Straight road with the supplied horizontal length. |
 | `left angle radius metres [options]` | Constant-radius left turn. |
@@ -64,12 +71,22 @@ Each road-building command accepts these optional pairs in any order:
 | --- | --- |
 | `rise height` | Elevation change over this command; defaults to 0. Negative values descend. |
 | `bank angle` | Target banking angle at the end of this command; defaults to the current bank. |
-| `kind type` | Override this command's road kind, including on a curve. |
+| `kind type` | Override this command's road kind, including on a curve. Not allowed on `ramp` or `gap`. |
 
 An explicit `kind` option applies to that command only. Likewise, `bridge 80`
 creates one bridge segment and does not change the default kind. To make a
 curved bridge, write `right 45 radius 100 kind bridge`, or use `kind bridge`
-before several commands and `kind road` afterward.
+before several commands and `kind road` afterward. `ramp` and `gap` always
+build their own kind, so a `kind` option on them is an error rather than
+silently removing the launch slope or the break in the road; for a curved gap,
+write `left 10 radius 80 kind gap`.
+
+The default kind applies to every following `straight`, `left` and `right`.
+After `kind ramp`, each of them is a ramp and needs a positive `rise`; after
+`kind gap`, each of them is a gap. Switch back with `kind road`.
+
+`width` and `kind` only affect road built after them. Placing either after the
+last road command is an error naming its line, because it would have no effect.
 
 ## Hills, banking and jumps
 
@@ -122,7 +139,9 @@ and keeping the same 10 m clearance from the start and finish.
 
 `close` does **not** invent a connector or teleport the road. Before it, build
 back to within 0.25 m of the start with matching heading, slope, bank and width.
-The parser removes tiny rounding drift at the seam, provided this does not
+Matching means the road's forward and up directions at the endpoint each agree
+with those at the start to within about 2.6° (their dot products are at least
+0.999), and the widths differ by no more than 0.01 m. The parser removes tiny rounding drift at the seam, provided this does not
 collapse or reverse the final sampled segment or make its slope exceed 100%.
 A short, densely sampled final transition may need a more precise endpoint
 or a longer final command.

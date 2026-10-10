@@ -1,14 +1,63 @@
 name: Windows, Linux, and macOS
 
 on:
+  # Branch pushes from this repository are covered by their pull request;
+  # only main gets a push build of its own.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Supersede stale runs of the same PR or branch; never cancel builds of main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Keep in sync with rust-version in Cargo.toml.
+      MSRV: "1.89"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.MSRV }}
+        run: rustup toolchain install "$MSRV" --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check on the minimum supported Rust version
+        run: cargo "+$MSRV" check --locked --all-targets
+
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -30,11 +79,10 @@ jobs:
       run:
         shell: bash
     env:
-      CARGO_TERM_COLOR: always
       APEX_BINARY: target/${{ matrix.target }}/release/apex-road${{ matrix.extension }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -49,10 +97,12 @@ jobs:
       - name: Install stable Rust
         run: >-
           rustup toolchain install stable --profile minimal
-          --component rustfmt --component clippy --target ${{ matrix.target }}
+          --component clippy --target ${{ matrix.target }}
 
-      - name: Check formatting
-        run: cargo +stable fmt --all -- --check
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
         run: cargo +stable clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings

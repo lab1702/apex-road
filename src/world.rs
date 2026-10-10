@@ -1,5 +1,9 @@
 //! Procedural, vertex-lit scenery. Every road mesh comes from the same samples as physics.
-use crate::track::{RoadKind, RoadSample, Track};
+use crate::track::{
+    RAIL_FACE_OFFSET, RoadKind, RoadSample, SHOULDER_WIDTH, TUNNEL_ARCH_PANELS, TUNNEL_ARCH_RISE,
+    TUNNEL_ARCH_SIDE_CLEARANCE, TUNNEL_ARCH_SPRING, Track, deck_twist, frame_change,
+    shoulder_curve_error, tunnel_arch_angle,
+};
 use macroquad::miniquad::CullFace;
 use macroquad::prelude::*;
 
@@ -10,25 +14,49 @@ const CREAM: Color = Color::new(0.91, 0.91, 0.82, 1.0);
 const RED: Color = Color::new(0.78, 0.28, 0.20, 1.0);
 const TEAL: Color = Color::new(0.13, 0.67, 0.64, 1.0);
 
+/// Hard per-mesh vertex limit. Meshes use 16-bit indices, and macroquad copies
+/// each one into a draw-call batch of `draw_call_vertex_capacity` (60,000).
+const MESH_VERTEX_LIMIT: usize = 60_000;
+const _: () = assert!(MESH_VERTEX_LIMIT <= u16::MAX as usize + 1);
+
 struct Builder {
     vertices: Vec<Vertex>,
     indices: Vec<u16>,
+    /// Meshes already closed because another primitive would have exceeded
+    /// `MESH_VERTEX_LIMIT`. Primitives never share vertices, so a split
+    /// between any two of them is always valid.
+    full: Vec<Mesh>,
 }
 impl Builder {
     fn new() -> Self {
         Self {
             vertices: vec![],
             indices: vec![],
+            full: vec![],
         }
     }
+    /// Index of the first of `count` new vertices, starting a fresh mesh if
+    /// they would not fit. A wrapped 16-bit index would silently stitch
+    /// triangles to the start of the mesh, so this can never truncate.
+    fn base_index(&mut self, count: usize) -> u16 {
+        if self.vertices.len() + count > MESH_VERTEX_LIMIT {
+            self.full.push(Mesh {
+                vertices: std::mem::take(&mut self.vertices),
+                indices: std::mem::take(&mut self.indices),
+                texture: None,
+            });
+        }
+        debug_assert!(self.vertices.len() + count <= u16::MAX as usize + 1);
+        u16::try_from(self.vertices.len()).expect("mesh vertices fit 16-bit indices")
+    }
     fn tri(&mut self, a: Vec3, b: Vec3, c: Vec3, color: Color) {
-        let n = self.vertices.len() as u16;
+        let n = self.base_index(3);
         self.vertices
             .extend([a, b, c].map(|p| Vertex::new2(p, Vec2::ZERO, color)));
         self.indices.extend([n, n + 1, n + 2]);
     }
     fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3, color: Color) {
-        let n = self.vertices.len() as u16;
+        let n = self.base_index(4);
         self.vertices
             .extend([a, b, c, d].map(|p| Vertex::new2(p, Vec2::ZERO, color)));
         self.indices.extend([n, n + 1, n + 2, n, n + 2, n + 3]);
@@ -93,7 +121,22 @@ impl Builder {
             );
         }
     }
+    /// Every mesh built so far, each within `MESH_VERTEX_LIMIT`.
+    fn into_meshes(self) -> Vec<Mesh> {
+        let mut meshes = self.full;
+        if !self.vertices.is_empty() {
+            meshes.push(Mesh {
+                vertices: self.vertices,
+                indices: self.indices,
+                texture: None,
+            });
+        }
+        meshes
+    }
+    /// The single mesh of a builder known to stay below the split limit.
+    #[cfg(test)]
     fn finish(self) -> Mesh {
+        assert!(self.full.is_empty(), "builder split; use into_meshes");
         Mesh {
             vertices: self.vertices,
             indices: self.indices,
@@ -117,18 +160,14 @@ fn edge(s: RoadSample, x: f32, h: f32) -> Vec3 {
 // road far above its driving surface. Refine only twisted sections until the
 // diagonal's departure from the interpolated cross-section is below 2 cm.
 fn surface_steps(a: RoadSample, b: RoadSample) -> usize {
-    let normal = (a.up + b.up).normalize();
-    let span_change = b.right * b.width - a.right * a.width;
-    let twist = span_change.dot(normal).abs() * 0.25;
-    ((twist / 0.02).ceil().max(1.0) as usize).max(frame_steps(a, b))
+    ((deck_twist(a, b) / 0.02).ceil().max(1.0) as usize).max(frame_steps(a, b))
 }
 
 fn frame_steps(a: RoadSample, b: RoadSample) -> usize {
     // A banked hill can curve the road edges without twisting them relative
     // to the average normal. Bound frame changes too: otherwise a straight
     // chord cuts far inside the unit frame used by the driving surface.
-    let change = a.forward.distance(b.forward).max(a.right.distance(b.right));
-    (change / 0.05).ceil().max(1.0) as usize
+    (frame_change(a, b) / 0.05).ceil().max(1.0) as usize
 }
 
 fn surface_sample(track: &Track, a: RoadSample, b: RoadSample, t: f32) -> RoadSample {
@@ -167,28 +206,19 @@ fn shoulder_segment(
     let [a, b] = samples;
     // Even an unbanked hill twists a shoulder: its inner edge climbs while
     // its outer edge stays on the terrain. Bound that vertical error as well.
-    let height_change =
-        (edge(b, side * b.width * 0.5, 0.).y - edge(a, side * a.width * 0.5, 0.).y).abs();
+    let height_change = (b.edge_height(side) - a.edge_height(side)).abs();
     // Curved cross-sections bow away from the straight triangle edges.
     // On a high shoulder even a few millimetres of horizontal displacement
     // becomes a visible height error, proportional to its downhill slope.
-    let frame_change = a.forward.distance(b.forward).max(a.right.distance(b.right));
-    let shoulder_slope = [a, b]
-        .into_iter()
-        .map(|s| {
-            (edge(s, side * s.width * 0.5, 0.).y - ground).abs() / (12.0 * s.right.xz().length())
-        })
-        .fold(0.0_f32, f32::max);
-    let curve_error =
-        frame_change.powi(2) * (a.width.max(b.width) * 0.5 + 12.0) * 0.25 * shoulder_slope;
+    let curve_error = shoulder_curve_error(a, b, &[side], ground);
     let steps = surface_steps(a, b)
         .max((height_change / 0.08).ceil() as usize)
         .max((curve_error / 0.01).sqrt().ceil() as usize);
     for step in 0..steps {
         let start = surface_sample(track, a, b, step as f32 / steps as f32);
         let end = surface_sample(track, a, b, (step + 1) as f32 / steps as f32);
-        let mut far_start = edge(start, side * (start.width * 0.5 + 12.), 0.);
-        let mut far_end = edge(end, side * (end.width * 0.5 + 12.), 0.);
+        let mut far_start = edge(start, side * (start.width * 0.5 + SHOULDER_WIDTH), 0.);
+        let mut far_end = edge(end, side * (end.width * 0.5 + SHOULDER_WIDTH), 0.);
         far_start.y = ground;
         far_end.y = ground;
         builder.quad(
@@ -204,7 +234,7 @@ fn shoulder_segment(
 fn checkerboard(track: &Track, distance: f32) -> Vec<Mesh> {
     let mut meshes = Vec::new();
     let mut builder = Builder::new();
-    for pair in track.samples.windows(2) {
+    for pair in track.samples().windows(2) {
         let [a, b] = [pair[0], pair[1]];
         if b.distance <= distance || a.distance >= distance + 1.4 || a.kind == RoadKind::Gap {
             continue;
@@ -222,9 +252,10 @@ fn checkerboard(track: &Track, distance: f32) -> Vec<Mesh> {
                 let front = track.sample_at(front);
                 let back = track.sample_at(back);
                 // Rapid banks can require thousands of small squares. Keep
-                // each mesh below both the u16 index and renderer batch limits.
+                // whole rows together in modest, separately culled meshes;
+                // the builder itself enforces the hard index limit.
                 if builder.vertices.len() + 64 > 16_000 {
-                    meshes.push(std::mem::replace(&mut builder, Builder::new()).finish());
+                    meshes.extend(std::mem::replace(&mut builder, Builder::new()).into_meshes());
                 }
                 for x in 0..16 {
                     let left = x as f32 / 16.0 - 0.5;
@@ -241,9 +272,7 @@ fn checkerboard(track: &Track, distance: f32) -> Vec<Mesh> {
             }
         }
     }
-    if !builder.vertices.is_empty() {
-        meshes.push(builder.finish());
-    }
+    meshes.extend(builder.into_meshes());
     meshes
 }
 
@@ -262,7 +291,7 @@ impl<'a> TreeExclusion<'a> {
             max = max.max(sample.pos.xz());
             half_width = half_width.max(sample.width * 0.5);
         }
-        let padding = Vec2::splat(half_width + 12.0);
+        let padding = Vec2::splat(half_width + SHOULDER_WIDTH);
         Self {
             samples,
             min: min - padding,
@@ -281,7 +310,7 @@ impl<'a> TreeExclusion<'a> {
             let span = pair[1].pos.xz() - a;
             let t = ((position - a).dot(span) / span.length_squared().max(f32::EPSILON))
                 .clamp(0.0, 1.0);
-            let clearance = pair[0].width.max(pair[1].width) * 0.5 + 12.0 + radius;
+            let clearance = pair[0].width.max(pair[1].width) * 0.5 + SHOULDER_WIDTH + radius;
             position.distance_squared(a + span * t) > clearance * clearance
         })
     }
@@ -310,14 +339,76 @@ impl Chunk {
         }
     }
 
-    fn visible_from(&self, position: Vec3) -> bool {
+    fn within_draw_distance(&self, position: Vec3) -> bool {
         // Tall supports and sloping shoulders can be close to the camera even
         // when the road deck is far away. Cull only when the entire bounds are.
+        self.distant
+            || position.distance_squared(position.clamp(self.min, self.max))
+                < DRAW_DISTANCE * DRAW_DISTANCE
+    }
+
+    fn visible(&self, frustum: &Frustum) -> bool {
         !self.mesh.vertices.is_empty()
-            && (self.distant
-                || position.distance_squared(position.clamp(self.min, self.max)) < 900. * 900.)
+            && frustum.intersects(self.min, self.max)
+            && self.within_draw_distance(frustum.eye)
     }
 }
+
+/// Exponential-squared haze: `1 - exp(-d² · FOG_DENSITY)`, capped at `FOG_LIMIT`.
+const FOG_DENSITY: f32 = 0.000_001_1;
+const FOG_LIMIT: f32 = 0.97;
+/// Course scenery is culled where the haze reaches its cap (about 1,784 m).
+/// The fragment shader dissolves it between `FADE_START` and this distance,
+/// so culling a chunk whose bounds lie entirely beyond it changes no pixel,
+/// even against the darker upper sky that the haze colour does not match.
+const DRAW_DISTANCE: f32 = 1_800.;
+const FADE_START: f32 = 1_400.;
+/// Disables the dissolve for terrain, mountains and course landmarks.
+const NO_FADE: Vec2 = Vec2::new(1.0e9, 2.0e9);
+const _: () = assert!(FADE_START < DRAW_DISTANCE && DRAW_DISTANCE < NO_FADE.x);
+/// Slack for floating-point error in the extracted planes, in metres.
+const FRUSTUM_MARGIN: f32 = 4.;
+
+/// Conservative view-volume test. The planes come straight from the matrix
+/// used to render, so FOV, aspect, pitch, roll and the far plane are exact.
+struct Frustum {
+    eye: Vec3,
+    /// Inward-facing unit planes, relative to `eye` so offsets stay small
+    /// even at large track coordinates.
+    planes: [Vec4; 6],
+}
+impl Frustum {
+    fn new(view_projection: Mat4, eye: Vec3) -> Self {
+        let m = view_projection * Mat4::from_translation(eye);
+        let [x, y, z, w] = [m.row(0), m.row(1), m.row(2), m.row(3)];
+        let planes = [w + x, w - x, w + y, w - y, w + z, w - z]
+            .map(|plane| plane / plane.truncate().length().max(f32::EPSILON));
+        Self { eye, planes }
+    }
+
+    /// False only when the whole box is outside one clipping plane.
+    fn intersects(&self, min: Vec3, max: Vec3) -> bool {
+        let (min, max) = (min - self.eye, max - self.eye);
+        self.planes.iter().all(|plane| {
+            let normal = plane.truncate();
+            // The corner farthest along the inward normal.
+            let corner = Vec3::select(normal.cmpge(Vec3::ZERO), max, min);
+            // The far plane's normal is a difference of nearly equal f32
+            // terms, so its offset is only good to ~0.2%; allow 1%. Side
+            // planes pass through the eye, so their offsets are near zero.
+            normal.dot(corner) + plane.w >= -(FRUSTUM_MARGIN + plane.w.abs() * 0.01)
+        })
+    }
+}
+fn push_chunks(chunks: &mut Vec<Chunk>, builder: Builder, distant: bool) {
+    chunks.extend(
+        builder
+            .into_meshes()
+            .into_iter()
+            .map(|mesh| Chunk::new(mesh, distant)),
+    );
+}
+
 pub struct World {
     chunks: Vec<Chunk>,
     material: Material,
@@ -336,7 +427,11 @@ impl World {
                     cull_face: CullFace::Nothing,
                     ..Default::default()
                 },
-                uniforms: vec![UniformDesc::new("Eye", UniformType::Float3)],
+                uniforms: vec![
+                    UniformDesc::new("Eye", UniformType::Float3),
+                    UniformDesc::new("Fog", UniformType::Float2),
+                    UniformDesc::new("Fade", UniformType::Float2),
+                ],
                 ..Default::default()
             },
         )
@@ -354,18 +449,18 @@ impl World {
 
     fn build_chunks(track: &Track) -> Vec<Chunk> {
         let ground_y = track.ground_height();
-        let tree_exclusions: Vec<_> = (0..track.samples.len() - 1)
+        let tree_exclusions: Vec<_> = (0..track.samples().len() - 1)
             .step_by(48)
             .map(|first| {
                 TreeExclusion::new(
-                    &track.samples[first..=(first + 48).min(track.samples.len() - 1)],
+                    &track.samples()[first..=(first + 48).min(track.samples().len() - 1)],
                 )
             })
             .collect();
         let mut chunks = vec![];
         // Road, shoulders and architecture are spatially batched for cheap distance culling.
         for (chunk_index, points) in track
-            .samples
+            .samples()
             .windows(2)
             .collect::<Vec<_>>()
             .chunks(48)
@@ -456,23 +551,23 @@ impl World {
                             Color::new(0.65, 0.70, 0.64, 1.),
                         );
                         b.quad(
-                            edge(a, side * (w + 0.20), 1.0),
+                            edge(a, side * (w + RAIL_FACE_OFFSET), 1.0),
                             edge(a, side * (w + 0.35), 1.0),
                             edge(z, side * (wz + 0.35), 1.0),
-                            edge(z, side * (wz + 0.20), 1.0),
+                            edge(z, side * (wz + RAIL_FACE_OFFSET), 1.0),
                             CREAM,
                         );
                     }
                 }
                 if a.kind == RoadKind::Tunnel {
-                    for j in 0..10 {
-                        let t = j as f32 / 10. * std::f32::consts::PI;
-                        let u = (j + 1) as f32 / 10. * std::f32::consts::PI;
+                    for j in 0..TUNNEL_ARCH_PANELS {
+                        let t = tunnel_arch_angle(j);
+                        let u = tunnel_arch_angle(j + 1);
                         let arch = |s: RoadSample, angle: f32| {
                             edge(
                                 s,
-                                angle.cos() * (s.width * 0.5 + 0.65),
-                                1. + angle.sin() * 5.2,
+                                angle.cos() * (s.width * 0.5 + TUNNEL_ARCH_SIDE_CLEARANCE),
+                                TUNNEL_ARCH_SPRING + angle.sin() * TUNNEL_ARCH_RISE,
                             )
                         };
                         let tone = 0.60 + 0.12 * t.sin();
@@ -499,7 +594,7 @@ impl World {
                     if i % 8 == 0 {
                         arch_rib(&mut b, a);
                     }
-                    if i == 0 || track.samples[i - 1].kind != RoadKind::Tunnel {
+                    if i == 0 || track.samples()[i - 1].kind != RoadKind::Tunnel {
                         arch_rib(&mut b, a);
                     }
                 }
@@ -550,7 +645,11 @@ impl World {
                 if i % 4 == 0 && matches!(a.kind, RoadKind::Road | RoadKind::Ramp) {
                     for side in [-1., 1.] {
                         let seed = i as u32 * 17 + if side > 0. { 11 } else { 79 };
-                        let p = edge(a, side * (w + 15. + noise(seed) * 34.), 0.);
+                        let p = edge(
+                            a,
+                            side * (w + (SHOULDER_WIDTH + 3.) + noise(seed) * 34.),
+                            0.,
+                        );
                         let pos = vec3(p.x, ground_y, p.z);
                         let height = 5. + noise(seed + 7) * 8.;
                         // Keep the entire tree outside nearby road shoulders,
@@ -568,15 +667,18 @@ impl World {
                     roadside_sign(&mut b, a, ground_y, side);
                 }
                 // Width changes on a bank can require many shoulder slices.
-                // Split those dense runs before adding another source segment.
-                if b.vertices.len() >= 16_000 {
-                    chunks.push(Chunk::new(
-                        std::mem::replace(&mut b, Builder::new()).finish(),
+                // Split those dense runs before adding another source segment;
+                // the builder splits within a segment that alone exceeds the
+                // index limit.
+                if b.vertices.len() >= 16_000 || !b.full.is_empty() {
+                    push_chunks(
+                        &mut chunks,
+                        std::mem::replace(&mut b, Builder::new()),
                         false,
-                    ));
+                    );
                 }
             }
-            chunks.push(Chunk::new(b.finish(), false));
+            push_chunks(&mut chunks, b, false);
         }
         let mut gates = Builder::new();
         // Circuits share the start gate at the seam; only sprints need a
@@ -626,17 +728,17 @@ impl World {
                 );
             }
             if idx % 32 == 31 {
-                chunks.push(Chunk::new(gates.finish(), true));
+                push_chunks(&mut chunks, gates, true);
                 gates = Builder::new();
             }
         }
-        chunks.push(Chunk::new(gates.finish(), true));
+        push_chunks(&mut chunks, gates, true);
         let min = track
-            .samples
+            .samples()
             .iter()
             .fold(Vec3::splat(f32::MAX), |a, s| a.min(s.pos));
         let max = track
-            .samples
+            .samples()
             .iter()
             .fold(Vec3::splat(f32::MIN), |a, s| a.max(s.pos));
         let mid = (min + max) * 0.5;
@@ -659,7 +761,7 @@ impl World {
                 );
             }
         }
-        chunks.push(Chunk::new(ground.finish(), true));
+        push_chunks(&mut chunks, ground, true);
         // Rounded overlapping alpine ridges; deliberately outside the driving area.
         for k in 0..28u32 {
             let angle = k as f32 / 28. * std::f32::consts::TAU;
@@ -677,7 +779,7 @@ impl World {
                 100. + noise(k + 600) * 240.,
                 k,
             );
-            chunks.push(Chunk::new(b.finish(), true));
+            push_chunks(&mut chunks, b, true);
         }
         chunks
     }
@@ -706,11 +808,26 @@ impl World {
             );
         }
         set_camera(camera);
+        // macroquad copies every submitted mesh into a CPU batch each frame;
+        // skip whatever lies outside the view volume or the draw distance.
+        let frustum = Frustum::new(camera.matrix(), camera.position);
         self.material.set_uniform("Eye", camera.position);
+        self.material
+            .set_uniform("Fog", vec2(FOG_DENSITY, FOG_LIMIT));
         gl_use_material(&self.material);
-        for c in &self.chunks {
-            if c.visible_from(camera.position) {
-                draw_mesh(&c.mesh);
+        for distant in [false, true] {
+            // Uniforms are captured per draw call, so the dissolve applies
+            // only to the course scenery that is culled at the draw distance.
+            let fade = if distant {
+                NO_FADE
+            } else {
+                vec2(FADE_START, DRAW_DISTANCE)
+            };
+            self.material.set_uniform("Fade", fade);
+            for c in &self.chunks {
+                if c.distant == distant && c.visible(&frustum) {
+                    draw_mesh(&c.mesh);
+                }
             }
         }
         gl_use_default_material();
@@ -718,12 +835,13 @@ impl World {
     }
 }
 fn roadside_sign(b: &mut Builder, s: RoadSample, ground_y: f32, side: f32) {
-    let mut p = edge(s, side * (s.width * 0.5 + 9.), 0.);
-    // Signs stand three quarters of the way across the 12 m shoulder.
-    // Its surface descends to terrain, even when the road climbs or banks;
-    // a fixed offset from the road plane would leave the sign floating.
+    // Signs stand three quarters of the way across the shoulder. Its
+    // surface descends to terrain, even when the road climbs or banks; a
+    // fixed offset from the road plane would leave the sign floating.
+    let across = 0.75;
+    let mut p = edge(s, side * (s.width * 0.5 + SHOULDER_WIDTH * across), 0.);
     let road_edge_y = edge(s, side * s.width * 0.5, 0.).y;
-    p.y = road_edge_y + (ground_y - road_edge_y) * 0.75 + 0.45;
+    p.y = road_edge_y + (ground_y - road_edge_y) * across + 0.45;
     b.block(
         p + Vec3::Y * 0.65,
         s.right,
@@ -856,11 +974,20 @@ precision highp float;
 varying lowp vec4 color;
 varying highp vec3 world;
 uniform vec3 Eye;
+uniform vec2 Fog;
+uniform vec2 Fade;
+float bayer2(vec2 p) { return mod(2.0*p.x+3.0*p.y,4.0); }
 void main() {
     float d=length(world-Eye);
-    float fog=1.0-exp(-d*d*0.0000011);
+    if (d>Fade.x) {
+        // Ordered-dither dissolve: an opaque fade with no sorting.
+        vec2 cell=mod(floor(gl_FragCoord.xy),4.0);
+        float threshold=(4.0*bayer2(mod(cell,2.0))+bayer2(floor(cell*0.5))+0.5)/16.0;
+        if ((d-Fade.x)/(Fade.y-Fade.x)>=threshold) discard;
+    }
+    float fog=1.0-exp(-d*d*Fog.x);
     vec3 haze=vec3(0.72,0.84,0.86);
-    gl_FragColor=vec4(mix(color.rgb,haze,clamp(fog,0.0,0.97)),color.a);
+    gl_FragColor=vec4(mix(color.rgb,haze,clamp(fog,0.0,Fog.y)),color.a);
 }
 "#;
 
@@ -868,9 +995,76 @@ void main() {
 mod tests {
     use super::*;
 
+    /// Vertex and index counts, an exact bit digest, and the summed distance
+    /// of every vertex from the course's first sample for all scenery.
+    fn scenery_summary(track: &Track) -> (usize, usize, u64, f64) {
+        let origin = track.samples()[0].pos;
+        let mut vertices = 0;
+        let mut indices = 0;
+        let mut digest = 0xcbf29ce484222325u64;
+        let mut spread = 0.0_f64;
+        for chunk in World::build_chunks(track) {
+            vertices += chunk.mesh.vertices.len();
+            indices += chunk.mesh.indices.len();
+            for vertex in &chunk.mesh.vertices {
+                let p = vertex.position;
+                spread += f64::from(p.distance(origin));
+                let words = [
+                    p.x.to_bits(),
+                    p.y.to_bits(),
+                    p.z.to_bits(),
+                    u32::from_le_bytes(vertex.color),
+                ];
+                for word in words {
+                    digest = (digest ^ u64::from(word)).wrapping_mul(0x100000001b3);
+                }
+            }
+            for &index in &chunk.mesh.indices {
+                digest = (digest ^ u64::from(index)).wrapping_mul(0x100000001b3);
+            }
+        }
+        (vertices, indices, digest, spread)
+    }
+
+    /// Shoulders, rails and the tunnel arch take their geometry from
+    /// track.rs, which physics shares. The reference values were recorded
+    /// before that geometry moved there, when every vertex was bit-identical
+    /// (the printed digests match on the recording platform). The tolerances
+    /// allow only for last-bit differences in other platforms' sin and cos.
+    #[test]
+    fn bundled_scenery_matches_its_reference_geometry() {
+        for (path, reference_vertices, reference_indices, reference_spread) in [
+            ("tracks/alpine.track", 126760, 168828, 132780694.644),
+            ("tracks/club.track", 56232, 75912, 20680361.553),
+            ("tracks/camber_loop.track", 89618, 120108, 35141303.648),
+            ("tracks/ridgeway.track", 108332, 144516, 69842010.113),
+            ("tracks/stone_gallery.track", 105022, 146988, 93450544.123),
+            ("tracks/airfield.track", 90564, 118752, 74084725.105),
+            ("tracks/skyline_eight.track", 76808, 104334, 25383067.657),
+        ] {
+            let track = Track::load(path).unwrap();
+            let (vertices, indices, digest, spread) = scenery_summary(&track);
+            println!("{path}: {vertices} vertices, {indices} indices, digest {digest:016x}");
+            let close =
+                |actual: usize, reference: usize| actual.abs_diff(reference) * 1000 <= reference;
+            assert!(
+                close(vertices, reference_vertices),
+                "{path}: {vertices} vertices"
+            );
+            assert!(
+                close(indices, reference_indices),
+                "{path}: {indices} indices"
+            );
+            assert!(
+                (spread - reference_spread).abs() <= reference_spread * 0.00001,
+                "{path}: vertex spread {spread:.3}"
+            );
+        }
+    }
+
     fn road_mesh(track: &Track) -> Mesh {
         let mut builder = Builder::new();
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             if pair[0].kind != RoadKind::Gap {
                 road_segment(&mut builder, track, pair[0], pair[1], ASPHALT);
             }
@@ -902,7 +1096,7 @@ mod tests {
             Track::parse("width 40\nstraight 20 bank 60\nstraight 1 bank -60\nstraight 20 bank 0")
                 .unwrap();
         let mut coarse = Builder::new();
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             let [a, b] = [pair[0], pair[1]];
             coarse.quad(
                 edge(a, -a.width * 0.5, 0.),
@@ -943,7 +1137,7 @@ mod tests {
         );
         let flat = Track::parse("straight 40").unwrap();
         assert!(
-            flat.samples
+            flat.samples()
                 .windows(2)
                 .all(|pair| surface_steps(pair[0], pair[1]) == 1)
         );
@@ -957,7 +1151,7 @@ mod tests {
                     "width 40\nstraight 20 bank {bank}\nstraight 1 rise {rise}\nstraight 20"
                 ))
                 .unwrap();
-                for pair in track.samples.windows(2) {
+                for pair in track.samples().windows(2) {
                     let [a, b] = [pair[0], pair[1]];
                     let mut builder = Builder::new();
                     road_segment(&mut builder, &track, a, b, ASPHALT);
@@ -1067,7 +1261,7 @@ mod tests {
         let track = Track::parse("width 40\nstraight 20\nstraight 1 bank 60\nstraight 20").unwrap();
         let ground = track.ground_height();
         let mut builder = Builder::new();
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             for side in [-1.0, 1.0] {
                 shoulder_segment(
                     &mut builder,
@@ -1084,7 +1278,11 @@ mod tests {
             let sample = track.sample_at(20.0 + step as f32 / 40.0);
             for side in [-1.0, 1.0] {
                 for fraction in [0.2, 0.5, 0.8] {
-                    let point = edge(sample, side * (sample.width * 0.5 + 12.0 * fraction), 0.0);
+                    let point = edge(
+                        sample,
+                        side * (sample.width * 0.5 + SHOULDER_WIDTH * fraction),
+                        0.0,
+                    );
                     let road_edge = edge(sample, side * sample.width * 0.5, 0.0);
                     let contact_y = road_edge.y + (ground - road_edge.y) * fraction;
                     let rendered_y = triangle_height(&mesh, point).unwrap();
@@ -1105,7 +1303,7 @@ mod tests {
         let ground = track.ground_height();
         let chunks = World::build_chunks(&track);
         let mut checked = 0;
-        for pair in track.samples.windows(2) {
+        for pair in track.samples().windows(2) {
             // Inspect the level curve, whose complete shoulders fit outside
             // its center of curvature and do not overlap another road.
             if pair[0].pos.y < 499.9 || pair[0].forward.distance(pair[1].forward) < 0.01 {
@@ -1115,8 +1313,11 @@ mod tests {
                 for fraction in [0.2, 0.5, 0.8] {
                     for t in [0.25, 0.5, 0.75] {
                         let sample = surface_sample(&track, pair[0], pair[1], t);
-                        let point =
-                            edge(sample, side * (sample.width * 0.5 + 12.0 * fraction), 0.0);
+                        let point = edge(
+                            sample,
+                            side * (sample.width * 0.5 + SHOULDER_WIDTH * fraction),
+                            0.0,
+                        );
                         let edge_y = edge(sample, side * sample.width * 0.5, 0.0).y;
                         let expected = edge_y + (ground - edge_y) * fraction;
                         let actual = chunks
@@ -1137,19 +1338,52 @@ mod tests {
         assert!(checked > 1_000);
     }
 
+    /// Within renderer limits, and every vertex is referenced. The builder
+    /// never shares vertices between primitives, so a wrapped u16 index would
+    /// leave the vertices past 65,535 unreferenced even though every index
+    /// still points inside the mesh.
+    fn assert_mesh_indices_never_wrapped(mesh: &Mesh) {
+        assert!(mesh.vertices.len() <= MESH_VERTEX_LIMIT);
+        assert!(mesh.vertices.len() <= u16::MAX as usize + 1);
+        assert!(mesh.indices.len() <= 120_000);
+        let mut referenced = vec![false; mesh.vertices.len()];
+        for &i in &mesh.indices {
+            referenced[i as usize] = true;
+        }
+        assert!(
+            referenced.iter().all(|&r| r),
+            "unreferenced vertex: index wrapped"
+        );
+    }
+
+    #[test]
+    fn oversized_builders_split_instead_of_wrapping_indices() {
+        let mut builder = Builder::new();
+        let quads = 40_000;
+        for k in 0..quads {
+            let p = vec3(k as f32, 0., 0.);
+            builder.quad(p, p + Vec3::X, p + Vec3::X + Vec3::Z, p + Vec3::Z, CREAM);
+            builder.tri(p, p + Vec3::Y, p + Vec3::Z, RED);
+        }
+        let meshes = builder.into_meshes();
+        assert!(meshes.len() > 2);
+        for mesh in &meshes {
+            assert_mesh_indices_never_wrapped(mesh);
+            // Each primitive's indices stay within one mesh.
+            for triangle in mesh.indices.as_chunks::<3>().0 {
+                let [a, b, c] = triangle.map(|i| mesh.vertices[i as usize].position);
+                assert!(a.distance(b) <= 1.5 && b.distance(c) <= 1.5);
+            }
+        }
+        let total: usize = meshes.iter().map(|m| m.vertices.len()).sum();
+        assert_eq!(total, quads * 7);
+    }
+
     #[test]
     fn rapid_bank_markings_and_road_chunks_fit_renderer_limits() {
         let check_chunks = |track: &Track| {
             for chunk in World::build_chunks(track) {
-                assert!(chunk.mesh.vertices.len() <= 60_000);
-                assert!(chunk.mesh.indices.len() <= 120_000);
-                assert!(
-                    chunk
-                        .mesh
-                        .indices
-                        .iter()
-                        .all(|i| (*i as usize) < chunk.mesh.vertices.len())
-                );
+                assert_mesh_indices_never_wrapped(&chunk.mesh);
             }
         };
         for kind in ["road", "tunnel"] {
@@ -1204,8 +1438,11 @@ mod tests {
             .collect();
         assert!(!nearby_supports.is_empty());
         for chunk in nearby_supports {
-            assert!(chunk.visible_from(eye), "nearby bridge support was culled");
-            assert!(!chunk.visible_from(eye + Vec3::X * 10_000.));
+            assert!(
+                chunk.within_draw_distance(eye),
+                "nearby bridge support was culled"
+            );
+            assert!(!chunk.within_draw_distance(eye + Vec3::X * 10_000.));
         }
     }
 
@@ -1216,7 +1453,7 @@ mod tests {
                 "straight 100\nstraight 1000 rise 500 bank {bank}\nstraight 100"
             ))
             .unwrap();
-            let pair = &track.samples[300..302];
+            let pair = &track.samples()[300..302];
             let sample = surface_sample(&track, pair[0], pair[1], 0.5);
             for side in [-1., 1.] {
                 let mut shoulder = Builder::new();
@@ -1245,20 +1482,190 @@ mod tests {
     #[test]
     fn trees_stay_outside_the_shoulders_of_neighboring_straights() {
         let track = Track::parse("straight 500\nright 180 radius 20\nstraight 500").unwrap();
-        let trunk_top: [u8; 4] = tint(Color::new(0.33, 0.28, 0.21, 1.), 1.15).into();
-        let mut trunks = 0;
+        // Recognise each rendered tree by its leading run of shadow
+        // vertices, then check every vertex it emits: shadow, trunk, crown.
+        let mut probe = Builder::new();
+        tree(&mut probe, Vec3::ZERO, 8., 1);
+        let probe = probe.finish();
+        let tree_len = probe.vertices.len();
+        let shadow = probe.vertices[0].color;
+        let mut trees = 0;
         for chunk in World::build_chunks(&track) {
-            for vertex in chunk.mesh.vertices {
-                let p = vertex.position;
-                if vertex.color == trunk_top && (20.0..480.0).contains(&p.z) {
-                    trunks += 1;
+            if chunk.distant {
+                continue;
+            }
+            let vertices = &chunk.mesh.vertices;
+            for start in 0..vertices.len() {
+                if vertices[start].color != shadow
+                    || (start > 0 && vertices[start - 1].color == shadow)
+                {
+                    continue;
+                }
+                let base = vertices[start].position;
+                if !(20.0..480.0).contains(&base.z) {
+                    continue;
+                }
+                trees += 1;
+                for vertex in &vertices[start..start + tree_len] {
+                    let p = vertex.position;
                     // The parallel straights are at x = 0 and x = 40. Their
                     // drivable shoulders extend 18 m from each centerline.
                     let clearance = p.x.abs().min((p.x - 40.0).abs());
-                    assert!(clearance > 18.0, "tree intrudes into a shoulder at {p:?}");
+                    assert!(
+                        clearance > 18.0,
+                        "tree at {base:?} intrudes into a shoulder at {p:?}"
+                    );
                 }
             }
         }
-        assert!(trunks > 0, "the course must still contain roadside trees");
+        assert!(trees > 0, "the course must still contain roadside trees");
+    }
+
+    #[test]
+    fn draw_distance_is_where_the_haze_saturates() {
+        let haze = |d: f32| (1. - (-d * d * FOG_DENSITY).exp()).min(FOG_LIMIT);
+        assert!(haze(DRAW_DISTANCE) >= FOG_LIMIT);
+        // Scenery dissolves only where it is already mostly haze.
+        assert!(haze(FADE_START) > 0.85);
+        // The shader takes its haze from the constants used for culling.
+        assert!(FRAGMENT.contains("Fog.x") && FRAGMENT.contains("Fog.y"));
+    }
+
+    /// A camera far from the origin, with an orthonormal basis built
+    /// independently of its matrix: forward, rolled right and rolled up.
+    fn test_camera(
+        heading: f32,
+        pitch: f32,
+        roll: f32,
+        speed: f32,
+        aspect: f32,
+    ) -> (Frustum, [Vec3; 3]) {
+        let camera = crate::view::DriverCamera::new(
+            vec3(12_000., 300., -8_000.),
+            heading,
+            pitch,
+            roll,
+            speed,
+            aspect,
+        );
+        let forward = vec3(
+            heading.sin() * pitch.cos(),
+            pitch.sin(),
+            heading.cos() * pitch.cos(),
+        );
+        let level_right = vec3(heading.cos(), 0., -heading.sin());
+        let up = forward.cross(level_right).normalize() * roll.cos() - level_right * roll.sin();
+        let right = forward.cross(up).normalize();
+        (
+            Frustum::new(camera.matrix(), camera.position),
+            [forward, right, up],
+        )
+    }
+
+    fn cube(center: Vec3, half: f32) -> (Vec3, Vec3) {
+        (center - Vec3::splat(half), center + Vec3::splat(half))
+    }
+
+    #[test]
+    fn frustum_culls_behind_and_keeps_ahead_and_around_the_camera() {
+        for heading in [0., 1.1, -2.6] {
+            let (frustum, [forward, right, _]) = test_camera(heading, 0.05, 0., 60., 16. / 9.);
+            let eye = frustum.eye;
+            let visible = |(min, max): (Vec3, Vec3)| frustum.intersects(min, max);
+            for distance in [10., 200., 1_500., 2_900.] {
+                assert!(visible(cube(eye + forward * distance, 2.)), "{distance}");
+                assert!(!visible(cube(eye - forward * distance, 2.)), "{distance}");
+                // Well outside the ~98 degree horizontal field of view.
+                let beside = eye + (right * 3. + forward * 0.5) * distance;
+                assert!(!visible(cube(beside, 2.)), "beside at {distance} m");
+            }
+            // Beyond the 3 km far plane, even a mountain-sized box is gone.
+            assert!(!visible(cube(eye + forward * 4_000., 400.)));
+            // Bounds around the camera, or a long chunk that starts well
+            // behind it and ends ahead and to the side, are kept.
+            assert!(visible(cube(eye, 0.5)));
+            let behind = eye - forward * 300. - Vec3::Y * 2.;
+            let ahead = eye + forward * 300. + right * 30.;
+            assert!(visible((behind.min(ahead), behind.max(ahead))));
+        }
+    }
+
+    #[test]
+    fn frustum_never_culls_a_visible_point_at_any_roll_fov_or_aspect() {
+        let mut culled = 0;
+        for k in 0..400u32 {
+            let heading = (noise(k) - 0.5) * 7.;
+            let pitch = (noise(k + 1_000) - 0.5) * 0.8;
+            let roll = (noise(k + 2_000) - 0.5) * 2.4;
+            let speed = noise(k + 3_000) * 250.;
+            let aspect = 0.5 + noise(k + 4_000) * 3.;
+            let (frustum, [forward, right, up]) = test_camera(heading, pitch, roll, speed, aspect);
+            let half_height = ((66. + (speed / 180.).min(1.) * 5.) * 0.5_f32)
+                .to_radians()
+                .tan();
+            let point = |depth: f32, x: f32, y: f32| {
+                frustum.eye
+                    + (forward + right * x * half_height * aspect + up * y * half_height) * depth
+            };
+            let tiny = |p: Vec3| frustum.intersects(p - Vec3::splat(0.001), p + Vec3::splat(0.001));
+            for j in 0..40u32 {
+                let seed = k * 97 + j * 13;
+                let depth = 0.1 + noise(seed) * 2_990.;
+                // Anywhere on screen, including the exact corners.
+                let x = (noise(seed + 1) * 2.4 - 1.2).clamp(-1., 1.);
+                let y = (noise(seed + 2) * 2.4 - 1.2).clamp(-1., 1.);
+                let p = point(depth, x, y);
+                assert!(
+                    tiny(p),
+                    "visible {p:?} culled: heading {heading}, pitch {pitch}, roll {roll}, aspect {aspect}"
+                );
+                // Clearly off-screen, behind the camera, or past the far plane.
+                let off = 1.3 + noise(seed + 3);
+                for hidden in [
+                    point(depth.max(100.), x.signum() * off, y),
+                    point(depth.max(100.), x, y.signum() * off),
+                    point(-depth.max(10.), x, y),
+                    point(3_100., x * 0.9, y * 0.9),
+                ] {
+                    assert!(!tiny(hidden), "hidden {hidden:?} kept");
+                    culled += 1;
+                }
+            }
+        }
+        assert!(culled > 10_000);
+    }
+
+    #[test]
+    fn chunks_on_screen_or_beside_the_camera_are_submitted() {
+        let track = Track::load("tracks/skyline_eight.track").unwrap();
+        let chunks = World::build_chunks(&track);
+        let mut culled = 0;
+        let mut drawn = 0;
+        for k in 0..8 {
+            let s = track.sample_at(track.length * k as f32 / 8.);
+            let heading = s.forward.x.atan2(s.forward.z);
+            let pitch = s.forward.y.asin();
+            let camera =
+                crate::view::DriverCamera::new(s.pos, heading, pitch, s.bank, 100., 16. / 9.);
+            let matrix = camera.matrix();
+            let frustum = Frustum::new(matrix, camera.position);
+            for chunk in chunks.iter().filter(|c| !c.mesh.vertices.is_empty()) {
+                // Any vertex inside the clip volume (and draw distance), or
+                // within a few metres of the eye, means the chunk is needed.
+                let needed = chunk.mesh.vertices.iter().any(|v| {
+                    let clip = matrix * v.position.extend(1.);
+                    let distance = v.position.distance(camera.position);
+                    distance < 3.
+                        || (clip.w > 0.
+                            && clip.truncate().abs().cmple(Vec3::splat(clip.w)).all()
+                            && (chunk.distant || distance < DRAW_DISTANCE))
+                });
+                let visible = chunk.visible(&frustum);
+                assert!(visible || !needed, "visible chunk culled at {k}/8");
+                culled += usize::from(!visible);
+                drawn += usize::from(visible);
+            }
+        }
+        assert!(culled > drawn, "only {culled} culled, {drawn} drawn");
     }
 }

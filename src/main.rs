@@ -12,6 +12,7 @@ mod world;
 use courses::resolve_track;
 use macroquad::prelude::*;
 use race::Race;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use track::Track;
 use vehicle::{Car, Control};
@@ -25,15 +26,54 @@ struct Options {
     demo: bool,
     at: Option<f32>,
 }
-fn path_argument(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf, String> {
+const SMOKE_TEST_FRAMES: u64 = 240;
+const CAPTURE_FRAMES: u64 = 30;
+const HELP: &str = "APEX / ROAD
+
+apex-road [PATH | --track PATH] [options]
+  PATH, --track PATH  Drive a .track file (default tracks/alpine.track)
+  --validate PATH     Check a track without opening a window
+  --smoke-test        Auto-drive, exiting after 240 frames unless --frames is given
+  --autodrive         Run the demonstration driver
+  --demo              Auto-play every bundled track in a repeating loop
+  --frames N          Exit after N rendered frames
+  --capture PATH      Save the final frame as PNG (after 30 frames unless --frames is given)
+  --at METERS         Preview a position on the track
+
+Relative track paths are read from the current directory. Bundled
+tracks/*.track paths fall back to the game folder: the first of the current
+directory, the executable's directory, or one of its parents that contains
+the bundled tracks/. Records are saved in that folder's data/.
+
+Enter start · WASD / arrows drive · Space handbrake · R restart
+Right click toggles mouse driving: left/right steer, up adds throttle, down adds brake
+U toggles US / metric HUD units (default: US)
+Esc closes help, otherwise pauses · F1 help · F5 reload · Tab track · F11 fullscreen";
+
+fn starts_with_dash(arg: &OsStr) -> bool {
+    arg.as_encoded_bytes().starts_with(b"-")
+}
+fn path_argument(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<PathBuf, String> {
     args.next()
-        .filter(|value| !value.starts_with('-'))
+        .filter(|value| !starts_with_dash(value))
         .map(PathBuf::from)
         .ok_or_else(|| format!("{flag} needs a path"))
 }
-fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
+fn number_argument<T: std::str::FromStr>(
+    args: &mut impl Iterator<Item = OsString>,
+    missing: &str,
+    invalid: &str,
+) -> Result<T, String> {
+    let value = args.next().ok_or(missing)?;
+    value
+        .to_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("{invalid}: {}", value.to_string_lossy()))
+}
+/// Parse command-line arguments, which need not be valid Unicode paths.
+fn options<T: Into<OsString>>(args: impl IntoIterator<Item = T>) -> Result<Options, String> {
     let mut out = Options {
-        path: "tracks/alpine.track".into(),
+        path: courses::BUNDLED_PATHS[0].into(),
         validate: false,
         frames: None,
         capture: None,
@@ -41,21 +81,44 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         demo: false,
         at: None,
     };
-    let mut args = args.into_iter();
+    let mut path: Option<PathBuf> = None;
+    // `--validate a --track b` must not silently check only b.
+    let mut set_path = |next: PathBuf| {
+        if let Some(previous) = &path {
+            return Err(format!(
+                "Only one track path can be given; got '{}' and '{}'",
+                previous.display(),
+                next.display()
+            ));
+        }
+        path = Some(next);
+        Ok(())
+    };
+    let mut smoke_test = false;
+    let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--track" => out.path = path_argument(&mut args, "--track")?,
+        let Some(flag) = arg.to_str() else {
+            if starts_with_dash(&arg) {
+                return Err(format!(
+                    "Unknown option: {}. Use --help.",
+                    arg.to_string_lossy()
+                ));
+            }
+            set_path(arg.into())?;
+            continue;
+        };
+        match flag {
+            "--track" => set_path(path_argument(&mut args, "--track")?)?,
             "--validate" => {
                 out.validate = true;
-                out.path = path_argument(&mut args, "--validate")?;
+                set_path(path_argument(&mut args, "--validate")?)?;
             }
             "--frames" => {
-                out.frames = Some(
-                    args.next()
-                        .ok_or("--frames needs a positive integer")?
-                        .parse()
-                        .map_err(|_| "invalid frame count")?,
-                )
+                out.frames = Some(number_argument(
+                    &mut args,
+                    "--frames needs a positive integer",
+                    "invalid frame count",
+                )?)
             }
             "--capture" => out.capture = Some(path_argument(&mut args, "--capture")?),
             "--autodrive" => out.autodrive = true,
@@ -64,26 +127,26 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
                 out.autodrive = true;
             }
             "--smoke-test" => {
-                out.frames = Some(240);
+                smoke_test = true;
                 out.autodrive = true;
             }
             "--at" => {
-                out.at = Some(
-                    args.next()
-                        .ok_or("--at needs a distance in meters")?
-                        .parse()
-                        .map_err(|_| "invalid distance")?,
-                )
+                out.at = Some(number_argument(
+                    &mut args,
+                    "--at needs a distance in meters",
+                    "invalid distance",
+                )?)
             }
             "--help" | "-h" => {
-                println!(
-                    "APEX / ROAD\n\ncargo run --release -- [--track tracks/alpine.track]\n  --validate PATH   Check a track without opening a window\n  --smoke-test      Render 240 frames of automated driving\n  --autodrive       Run the demonstration driver\n  --demo            Auto-play every bundled track in a repeating loop\n  --frames N        Exit after N rendered frames\n  --capture PATH    Save the final frame as PNG (pair with --frames)\n  --at METERS       Preview a position on the track\n\nEnter start · WASD / arrows drive · Space handbrake · R restart\nRight click toggles mouse driving: left/right steer, up adds throttle, down adds brake\nU toggles US / metric HUD units (default: US)\nEsc pause · F1 help · F5 reload · Tab track · F11 fullscreen"
-                );
+                println!("{HELP}");
                 std::process::exit(0);
             }
-            other if !other.starts_with('-') => out.path = other.into(),
-            _ => return Err(format!("Unknown option: {arg}. Use --help.")),
+            other if !other.starts_with('-') => set_path(arg.into())?,
+            _ => return Err(format!("Unknown option: {flag}. Use --help.")),
         }
+    }
+    if let Some(path) = path {
+        out.path = path;
     }
     if out.frames == Some(0) {
         return Err("--frames must be positive".into());
@@ -91,8 +154,12 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     if out.at.is_some_and(|v| !v.is_finite() || v < 0.) {
         return Err("--at must be finite and nonnegative".into());
     }
+    // An explicit --frames wins regardless of its position.
+    if smoke_test && out.frames.is_none() {
+        out.frames = Some(SMOKE_TEST_FRAMES);
+    }
     if out.capture.is_some() && out.frames.is_none() {
-        out.frames = Some(30);
+        out.frames = Some(CAPTURE_FRAMES);
     }
     Ok(out)
 }
@@ -112,7 +179,7 @@ fn config() -> macroquad::conf::Conf {
     }
 }
 fn main() {
-    let mut opts = options(std::env::args().skip(1)).unwrap_or_else(|e| {
+    let mut opts = options(std::env::args_os().skip(1)).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
     });
@@ -127,10 +194,11 @@ fn main() {
         });
     if opts.validate {
         println!(
-            "OK: {} | {:.0} m | {} samples | {} checkpoints | {}",
+            "OK: {} | {} | {:.0} m | {} samples | {} checkpoints | {}",
+            opts.path.display(),
             track.name,
             track.length,
-            track.samples.len(),
+            track.samples().len(),
             track.checkpoints.len(),
             if track.closed {
                 "circuit"
@@ -147,8 +215,29 @@ fn main() {
         }
     });
 }
+/// Version of the rules that make best times comparable. Bump it whenever
+/// vehicle handling, the physics step, or timing changes enough that older
+/// records would be unfair, so new runs start a fresh record history.
+/// Version 1 files were named `{hash}.best`; they are left on disk unread.
+const RECORD_VERSION: u32 = 2;
+/// Records live in the game root's `data/`, beside the bundled `tracks/`.
+/// Without a game root (only possible with an explicit track path), fall back
+/// to the executable's directory rather than wherever the game was launched.
+fn records_dir() -> PathBuf {
+    courses::game_root()
+        .ok()
+        .or_else(|| Some(std::env::current_exe().ok()?.parent()?.to_owned()))
+        .unwrap_or_default()
+        .join("data")
+}
 fn record_path(track: &Track) -> PathBuf {
-    PathBuf::from(format!("data/{:016x}.best", track.source_hash()))
+    record_path_in(&records_dir(), track)
+}
+fn record_path_in(directory: &Path, track: &Track) -> PathBuf {
+    directory.join(format!(
+        "{:016x}-v{RECORD_VERSION}.best",
+        track.source_hash()
+    ))
 }
 fn read_record(path: &Path) -> Option<f32> {
     try_read_record(path).ok().flatten()
@@ -181,13 +270,14 @@ fn save_record(path: &Path, time: f32) -> std::io::Result<SavedRecord> {
     // The record itself is replaced by rename. Keep a separate, stable lock
     // file so every running game serializes its read/compare/write sequence.
     // Never remove this sidecar: another process may already be waiting on it.
+    // The lock is released when `lock` is dropped at the end of this function.
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path.with_extension("lock"))?;
-    lock.lock()?;
+    let locked = lock_record(&lock)?;
     if let Some(best) = try_read_record(path)?
         && best <= time
     {
@@ -196,15 +286,95 @@ fn save_record(path: &Path, time: f32) -> std::io::Result<SavedRecord> {
             improved: false,
         });
     }
-    // All writers for this record hold the same lock, including while using
-    // its temporary file. The same-directory rename keeps readers atomic.
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, format!("{time}\n"))?;
-    std::fs::rename(temp, path)?;
+    // All locked writers for this record share its temporary file. Without
+    // a lock, a per-process name keeps concurrent writers from interleaving.
+    // The same-directory rename keeps readers atomic.
+    let temp = if locked {
+        path.with_extension("tmp")
+    } else {
+        path.with_extension(format!("{}.tmp", std::process::id()))
+    };
+    let written = write_synced(&temp, format!("{time}\n").as_bytes())
+        .and_then(|()| rename_with_retry(&temp, path));
+    if let Err(error) = written {
+        // Do not leave a partial record behind. This cannot remove a
+        // directory or another writer's file: the name is ours while locked.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
     Ok(SavedRecord {
         best: time,
         improved: true,
     })
+}
+/// Bounded so a stuck writer cannot freeze the render thread, which saves
+/// records; contended saves report an error and retry after the next run.
+const RECORD_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Take the record lock, waiting briefly for another game to finish saving.
+/// Returns false when the filesystem cannot lock files at all; saving then
+/// proceeds unserialized, as it would on a single running game.
+fn lock_record(lock: &std::fs::File) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + RECORD_LOCK_TIMEOUT;
+    let mut delay = std::time::Duration::from_millis(1);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::Error(error)) if locking_unsupported(&error) => {
+                return Ok(false);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "another game is still saving this record",
+                    ));
+                }
+                std::thread::sleep(delay.min(deadline - now));
+                delay = (delay * 2).min(std::time::Duration::from_millis(16));
+            }
+        }
+    }
+}
+fn locking_unsupported(error: &std::io::Error) -> bool {
+    // ENOLCK (for example, NFS without a lock daemon), or Windows
+    // ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED from some network shares.
+    const NO_LOCKS: &[i32] = if cfg!(target_os = "linux") {
+        &[37]
+    } else if cfg!(target_os = "macos") {
+        &[77]
+    } else if cfg!(windows) {
+        &[1, 50]
+    } else {
+        &[]
+    };
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error
+            .raw_os_error()
+            .is_some_and(|code| NO_LOCKS.contains(&code))
+}
+/// Write a complete file and flush it to disk before it can replace a record,
+/// so a crash cannot leave a renamed but empty record.
+fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    std::io::Write::write_all(&mut file, contents)?;
+    file.sync_all()
+}
+/// Antivirus and indexing services on Windows can briefly hold the old record
+/// open, failing the rename with access denied. Retry for at most ~75 ms.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut delay = std::time::Duration::from_millis(5);
+    for _ in 0..4 {
+        match std::fs::rename(from, to) {
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            result => return result,
+        }
+    }
+    std::fs::rename(from, to)
 }
 fn save_capture(path: &Path, screenshot: &Image) -> Result<(), image::ImageError> {
     let mut pixels = image::RgbaImage::from_raw(
@@ -345,279 +515,499 @@ fn restart_run(
     race.started = true;
 }
 
-async fn game(opts: Options, mut track: Track) -> Result<(), String> {
+/// Keys that act once on the frame they are pressed, rather than while held.
+const COMMAND_KEYS: [KeyCode; 9] = [
+    KeyCode::F11,
+    KeyCode::F1,
+    KeyCode::U,
+    KeyCode::Escape,
+    KeyCode::Q,
+    KeyCode::Enter,
+    KeyCode::R,
+    KeyCode::F5,
+    KeyCode::Tab,
+];
+/// The simulation's fixed physics step, in seconds.
+const PHYSICS_STEP: f32 = 1. / 120.;
+/// Frame-limited auto-driven runs advance this much per rendered frame, so
+/// smoke tests and captures do not depend on the machine's frame rate.
+const FIXED_FRAME_TIME: f32 = 1. / 60.;
+/// Seconds during which a right click may still be the click that activated
+/// the window, rather than a request to toggle mouse driving.
+const ACTIVATION_GUARD: f32 = 0.25;
+/// Seconds stopped off the road before the restart hint appears.
+const OFF_COURSE_HINT_DELAY: f32 = 3.;
+/// A car this far below the lowest road surface is falling forever.
+const FALL_DEPTH: f32 = 30.;
+
+/// Everything one frame reads from the window, so the game's rules can run
+/// without one.
+#[derive(Clone, Debug)]
+struct FrameInput {
+    /// Seconds since the previous frame, as reported by the window.
+    frame_time: f32,
+    /// Focus was lost at some point since the previous frame.
+    focus_lost: bool,
+    /// The window became focused since the previous frame.
+    focus_gained: bool,
+    /// The window has focus now.
+    focused: bool,
+    /// Command keys pressed this frame.
+    pressed: Vec<KeyCode>,
+    right_click: bool,
+    /// Keyboard driving controls held this frame, including the handbrake.
+    keys: Control,
+    /// This frame's mouse motion events in order, in logical pixels.
+    mouse_motion: Vec<Vec2>,
+    /// The final mouse position this frame, in logical pixels.
+    mouse_position: Vec2,
+}
+
+impl FrameInput {
+    /// Gather this frame's input after its events were replayed into `focus`.
+    fn read(focus: &mut input::WindowInput) -> Self {
+        let focus_lost = focus.take_loss();
+        let frame_time = get_frame_time();
+        let focus_gained = focus.take_gain();
+        // Event coordinates are physical pixels; `mouse_position` is logical.
+        let dpi_scale = macroquad::miniquad::window::dpi_scale();
+        Self {
+            frame_time,
+            focus_lost,
+            focus_gained,
+            focused: focus.focused,
+            pressed: COMMAND_KEYS
+                .into_iter()
+                .filter(|key| is_key_pressed(*key))
+                .collect(),
+            right_click: is_mouse_button_pressed(MouseButton::Right),
+            keys: input(),
+            mouse_motion: focus
+                .drain_mouse_motion()
+                .map(|position| position / dpi_scale)
+                .collect(),
+            mouse_position: mouse_position().into(),
+        }
+    }
+
+    fn pressed(&self, key: KeyCode) -> bool {
+        self.pressed.contains(&key)
+    }
+}
+
+/// Window side effects requested by a frame's update, in order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Action {
+    /// Leave the game. Nothing else in the frame was updated.
+    Quit,
+    SetFullscreen(bool),
+    /// Grab and hide the cursor for mouse driving, or release and show it.
+    GrabCursor(bool),
+    /// The track changed, so its scenery must be rebuilt.
+    RebuildWorld,
+}
+
+/// The whole game apart from the window: course, car, run, records and UI
+/// modes. `update` applies one frame of input and simulation.
+struct GameState {
+    track: Track,
+    path: PathBuf,
+    /// Where records are kept. `None` uses the game root's `data/`,
+    /// resolved again for each loaded course.
+    records_dir: Option<PathBuf>,
+    record_file: PathBuf,
+    records: RunRecords,
+    car: Car,
+    race: Race,
+    attitude: CameraAttitude,
+    /// The controls applied on the latest frame, as shown by the HUD.
+    control: Control,
+    paused: bool,
+    help: bool,
+    units: hud::Units,
+    fullscreen: bool,
+    autodrive: bool,
+    /// `--demo`: cycle through the courses while the auto driver drives.
+    demo: bool,
+    /// `--frames`: rendered frames before the game exits.
+    frame_limit: Option<u64>,
+    frames: u64,
+    accumulator: f32,
+    note: String,
+    note_time: f32,
+    /// Seconds the car has been stopped off the road.
+    respawn_timer: f32,
+    /// Seconds left in which a right click is treated as window activation.
+    activation_guard: f32,
+    mouse: input::MouseDriving,
+    cursor_grabbed: bool,
+}
+
+fn record_path_for(directory: Option<&Path>, track: &Track) -> PathBuf {
+    match directory {
+        Some(directory) => record_path_in(directory, track),
+        None => record_path(track),
+    }
+}
+
+impl GameState {
+    fn new(opts: &Options, track: Track, records_dir: Option<PathBuf>) -> Self {
+        let mut car = Car::new(&track);
+        if let Some(at) = opts.at {
+            car.reset(&track, at.min(track.length - 5.));
+        }
+        let record_file = record_path_for(records_dir.as_deref(), &track);
+        let mut records = RunRecords::new(read_record(&record_file));
+        let mut race = records.start_race(car.distance, !opts.autodrive && opts.at.is_none());
+        race.started = opts.autodrive;
+        if opts.demo {
+            println!("Demo: {}", track.name);
+        }
+        Self {
+            attitude: CameraAttitude::new(&car),
+            track,
+            path: opts.path.clone(),
+            records_dir,
+            record_file,
+            records,
+            car,
+            race,
+            control: Control::default(),
+            paused: false,
+            help: false,
+            units: hud::Units::default(),
+            fullscreen: false,
+            autodrive: opts.autodrive,
+            demo: opts.demo,
+            frame_limit: opts.frames,
+            frames: 0,
+            accumulator: 0.,
+            note: String::new(),
+            note_time: 0.,
+            respawn_timer: 0.,
+            activation_guard: 0.,
+            mouse: input::MouseDriving::default(),
+            cursor_grabbed: false,
+        }
+    }
+
+    fn notify(&mut self, note: impl Into<String>, seconds: f32) {
+        self.note = note.into();
+        self.note_time = seconds;
+    }
+
+    /// The notification currently on screen, if any.
+    fn notification(&self) -> Option<&str> {
+        (self.note_time > 0.).then_some(self.note.as_str())
+    }
+
+    /// Back to the grid for a new run, with the view snapped to match.
+    fn restart(&mut self) {
+        restart_run(
+            &mut self.car,
+            &self.track,
+            &mut self.records,
+            &mut self.race,
+            self.autodrive,
+        );
+        self.attitude.snap(&self.car);
+        self.mouse.reset();
+    }
+
+    /// Apply one frame of input, then advance the simulation. Returns the
+    /// window side effects for the caller to perform in order.
+    fn update(&mut self, input: &FrameInput) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if input.focus_lost {
+            // Keys and mouse motion stop arriving without focus. Hold any
+            // timed run still until the player resumes it deliberately.
+            if self.race.started && !self.race.finished && !self.autodrive {
+                self.paused = true;
+            }
+            self.mouse.reset();
+        }
+        let dt = input.frame_time.clamp(0., 0.1);
+        self.activation_guard = if input.focus_gained {
+            ACTIVATION_GUARD
+        } else {
+            (self.activation_guard - dt).max(0.)
+        };
+        self.frames += 1;
+        self.note_time = (self.note_time - dt).max(0.);
+        if input.pressed(KeyCode::F11) {
+            self.fullscreen = !self.fullscreen;
+            actions.push(Action::SetFullscreen(self.fullscreen));
+            self.mouse.reset();
+        }
+        if input.pressed(KeyCode::F1) {
+            self.help = !self.help;
+        }
+        if input.pressed(KeyCode::U) {
+            self.units.toggle();
+        }
+        if input.pressed(KeyCode::Escape) {
+            if self.help {
+                self.help = false;
+            } else {
+                self.paused = !self.paused;
+            }
+        }
+        if self.paused && input.pressed(KeyCode::Q) {
+            actions.push(Action::Quit);
+            return actions;
+        }
+        // Replayed events report the activating click as focused input, so
+        // ignore right clicks while the window is just regaining focus.
+        if input.focused && !input.focus_gained && self.activation_guard <= 0. && input.right_click
+        {
+            self.mouse.toggle();
+            // A manual takeover ends the demonstration for this session.
+            self.autodrive = false;
+        }
+        if input.pressed(KeyCode::Enter) {
+            if self.race.finished {
+                self.restart();
+            }
+            self.race.started = true;
+            self.paused = false;
+            self.help = false;
+        }
+        if input.pressed(KeyCode::R) {
+            self.restart();
+            self.accumulator = 0.;
+            self.respawn_timer = 0.;
+            self.notify("NEW RUN", 2.);
+        }
+        let demo = self.demo && self.autodrive;
+        let reload = input.pressed(KeyCode::F5);
+        let advance_demo =
+            demo && self.race.completed_runs > 0 && !self.paused && !self.help && !reload;
+        let switch = input.pressed(KeyCode::Tab) || advance_demo;
+        if (switch || reload) && self.change_course(switch, advance_demo) {
+            actions.push(Action::RebuildWorld);
+        }
+        let driving = self.race.started
+            && !self.paused
+            && !self.help
+            && !self.race.finished
+            && (input.focused || self.autodrive);
+        let capture_mouse = self.mouse.enabled() && driving;
+        if capture_mouse != self.cursor_grabbed {
+            actions.push(Action::GrabCursor(capture_mouse));
+            self.cursor_grabbed = capture_mouse;
+            self.mouse.reset();
+        }
+        self.mouse.update_frame(
+            input.mouse_motion.iter().copied(),
+            input.mouse_position,
+            capture_mouse,
+        );
+        self.control = if self.autodrive {
+            demo_control(&self.car, &self.track)
+        } else if self.mouse.enabled() {
+            self.mouse.control(input.keys.handbrake)
+        } else {
+            input.keys
+        };
+        if driving {
+            self.simulate(dt, demo);
+        } else {
+            self.accumulator = 0.;
+        }
+        self.attitude.follow(&self.car, dt);
+        actions
+    }
+
+    /// Load the next course (`switch`) or reload the current one. A failed
+    /// load keeps the current course. Returns whether the track changed.
+    fn change_course(&mut self, switch: bool, automatic: bool) -> bool {
+        let next = if switch {
+            courses::next_path(&self.path).and_then(|path| resolve_track(&path))
+        } else {
+            Ok(self.path.clone())
+        };
+        match next.and_then(|path| Track::load(&path).map(|track| (path, track))) {
+            Ok((path, track)) => {
+                self.track = track;
+                self.path = path;
+                self.car = Car::new(&self.track);
+                self.record_file = record_path_for(self.records_dir.as_deref(), &self.track);
+                self.records = RunRecords::new(read_record(&self.record_file));
+                self.race = self.records.start_race(self.car.distance, !self.autodrive);
+                self.race.started = self.autodrive;
+                if self.demo && self.autodrive {
+                    println!("Demo: {}", self.track.name);
+                }
+                self.attitude.snap(&self.car);
+                self.accumulator = 0.;
+                self.paused = false;
+                self.respawn_timer = 0.;
+                self.mouse.reset();
+                self.notify(
+                    if switch {
+                        "COURSE LOADED"
+                    } else {
+                        "TRACK RELOADED"
+                    },
+                    3.,
+                );
+                true
+            }
+            Err(e) => {
+                // Stop automatic retries until the user resumes or reloads.
+                if automatic {
+                    self.paused = true;
+                }
+                self.notify(format!("RELOAD FAILED: {e}"), 15.);
+                eprintln!("{}", self.note);
+                false
+            }
+        }
+    }
+
+    /// Run the physics steps covered by this frame, saving records and
+    /// recovering a car that has fallen off the world.
+    fn simulate(&mut self, dt: f32, demo: bool) {
+        // Frame-limited auto-driven runs advance a fixed time per frame, so
+        // everything timed in simulation follows that clock, not the window's.
+        let dt = if self.frame_limit.is_some() && self.autodrive {
+            FIXED_FRAME_TIME
+        } else {
+            dt
+        };
+        self.accumulator += dt;
+        while self.accumulator >= PHYSICS_STEP {
+            self.car.update(&self.track, self.control, PHYSICS_STEP);
+            let candidate = self.race.update(
+                &self.track,
+                PHYSICS_STEP,
+                self.car.distance,
+                self.car.on_course(),
+            );
+            match self
+                .records
+                .save_candidate(&self.record_file, &mut self.race, candidate)
+            {
+                Err(e) => self.notify(format!("Record could not be saved: {e}"), 8.),
+                Ok(Some(saved)) => self.notify(
+                    if saved.improved {
+                        "NEW PERSONAL BEST"
+                    } else {
+                        "PERSONAL BEST SYNCED"
+                    },
+                    5.,
+                ),
+                Ok(None) => {}
+            }
+            if !self.car.position.is_finite()
+                || self.car.position.y < self.track.ground_height() - FALL_DEPTH
+            {
+                self.restart();
+                self.notify("BACK ON THE GRID", 3.);
+                self.accumulator = 0.;
+                break;
+            }
+            self.accumulator -= PHYSICS_STEP;
+            if self.race.finished || (demo && self.race.completed_runs > 0) {
+                self.accumulator = 0.;
+                break;
+            }
+        }
+        if self.car.offroad && self.car.speed_kmh() < 4. {
+            self.respawn_timer += dt;
+        } else {
+            self.respawn_timer = 0.;
+        }
+        if self.respawn_timer > OFF_COURSE_HINT_DELAY {
+            self.notify("OFF COURSE · PRESS R TO RESTART", 2.);
+        }
+    }
+
+    /// Whether `--frames` has been reached and the game should exit after
+    /// drawing (and capturing) this frame.
+    fn frame_limit_reached(&self) -> bool {
+        self.frame_limit.is_some_and(|limit| self.frames >= limit)
+    }
+
+    fn driver_camera(&self, aspect: f32) -> view::DriverCamera {
+        view::DriverCamera::new(
+            self.car.position,
+            self.car.heading,
+            self.attitude.pitch,
+            self.attitude.roll,
+            self.car.speed_kmh(),
+            aspect,
+        )
+    }
+
+    fn hud(&self, fps: i32) -> hud::HudState<'_> {
+        let speed = self.car.speed_kmh();
+        let gear = hud::gear(speed, self.car.reversing);
+        hud::HudState {
+            track_name: &self.track.name,
+            speed,
+            units: self.units,
+            rpm: hud::engine_rpm(speed, gear, self.control.throttle),
+            gear,
+            throttle: self.car.throttle,
+            brake: self.car.brake,
+            // The input, not the wheel angle: lock narrows with speed.
+            steering: self.control.steer,
+            slip: self.car.slip,
+            elapsed: self.race.elapsed as f32,
+            best: self.race.best,
+            last: self.race.last,
+            checkpoint: self.race.next_checkpoint,
+            checkpoint_count: self.track.checkpoints.len(),
+            progress: self.car.distance / self.track.length,
+            paused: self.paused,
+            started: self.race.started,
+            finished: self.race.finished,
+            invalid: self.race.invalid_reason,
+            airborne: !self.car.grounded,
+            offroad: self.car.offroad,
+            help: self.help,
+            mouse_enabled: self.mouse.enabled(),
+            autodrive: self.autodrive,
+            notification: self.notification(),
+            fps,
+        }
+    }
+}
+
+async fn game(opts: Options, track: Track) -> Result<(), String> {
     hud::init();
     prevent_quit();
-    let mut path = opts.path.clone();
-    let mut world = world::World::new(&track);
-    let mut car = Car::new(&track);
-    if let Some(at) = opts.at {
-        car.reset(&track, at.min(track.length - 5.));
-    }
-    let mut record_file = record_path(&track);
-    let mut records = RunRecords::new(read_record(&record_file));
-    let mut race = records.start_race(car.distance, !opts.autodrive && opts.at.is_none());
-    race.started = opts.autodrive;
-    let mut paused = false;
-    let mut help = false;
-    let mut units = hud::Units::default();
-    let mut fullscreen = false;
-    let mut accumulator = 0.;
-    let mut frames = 0;
-    let mut note = String::new();
-    let mut note_time: f32 = 0.;
-    let mut camera_pitch = car.pitch;
-    let mut camera_roll = car.roll;
-    let mut respawn_timer = 0.;
-    let mut mouse = input::MouseDriving::default();
-    let mut cursor_grabbed = false;
+    let mut state = GameState::new(&opts, track, None);
+    let mut world = world::World::new(&state.track);
     let mut focus = input::WindowInput::new();
     let input_subscriber = macroquad::input::utils::register_input_subscriber();
-    let mut autodrive = opts.autodrive;
-    if opts.demo {
-        println!("Demo: {}", track.name);
-    }
-    let fixed = 1. / 120.;
     let mut result = Ok(());
-    loop {
+    'frames: loop {
         if is_quit_requested() {
             break;
         }
         macroquad::input::utils::repeat_all_miniquad_input(&mut focus, input_subscriber);
-        if focus.take_loss() && mouse.enabled() {
-            paused = true;
-            mouse.reset();
-        }
-        let dt = get_frame_time().clamp(0., 0.1);
-        frames += 1;
-        note_time = (note_time - dt).max(0.);
-        if is_key_pressed(KeyCode::F11) {
-            fullscreen = !fullscreen;
-            set_fullscreen(fullscreen);
-            mouse.reset();
-        }
-        if is_key_pressed(KeyCode::F1) {
-            help = !help;
-        }
-        if is_key_pressed(KeyCode::U) {
-            units.toggle();
-        }
-        if is_key_pressed(KeyCode::Escape) {
-            if help {
-                help = false;
-            } else {
-                paused = !paused;
-            }
-        }
-        if paused && is_key_pressed(KeyCode::Q) {
-            break;
-        }
-        if focus.focused && is_mouse_button_pressed(MouseButton::Right) {
-            mouse.toggle();
-            // A manual takeover ends the demonstration for this session.
-            autodrive = false;
-        }
-        if is_key_pressed(KeyCode::Enter) {
-            if race.finished {
-                restart_run(&mut car, &track, &mut records, &mut race, autodrive);
-                mouse.reset();
-            }
-            race.started = true;
-            paused = false;
-            help = false;
-        }
-        if is_key_pressed(KeyCode::R) {
-            restart_run(&mut car, &track, &mut records, &mut race, autodrive);
-            accumulator = 0.;
-            respawn_timer = 0.;
-            mouse.reset();
-            note = "NEW RUN".into();
-            note_time = 2.;
-        }
-        let demo = opts.demo && autodrive;
-        let reload = is_key_pressed(KeyCode::F5);
-        let advance_demo = demo && race.completed_runs > 0 && !paused && !help && !reload;
-        let switch = is_key_pressed(KeyCode::Tab) || advance_demo;
-        if switch || reload {
-            let next = if switch {
-                courses::next_path(&path).and_then(|path| resolve_track(&path))
-            } else {
-                Ok(path.clone())
-            };
-            match next.and_then(|path| Track::load(&path).map(|track| (path, track))) {
-                Ok((next, new_track)) => {
-                    track = new_track;
-                    world.rebuild(&track);
-                    path = next;
-                    car = Car::new(&track);
-                    record_file = record_path(&track);
-                    records = RunRecords::new(read_record(&record_file));
-                    race = records.start_race(car.distance, !autodrive);
-                    race.started = autodrive;
-                    if demo {
-                        println!("Demo: {}", track.name);
-                    }
-                    camera_pitch = car.pitch;
-                    camera_roll = car.roll;
-                    accumulator = 0.;
-                    paused = false;
-                    respawn_timer = 0.;
-                    mouse.reset();
-                    note = if switch {
-                        "COURSE LOADED"
-                    } else {
-                        "TRACK RELOADED"
-                    }
-                    .into();
-                    note_time = 3.;
+        let input = FrameInput::read(&mut focus);
+        for action in state.update(&input) {
+            match action {
+                Action::Quit => break 'frames,
+                Action::SetFullscreen(fullscreen) => set_fullscreen(fullscreen),
+                Action::GrabCursor(grab) => {
+                    set_cursor_grab(grab);
+                    show_mouse(!grab);
                 }
-                Err(e) => {
-                    // Stop automatic retries until the user resumes or reloads.
-                    if advance_demo {
-                        paused = true;
-                    }
-                    note = format!("RELOAD FAILED: {e}");
-                    eprintln!("{note}");
-                    note_time = 15.;
-                }
+                Action::RebuildWorld => world.rebuild(&state.track),
             }
         }
-        let driving =
-            race.started && !paused && !help && !race.finished && (focus.focused || autodrive);
-        let capture_mouse = mouse.enabled() && driving;
-        if capture_mouse != cursor_grabbed {
-            set_cursor_grab(capture_mouse);
-            show_mouse(!capture_mouse);
-            cursor_grabbed = capture_mouse;
-            mouse.reset();
-        }
-        let (mouse_x, mouse_y) = mouse_position();
-        let dpi_scale = macroquad::miniquad::window::dpi_scale();
-        mouse.update_frame(
-            focus
-                .drain_mouse_motion()
-                .map(|position| position / dpi_scale),
-            vec2(mouse_x, mouse_y),
-            capture_mouse,
-        );
-        let control = if autodrive {
-            demo_control(&car, &track)
-        } else if mouse.enabled() {
-            mouse.control(is_key_down(KeyCode::Space))
-        } else {
-            input()
-        };
-        if driving {
-            accumulator += if opts.frames.is_some() && autodrive {
-                1. / 60.
-            } else {
-                dt
-            };
-            while accumulator >= fixed {
-                car.update(&track, control, fixed);
-                let candidate = race.update(&track, fixed, car.distance, !car.offroad);
-                match records.save_candidate(&record_file, &mut race, candidate) {
-                    Err(e) => {
-                        note = format!("Record could not be saved: {e}");
-                        note_time = 8.;
-                    }
-                    Ok(Some(saved)) => {
-                        note = if saved.improved {
-                            "NEW PERSONAL BEST"
-                        } else {
-                            "PERSONAL BEST SYNCED"
-                        }
-                        .into();
-                        note_time = 5.;
-                    }
-                    Ok(None) => {}
-                }
-                if !car.position.is_finite() || car.position.y < track.ground_height() - 30. {
-                    restart_run(&mut car, &track, &mut records, &mut race, autodrive);
-                    mouse.reset();
-                    note = "BACK ON THE GRID".into();
-                    note_time = 3.;
-                    accumulator = 0.;
-                    break;
-                }
-                accumulator -= fixed;
-                if race.finished || (demo && race.completed_runs > 0) {
-                    accumulator = 0.;
-                    break;
-                }
-            }
-            if car.offroad && car.speed_kmh() < 4. {
-                respawn_timer += dt;
-            } else {
-                respawn_timer = 0.;
-            }
-            if respawn_timer > 3. {
-                note = "OFF COURSE · PRESS R TO RESTART".into();
-                note_time = 2.;
-            }
-        } else {
-            accumulator = 0.;
-        }
-        camera_pitch += (car.pitch - camera_pitch) * (dt * 8.).min(1.);
-        camera_roll += (car.roll - camera_roll) * (dt * 7.).min(1.);
-        let camera = view::DriverCamera::new(
-            car.position,
-            car.heading,
-            camera_pitch,
-            camera_roll,
-            car.speed_kmh(),
-            screen_width() / screen_height().max(1.),
-        );
-        world.draw(&camera);
-        let speed = car.speed_kmh();
-        let gear = if car.reversing {
-            7
-        } else if speed < 1. {
-            0
-        } else {
-            (1. + (speed / 42.).floor()).min(6.) as u8
-        };
-        let rpm = if gear == 0 {
-            950. + control.throttle * 1200.
-        } else {
-            1800. + (speed % 42.) / 42. * 4300. + control.throttle * 350.
-        };
+        world.draw(&state.driver_camera(screen_width() / screen_height().max(1.)));
         hud::draw(
-            &hud::HudState {
-                track_name: &track.name,
-                speed,
-                units,
-                rpm,
-                gear,
-                throttle: car.throttle,
-                brake: car.brake,
-                steering: car.steering / 0.58,
-                slip: car.slip,
-                elapsed: race.elapsed as f32,
-                best: race.best,
-                last: race.last,
-                checkpoint: race.next_checkpoint,
-                checkpoint_count: track.checkpoints.len(),
-                progress: car.distance / track.length,
-                paused,
-                started: race.started,
-                finished: race.finished,
-                invalid: race.invalid,
-                airborne: !car.grounded,
-                offroad: car.offroad,
-                help,
-                mouse_enabled: mouse.enabled(),
-                autodrive,
-                notification: if note_time > 0. { Some(&note) } else { None },
-                fps: get_fps(),
-            },
-            &track,
-            car.position,
-            car.heading,
+            &state.hud(get_fps()),
+            &state.track,
+            state.car.position,
+            state.car.heading,
         );
-        if let Some(limit) = opts.frames
-            && frames >= limit
-        {
+        if state.frame_limit_reached() {
             if let Some(ref dest) = opts.capture {
                 if let Err(error) = save_capture(dest, &get_screen_data()) {
                     result = Err(format!("Capture error for '{}': {error}", dest.display()));
@@ -626,8 +1016,11 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
                 println!("Captured {}", dest.display());
             }
             println!(
-                "Graphics smoke passed: {frames} frames, {:.1} km/h, {:.1} m progress, position {:?}",
-                speed, car.distance, car.position
+                "Graphics smoke passed: {} frames, {:.1} km/h, {:.1} m progress, position {:?}",
+                state.frames,
+                state.car.speed_kmh(),
+                state.car.distance,
+                state.car.position
             );
             break;
         }
@@ -637,6 +1030,100 @@ async fn game(opts: Options, mut track: Track) -> Result<(), String> {
     show_mouse(true);
     hud::shutdown();
     result
+}
+
+/// The driver's view follows the car's pitch and roll with a little lag.
+struct CameraAttitude {
+    pitch: f32,
+    roll: f32,
+}
+
+impl CameraAttitude {
+    fn new(car: &Car) -> Self {
+        let mut attitude = Self {
+            pitch: 0.,
+            roll: 0.,
+        };
+        attitude.snap(car);
+        attitude
+    }
+
+    /// Jump straight to the car's attitude after a restart or respawn,
+    /// instead of swinging over from where the previous run ended.
+    fn snap(&mut self, car: &Car) {
+        self.pitch = smooth_toward(f32::NAN, car.pitch, 0., 0.);
+        self.roll = smooth_toward(f32::NAN, car.roll, 0., 0.);
+    }
+
+    fn follow(&mut self, car: &Car, dt: f32) {
+        self.pitch = smooth_toward(self.pitch, car.pitch, 8., dt);
+        self.roll = smooth_toward(self.roll, car.roll, 7., dt);
+    }
+}
+
+/// Exponential smoothing at `rate` per second, independent of frame rate.
+/// A non-finite value never reaches the camera: an invalid current value
+/// adopts the target, and an invalid target holds the current value.
+fn smooth_toward(current: f32, target: f32, rate: f32, dt: f32) -> f32 {
+    match (current.is_finite(), target.is_finite()) {
+        (true, true) => {
+            let blend = 1. - (-rate * dt.max(0.)).exp();
+            current + (target - current) * blend
+        }
+        (false, true) => target,
+        (true, false) => current,
+        (false, false) => 0.,
+    }
+}
+
+#[cfg(test)]
+mod camera_checks {
+    use super::*;
+
+    #[test]
+    fn smoothing_is_independent_of_frame_rate() {
+        let mut fast = 0.;
+        for _ in 0..240 {
+            fast = smooth_toward(fast, 1., 8., 1. / 240.);
+        }
+        let mut slow = 0.;
+        for _ in 0..30 {
+            slow = smooth_toward(slow, 1., 8., 1. / 30.);
+        }
+        assert!((fast - slow).abs() < 1e-4, "{fast} vs {slow}");
+        assert!((fast - (1. - (-8f32).exp())).abs() < 1e-4);
+        // A long frame approaches the target without overshooting it.
+        assert!(smooth_toward(0., 1., 8., 0.5) <= 1.);
+        assert_eq!(smooth_toward(0.25, 1., 8., 0.), 0.25);
+    }
+
+    #[test]
+    fn non_finite_attitudes_never_reach_the_camera() {
+        assert_eq!(smooth_toward(f32::NAN, 0.3, 8., 0.01), 0.3);
+        assert_eq!(smooth_toward(0.2, f32::NAN, 8., 0.01), 0.2);
+        assert_eq!(smooth_toward(0.2, f32::INFINITY, 8., 0.01), 0.2);
+        assert_eq!(smooth_toward(f32::NAN, f32::NAN, 8., 0.01), 0.);
+        assert_eq!(smooth_toward(0.2, 0.3, 8., f32::NAN), 0.2);
+    }
+
+    #[test]
+    fn restarts_snap_the_view_to_the_grid_attitude() {
+        let track = Track::parse("straight 40 rise 6\nstraight 40 bank 10\nstraight 40").unwrap();
+        let mut car = Car::new(&track);
+        let mut attitude = CameraAttitude::new(&car);
+        assert_eq!((attitude.pitch, attitude.roll), (car.pitch, car.roll));
+        car.reset(&track, 60.);
+        attitude.follow(&car, 1. / 60.);
+        assert_ne!(attitude.roll, car.roll);
+        let mut records = RunRecords::new(None);
+        let mut race = records.start_race(car.distance, true);
+        restart_run(&mut car, &track, &mut records, &mut race, false);
+        attitude.snap(&car);
+        assert_eq!((attitude.pitch, attitude.roll), (car.pitch, car.roll));
+        attitude.pitch = f32::NAN;
+        attitude.follow(&car, 1. / 60.);
+        assert_eq!(attitude.pitch, car.pitch);
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +1145,181 @@ mod driving_checks {
         let opts = options(["--validate", "tracks/club.track"].map(String::from)).unwrap();
         assert!(opts.validate);
         assert_eq!(opts.path, PathBuf::from("tracks/club.track"));
+    }
+
+    #[test]
+    fn frame_counts_must_be_positive_integers() {
+        for args in [
+            vec!["--frames", "0"],
+            vec!["--smoke-test", "--frames", "0"],
+            vec!["--capture", "x.png", "--frames", "0"],
+        ] {
+            assert_eq!(
+                options(args).err(),
+                Some("--frames must be positive".into())
+            );
+        }
+        assert!(options(["--frames", "-3"]).is_err());
+        assert!(options(["--frames", "many"]).is_err());
+        assert!(options(["--frames"]).is_err());
+        assert_eq!(options(["--frames", "1"]).unwrap().frames, Some(1));
+    }
+
+    #[test]
+    fn explicit_frames_override_the_smoke_test_default_in_any_order() {
+        for args in [
+            vec!["--smoke-test", "--frames", "5"],
+            vec!["--frames", "5", "--smoke-test"],
+        ] {
+            let opts = options(args).unwrap();
+            assert_eq!(opts.frames, Some(5));
+            assert!(opts.autodrive);
+        }
+        let opts = options(["--smoke-test"]).unwrap();
+        assert_eq!(opts.frames, Some(SMOKE_TEST_FRAMES));
+        let opts = options(["--smoke-test", "--capture", "drive.png"]).unwrap();
+        assert_eq!(opts.frames, Some(SMOKE_TEST_FRAMES));
+    }
+
+    #[test]
+    fn capture_without_frames_defaults_to_thirty() {
+        let opts = options(["--capture", "shot.png"]).unwrap();
+        assert_eq!(opts.capture, Some(PathBuf::from("shot.png")));
+        assert_eq!(opts.frames, Some(30));
+        let opts = options(["--frames", "7", "--capture", "shot.png"]).unwrap();
+        assert_eq!(opts.frames, Some(7));
+        assert_eq!(options(["--autodrive"]).unwrap().frames, None);
+    }
+
+    #[test]
+    fn only_one_track_path_is_accepted() {
+        for args in [
+            vec!["--validate", "a.track", "--track", "b.track"],
+            vec!["--track", "a.track", "--validate", "b.track"],
+            vec!["--track", "a.track", "--track", "b.track"],
+            vec!["a.track", "b.track"],
+            vec!["a.track", "--validate", "b.track"],
+        ] {
+            let error = options(args.clone()).err().unwrap();
+            assert!(
+                error.contains("a.track") && error.contains("b.track"),
+                "{args:?}: {error}"
+            );
+        }
+        let opts = options(["my.track"]).unwrap();
+        assert_eq!(opts.path, PathBuf::from("my.track"));
+        assert!(!opts.validate);
+        let opts = options(["--validate", "b.track", "--autodrive"]).unwrap();
+        assert!(opts.validate && opts.autodrive);
+        assert_eq!(opts.path, PathBuf::from("b.track"));
+    }
+
+    #[test]
+    fn unknown_options_are_reported() {
+        for flag in ["--trak", "-x", "--"] {
+            assert_eq!(
+                options(["--autodrive", flag]).err(),
+                Some(format!("Unknown option: {flag}. Use --help."))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_arguments_are_paths_or_clean_errors() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = OsString::from_vec(b"caf\xe9.track".to_vec());
+        assert_eq!(
+            options([path.clone()]).unwrap().path,
+            PathBuf::from(path.clone())
+        );
+        let opts = options([OsString::from("--capture"), path.clone()]).unwrap();
+        assert_eq!(opts.capture, Some(PathBuf::from(path)));
+        let flag = OsString::from_vec(b"--fr\xe9mes".to_vec());
+        assert!(options([flag]).err().unwrap().starts_with("Unknown option"));
+        let number = OsString::from_vec(b"1\xe9".to_vec());
+        assert!(
+            options([OsString::from("--frames"), number])
+                .err()
+                .unwrap()
+                .starts_with("invalid frame count")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_arguments_are_paths_or_clean_errors() {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired surrogate cannot be represented as UTF-8.
+        let wide = |text: &str| {
+            let mut units: Vec<u16> = text.encode_utf16().collect();
+            units.insert(2, 0xd800);
+            OsString::from_wide(&units)
+        };
+        let path = wide("my.track");
+        assert_eq!(options([path.clone()]).unwrap().path, PathBuf::from(path));
+        assert!(
+            options([wide("--frames")])
+                .err()
+                .unwrap()
+                .starts_with("Unknown option")
+        );
+        assert!(
+            options([OsString::from("--at"), wide("12")])
+                .err()
+                .unwrap()
+                .starts_with("invalid distance")
+        );
+    }
+
+    #[test]
+    fn records_are_keyed_by_track_contents_and_record_version() {
+        let directory = Path::new("records");
+        let track = Track::parse("straight 40").unwrap();
+        let path = record_path_in(directory, &track);
+        assert_eq!(
+            path,
+            directory.join(format!(
+                "{:016x}-v{RECORD_VERSION}.best",
+                track.source_hash()
+            ))
+        );
+        assert_ne!(
+            path,
+            directory.join(format!("{:016x}.best", track.source_hash()))
+        );
+        assert_ne!(
+            record_path_in(directory, &Track::parse("straight 41").unwrap()),
+            path
+        );
+        // Records sit beside the bundled tracks, wherever the game started.
+        assert_eq!(
+            record_path(&track),
+            courses::game_root()
+                .unwrap()
+                .join("data")
+                .join(path.file_name().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_held_record_lock_fails_quickly_without_changing_the_record() {
+        let directory = TempDir::new("apex-record-lock-timeout-test");
+        let path = directory.path().join("course.best");
+        save_record(&path, 60.0).unwrap();
+        // A second handle conflicts even within one process.
+        let holder = std::fs::File::create(path.with_extension("lock")).unwrap();
+        holder.lock().unwrap();
+        let started = std::time::Instant::now();
+        let error = save_record(&path, 40.0).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(read_record(&path), Some(60.0));
+        assert!(!path.with_extension("tmp").exists());
+        holder.unlock().unwrap();
+        assert!(save_record(&path, 40.0).unwrap().improved);
+        assert_eq!(read_record(&path), Some(40.0));
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]
@@ -787,7 +1449,14 @@ mod driving_checks {
             wait_for_files(&[directory.join("go")]);
             for step in 0..32 {
                 let time = (1000 - step * 4 - writer) as f32;
-                let saved = save_record(&directory.join("course.best"), time).unwrap();
+                // The game gives up on a contended lock after a short wait
+                // and retries after a later run; do the same here.
+                let saved = loop {
+                    match save_record(&directory.join("course.best"), time) {
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
+                        result => break result.unwrap(),
+                    }
+                };
                 assert!(saved.best <= time);
                 std::thread::yield_now();
             }
@@ -883,7 +1552,7 @@ mod driving_checks {
             assert_eq!(opts.path, PathBuf::from("tracks/club.track"));
             assert_eq!(opts.frames, Some(180));
         }
-        let opts = options(["--demo".into()]).unwrap();
+        let opts = options(["--demo"]).unwrap();
         assert!(opts.demo && opts.autodrive);
         assert!(opts.frames.is_none());
         assert_eq!(opts.path, PathBuf::from(courses::BUNDLED_PATHS[0]));
@@ -909,13 +1578,13 @@ mod driving_checks {
                 },
                 1. / 120.,
             );
-            let candidate = race.update(track, 1. / 120., car.distance, !car.offroad);
+            let candidate = race.update(track, 1. / 120., car.distance, car.on_course());
             accepted = records.accept(candidate).or(accepted);
             if race.finished {
                 break;
             }
         }
-        assert!(race.finished && !race.invalid);
+        assert!(race.finished && !race.invalid());
         accepted
     }
 
@@ -968,7 +1637,7 @@ mod driving_checks {
         // A second reset before finishing must retain the same completed time.
         for _ in 0..2 {
             restart_run(&mut car, &track, &mut records, &mut race, false);
-            assert!(race.started && !race.finished && !race.invalid);
+            assert!(race.started && !race.finished && !race.invalid());
             assert_eq!(race.last, completed);
             assert_eq!(race.best, completed);
             assert_eq!(race.elapsed, 0.);
@@ -1041,7 +1710,7 @@ mod driving_checks {
 
     #[test]
     fn demo_drives_every_bundled_course_and_repeats_without_saving_records() {
-        let opts = options(["--demo".into()]).unwrap();
+        let opts = options(["--demo"]).unwrap();
         let mut path = opts.path.clone();
         for expected in courses::BUNDLED_PATHS
             .iter()
@@ -1060,7 +1729,7 @@ mod driving_checks {
                 let control = demo_control(&car, &track);
                 for _ in 0..2 {
                     car.update(&track, control, 1. / 120.);
-                    let candidate = race.update(&track, 1. / 120., car.distance, !car.offroad);
+                    let candidate = race.update(&track, 1. / 120., car.distance, car.on_course());
                     assert!(records.accept(candidate).is_none());
                     if race.completed_runs > 0 {
                         break;
@@ -1092,5 +1761,484 @@ mod driving_checks {
             path = courses::next_path(&path).unwrap();
         }
         assert_eq!(path, opts.path);
+    }
+}
+
+#[cfg(test)]
+mod frame_checks {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    const COURSE: &str = "name \"Test Straight\"\nwidth 12\nstraight 150\n";
+
+    /// One 60 Hz frame in a focused window with these command keys pressed.
+    fn frame(pressed: &[KeyCode]) -> FrameInput {
+        FrameInput {
+            frame_time: 1. / 60.,
+            focus_lost: false,
+            focus_gained: false,
+            focused: true,
+            pressed: pressed.to_vec(),
+            right_click: false,
+            keys: Control::default(),
+            mouse_motion: Vec::new(),
+            mouse_position: Vec2::ZERO,
+        }
+    }
+
+    fn idle() -> FrameInput {
+        frame(&[])
+    }
+
+    fn lasting(frame_time: f32) -> FrameInput {
+        FrameInput {
+            frame_time,
+            ..idle()
+        }
+    }
+
+    fn right_click() -> FrameInput {
+        FrameInput {
+            right_click: true,
+            ..idle()
+        }
+    }
+
+    fn throttle() -> FrameInput {
+        FrameInput {
+            keys: Control {
+                throttle: 1.,
+                ..Control::default()
+            },
+            ..idle()
+        }
+    }
+
+    /// A game on `track_path`, keeping records in the fixture's `data/`.
+    fn game_on(dir: &TempDir, track_path: &Path, args: &[&str]) -> GameState {
+        let mut all = vec![OsString::from("--track"), track_path.into()];
+        all.extend(args.iter().map(OsString::from));
+        let opts = options(all).unwrap();
+        let track = Track::load(&opts.path).unwrap();
+        GameState::new(&opts, track, Some(dir.path().join("data")))
+    }
+
+    /// A game on a short custom straight in a fresh fixture directory.
+    fn game(args: &[&str]) -> (TempDir, GameState) {
+        let dir = TempDir::new("apex-game-state-test");
+        let path = dir.path().join("course.track");
+        std::fs::write(&path, COURSE).unwrap();
+        let state = game_on(&dir, &path, args);
+        (dir, state)
+    }
+
+    fn bundled(index: usize) -> PathBuf {
+        resolve_track(Path::new(courses::BUNDLED_PATHS[index])).unwrap()
+    }
+
+    fn grid_distance(state: &GameState) -> f32 {
+        Car::new(&state.track).distance
+    }
+
+    #[test]
+    fn escape_closes_help_before_pausing() {
+        let (_dir, mut state) = game(&[]);
+        state.update(&frame(&[KeyCode::F1]));
+        assert!(state.help && !state.paused);
+        state.update(&frame(&[KeyCode::Escape]));
+        assert!(!state.help && !state.paused);
+        state.update(&frame(&[KeyCode::Escape]));
+        assert!(state.paused && !state.help);
+        // Help opened over the pause menu closes first, leaving it paused.
+        state.update(&frame(&[KeyCode::F1]));
+        assert!(state.help && state.paused);
+        state.update(&frame(&[KeyCode::Escape]));
+        assert!(!state.help && state.paused);
+        state.update(&frame(&[KeyCode::Escape]));
+        assert!(!state.help && !state.paused);
+    }
+
+    #[test]
+    fn q_quits_only_while_paused() {
+        let (_dir, mut state) = game(&[]);
+        assert_eq!(state.update(&frame(&[KeyCode::Q])), []);
+        // Escape is handled first: it resumes, so the same frame's Q does not quit.
+        state.update(&frame(&[KeyCode::Escape]));
+        assert!(state.paused);
+        assert_eq!(state.update(&frame(&[KeyCode::Escape, KeyCode::Q])), []);
+        assert!(!state.paused);
+        state.update(&frame(&[KeyCode::Escape]));
+        // Earlier side effects in the frame still happen; nothing after Q does.
+        assert_eq!(
+            state.update(&frame(&[KeyCode::F11, KeyCode::Q, KeyCode::Enter])),
+            [Action::SetFullscreen(true), Action::Quit]
+        );
+        assert!(state.paused && !state.race.started);
+    }
+
+    #[test]
+    fn enter_starts_a_run_and_restarts_a_finished_one() {
+        let (_dir, mut state) = game(&[]);
+        let grid = grid_distance(&state);
+        state.update(&throttle());
+        assert!(!state.race.started);
+        assert_eq!(state.car.distance, grid);
+        assert_eq!(state.race.elapsed, 0.);
+
+        // The run starts and is simulated on the frame Enter is pressed.
+        state.update(&frame(&[KeyCode::Enter]));
+        assert!(state.race.started && !state.paused);
+        assert!(state.race.elapsed > 0.);
+
+        // Enter also resumes a paused run in place, closing help.
+        state.update(&throttle());
+        state.update(&frame(&[KeyCode::Escape]));
+        state.update(&frame(&[KeyCode::F1]));
+        let distance = state.car.distance;
+        assert!(distance > grid);
+        state.update(&frame(&[KeyCode::Enter]));
+        assert!(!state.paused && !state.help);
+        assert!(state.car.distance >= distance);
+
+        for _ in 0..3000 {
+            if state.race.finished {
+                break;
+            }
+            state.update(&throttle());
+        }
+        assert!(state.race.finished && !state.race.invalid());
+        let finish_time = state.race.last.unwrap();
+        assert_eq!(state.notification(), Some("NEW PERSONAL BEST"));
+        assert_eq!(read_record(&state.record_file), Some(finish_time));
+        // A finished run stays put.
+        let finished_at = state.car.distance;
+        state.update(&throttle());
+        assert_eq!(state.car.distance, finished_at);
+
+        state.update(&frame(&[KeyCode::Enter]));
+        assert!(state.race.started && !state.race.finished);
+        assert_eq!(state.race.last, Some(finish_time));
+        assert_eq!(state.race.best, Some(finish_time));
+        assert!(state.race.elapsed < 0.1);
+        assert!(state.car.distance < grid + 1.);
+    }
+
+    #[test]
+    fn r_restarts_the_run_and_snaps_the_camera() {
+        let (_dir, mut state) = game(&[]);
+        let grid = grid_distance(&state);
+        state.update(&frame(&[KeyCode::Enter]));
+        for _ in 0..60 {
+            state.update(&throttle());
+        }
+        assert!(state.car.distance > grid + 1.);
+        state.update(&frame(&[KeyCode::Escape]));
+        state.attitude.pitch = 0.5;
+        state.attitude.roll = -0.3;
+        state.respawn_timer = 2.;
+
+        state.update(&frame(&[KeyCode::R]));
+        assert_eq!(state.car.distance, grid);
+        assert!(state.race.started && state.race.elapsed == 0.);
+        assert_eq!(
+            (state.attitude.pitch, state.attitude.roll),
+            (state.car.pitch, state.car.roll)
+        );
+        assert_eq!((state.accumulator, state.respawn_timer), (0., 0.));
+        assert_eq!(state.notification(), Some("NEW RUN"));
+        // Restarting does not resume a paused run.
+        assert!(state.paused);
+        for _ in 0..121 {
+            state.update(&idle());
+        }
+        assert_eq!(state.notification(), None);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_current_track_and_shows_the_error() {
+        let (dir, mut state) = game(&[]);
+        let path = dir.path().join("course.track");
+        let original = state.track.source_hash();
+        state.update(&frame(&[KeyCode::Enter]));
+        std::fs::write(&path, "straight banana\n").unwrap();
+        let distance = state.car.distance;
+
+        let actions = state.update(&FrameInput {
+            pressed: vec![KeyCode::F5],
+            ..throttle()
+        });
+        assert!(!actions.contains(&Action::RebuildWorld));
+        assert_eq!(state.track.source_hash(), original);
+        assert_eq!(state.path, path);
+        let note = state.notification().unwrap();
+        assert!(note.starts_with("RELOAD FAILED: "), "{note}");
+        assert!(note.contains("banana"), "{note}");
+        assert_eq!(state.note_time, 15.);
+        // The current run carries on.
+        assert!(state.race.started && !state.paused);
+        assert!(state.car.distance > distance);
+
+        std::fs::write(&path, "name \"Edited\"\nstraight 90\n").unwrap();
+        let actions = state.update(&frame(&[KeyCode::F5]));
+        assert_eq!(actions, [Action::RebuildWorld]);
+        assert_eq!(state.track.name, "Edited");
+        assert_ne!(state.track.source_hash(), original);
+        assert_eq!(state.notification(), Some("TRACK RELOADED"));
+        assert!(!state.race.started);
+    }
+
+    #[test]
+    fn course_changes_reset_the_run_and_records_but_keep_units_and_mouse_mode() {
+        let (dir, mut state) = game(&[]);
+        let next = Track::load(bundled(0)).unwrap();
+        let next_record = record_path_in(&dir.path().join("data"), &next);
+        save_record(&next_record, 123.).unwrap();
+        state.update(&frame(&[KeyCode::U]));
+        state.update(&right_click());
+        state.update(&frame(&[KeyCode::Enter]));
+        state.update(&frame(&[KeyCode::Escape]));
+        state.update(&frame(&[KeyCode::F1]));
+        state.attitude.pitch = 0.5;
+        assert!(state.mouse.enabled() && state.paused && state.help);
+
+        let actions = state.update(&frame(&[KeyCode::Tab]));
+        assert!(actions.contains(&Action::RebuildWorld));
+        assert_eq!(state.path, bundled(0));
+        assert_eq!(state.track.source_hash(), next.source_hash());
+        assert_eq!(state.record_file, next_record);
+        assert_eq!(state.race.best, Some(123.));
+        assert_eq!(state.race.elapsed, 0.);
+        assert!(!state.race.started && !state.paused);
+        assert_eq!(state.car.distance, grid_distance(&state));
+        assert_eq!(
+            (state.attitude.pitch, state.attitude.roll),
+            (state.car.pitch, state.car.roll)
+        );
+        assert_eq!(state.notification(), Some("COURSE LOADED"));
+        // Player preferences and the help screen survive the change.
+        assert!(matches!(state.units, hud::Units::Metric));
+        assert!(state.mouse.enabled() && state.help);
+
+        // Reloading rereads the record, which may have changed on disk.
+        save_record(&next_record, 100.).unwrap();
+        state.update(&frame(&[KeyCode::F1]));
+        state.update(&frame(&[KeyCode::Enter]));
+        state.update(&frame(&[KeyCode::Escape]));
+        state.update(&frame(&[KeyCode::F5]));
+        assert_eq!(state.path, bundled(0));
+        assert_eq!(state.race.best, Some(100.));
+        assert!(!state.race.started && !state.paused);
+        assert_eq!(state.notification(), Some("TRACK RELOADED"));
+        assert!(matches!(state.units, hud::Units::Metric) && state.mouse.enabled());
+    }
+
+    #[test]
+    fn losing_focus_pauses_only_an_active_manual_run() {
+        let lose_focus = FrameInput {
+            focus_lost: true,
+            focused: false,
+            ..idle()
+        };
+        let (_dir, mut state) = game(&[]);
+        state.update(&lose_focus);
+        assert!(!state.paused, "the start screen is not a run");
+
+        state.update(&frame(&[KeyCode::Enter]));
+        state.update(&right_click());
+        assert!(state.mouse.enabled() && state.cursor_grabbed);
+        assert_eq!(state.update(&lose_focus), [Action::GrabCursor(false)]);
+        assert!(state.paused && state.mouse.enabled());
+        let distance = state.car.distance;
+        // Without focus the run stays still even once resumed.
+        state.update(&FrameInput {
+            pressed: vec![KeyCode::Escape],
+            focused: false,
+            ..throttle()
+        });
+        assert!(!state.paused);
+        assert_eq!(state.car.distance, distance);
+
+        state.race.finished = true;
+        state.update(&lose_focus);
+        assert!(!state.paused, "a finished run has nothing to hold");
+
+        let (_dir, mut state) = game(&["--autodrive"]);
+        state.update(&lose_focus);
+        assert!(!state.paused, "the auto driver keeps driving");
+        let distance = state.car.distance;
+        state.update(&FrameInput {
+            focused: false,
+            ..idle()
+        });
+        assert!(state.car.distance > distance);
+    }
+
+    #[test]
+    fn the_click_that_refocuses_the_window_does_not_toggle_mouse_driving() {
+        let (_dir, mut state) = game(&["--autodrive"]);
+        state.update(&FrameInput {
+            focus_lost: true,
+            focused: false,
+            ..idle()
+        });
+        state.update(&FrameInput {
+            focused: false,
+            ..right_click()
+        });
+        assert!(!state.mouse.enabled() && state.autodrive);
+        state.update(&FrameInput {
+            focus_gained: true,
+            ..right_click()
+        });
+        assert!(!state.mouse.enabled() && state.autodrive);
+        // Clicks replayed shortly after activation are ignored too.
+        state.update(&FrameInput {
+            frame_time: 0.1,
+            ..right_click()
+        });
+        assert!(!state.mouse.enabled());
+        state.update(&lasting(0.1));
+        state.update(&lasting(0.1));
+        state.update(&right_click());
+        assert!(state.mouse.enabled() && !state.autodrive);
+        state.update(&right_click());
+        assert!(!state.mouse.enabled() && !state.autodrive);
+    }
+
+    #[test]
+    fn a_car_falling_below_the_course_returns_to_the_grid() {
+        let (_dir, mut state) = game(&[]);
+        let grid = grid_distance(&state);
+        state.update(&frame(&[KeyCode::Enter]));
+        for _ in 0..60 {
+            state.update(&throttle());
+        }
+        let floor = state.track.ground_height() - FALL_DEPTH;
+        // Just above the threshold is still a fall in progress.
+        state.car.position.y = floor + 1.;
+        state.car.grounded = false;
+        state.update(&idle());
+        assert_ne!(state.notification(), Some("BACK ON THE GRID"));
+        assert!(state.car.distance > grid + 1.);
+
+        state.car.position.y = floor - 5.;
+        state.attitude.pitch = 0.5;
+        state.update(&idle());
+        assert_eq!(state.notification(), Some("BACK ON THE GRID"));
+        assert_eq!(state.car.distance, grid);
+        assert!(state.race.started && state.race.elapsed < 0.01);
+        assert_eq!(state.accumulator, 0.);
+        assert!(state.attitude.pitch.abs() < 0.01);
+
+        state.car.position.x = f32::NAN;
+        state.update(&idle());
+        assert!(state.car.position.is_finite());
+        assert_eq!(state.car.distance, grid);
+    }
+
+    #[test]
+    fn a_car_stopped_off_the_road_is_told_how_to_restart() {
+        let (_dir, mut state) = game(&["--at", "60"]);
+        state.update(&frame(&[KeyCode::Enter]));
+        state.car.position.x += 25.;
+        state.update(&idle());
+        assert!(state.car.offroad && state.car.speed_kmh() < 4.);
+        for _ in 0..28 {
+            state.update(&lasting(0.1));
+        }
+        assert_eq!(state.notification(), None);
+        for _ in 0..3 {
+            state.update(&lasting(0.1));
+        }
+        assert_eq!(
+            state.notification(),
+            Some("OFF COURSE · PRESS R TO RESTART")
+        );
+        // Pausing stops the hint's timer rather than resetting it.
+        state.update(&frame(&[KeyCode::Escape]));
+        assert!(state.respawn_timer > OFF_COURSE_HINT_DELAY);
+        state.update(&frame(&[KeyCode::R]));
+        assert_eq!(state.respawn_timer, 0.);
+        assert_eq!(state.notification(), Some("NEW RUN"));
+    }
+
+    #[test]
+    fn the_off_course_timer_follows_the_fixed_frame_clock() {
+        // Smoke tests and captures must not depend on the machine's speed.
+        let (_dir, mut state) = game(&["--autodrive", "--frames", "100", "--at", "60"]);
+        state.car.position.x += 25.;
+        state.update(&idle());
+        assert!(state.car.offroad && state.car.speed_kmh() < 4.);
+        let before = state.respawn_timer;
+        state.update(&lasting(0.1));
+        assert!(state.car.offroad && state.car.speed_kmh() < 4.);
+        assert!((state.respawn_timer - before - FIXED_FRAME_TIME).abs() < 1e-6);
+    }
+
+    #[test]
+    fn demo_mode_moves_on_after_a_completed_run() {
+        let dir = TempDir::new("apex-demo-state-test");
+        let mut state = game_on(&dir, &bundled(0), &["--demo"]);
+        assert!(state.race.started && state.autodrive);
+        state.update(&idle());
+        assert_eq!(state.path, bundled(0));
+
+        state.race.completed_runs = 1;
+        // Not while paused or reading help, and a reload takes precedence.
+        state.update(&frame(&[KeyCode::Escape]));
+        assert!(state.paused);
+        assert_eq!(state.path, bundled(0));
+        state.update(&frame(&[KeyCode::Escape, KeyCode::F5]));
+        assert!(!state.paused);
+        assert_eq!(state.path, bundled(0));
+        assert_eq!(state.notification(), Some("TRACK RELOADED"));
+        assert_eq!(state.race.completed_runs, 0);
+        state.race.completed_runs = 1;
+        state.update(&frame(&[KeyCode::F1]));
+        assert_eq!(state.path, bundled(0));
+
+        let actions = state.update(&frame(&[KeyCode::F1]));
+        assert!(actions.contains(&Action::RebuildWorld));
+        assert_eq!(state.path, bundled(1));
+        assert_eq!(state.notification(), Some("COURSE LOADED"));
+        assert!(state.race.started && state.race.completed_runs == 0);
+
+        // A manual takeover ends the cycle.
+        state.update(&right_click());
+        state.race.completed_runs = 1;
+        state.update(&idle());
+        assert_eq!(state.path, bundled(1));
+    }
+
+    #[test]
+    fn frame_limits_end_the_game_and_fix_the_auto_driver_step() {
+        let (_dir, mut state) = game(&["--frames", "3"]);
+        for _ in 0..2 {
+            state.update(&idle());
+            assert!(!state.frame_limit_reached());
+        }
+        state.update(&idle());
+        assert!(state.frame_limit_reached());
+
+        let (_dir, mut state) = game(&["--capture", "shot.png"]);
+        for _ in 0..CAPTURE_FRAMES {
+            assert!(!state.frame_limit_reached());
+            state.update(&idle());
+        }
+        assert!(state.frame_limit_reached());
+        let (_dir, state) = game(&[]);
+        assert!(!state.frame_limit_reached());
+
+        // Smoke tests advance a fixed 1/60 s per frame, however long it took.
+        let (_dir, mut state) = game(&["--smoke-test"]);
+        state.update(&lasting(0.1));
+        assert!((state.race.elapsed - 1. / 60.).abs() < 1e-6);
+        // Interactive frames, and frames after a takeover, use real time.
+        let (_dir, mut state) = game(&["--frames", "100"]);
+        state.update(&FrameInput {
+            pressed: vec![KeyCode::Enter],
+            ..lasting(0.1)
+        });
+        assert!(state.race.elapsed > 0.09);
     }
 }
