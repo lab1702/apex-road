@@ -2,6 +2,7 @@
 use macroquad::prelude::*;
 use std::cell::RefCell;
 
+use crate::race::InvalidReason;
 use crate::track::Track;
 
 const PAPER: Color = Color::new(0.94, 0.95, 0.90, 1.0);
@@ -30,6 +31,7 @@ pub fn init() {
 /// Call before returning from the game's async function, after the last draw.
 pub fn shutdown() {
     HUD_FONT.with(|slot| drop(slot.borrow_mut().take()));
+    FIT_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 fn measure(label: &str, size: f32) -> TextDimensions {
@@ -80,6 +82,87 @@ impl Units {
     }
 }
 
+/// Gauge codes for neutral and reverse; forward gears are 1 to `TOP_GEAR`.
+pub const NEUTRAL: u8 = 0;
+pub const REVERSE: u8 = 7;
+const TOP_GEAR: u8 = 6;
+/// Road speed covered by each gear of the display-only gearbox.
+const GEAR_SPAN_KMH: f32 = 42.0;
+const TACH_MIN_RPM: f32 = 850.0;
+const TACH_MAX_RPM: f32 = 7500.0;
+/// Tachometer segments above this engine speed are drawn as the redline.
+const REDLINE_RPM: f32 = 6500.0;
+const TACH_SEGMENTS: usize = 32;
+
+/// The gear shown for a road speed. The car itself has no gearbox.
+pub fn gear(speed_kmh: f32, reversing: bool) -> u8 {
+    if reversing {
+        REVERSE
+    } else if speed_kmh.is_nan() || speed_kmh < 1.0 {
+        NEUTRAL
+    } else {
+        (1.0 + (speed_kmh / GEAR_SPAN_KMH).floor()).min(f32::from(TOP_GEAR)) as u8
+    }
+}
+
+/// Engine speed for the tachometer. Each gear sweeps from 1800 rpm at its
+/// lowest road speed into the redline at its highest under full throttle;
+/// lifting off keeps cruising revs below the redline.
+pub fn engine_rpm(speed_kmh: f32, gear: u8, throttle: f32) -> f32 {
+    let throttle = if throttle.is_nan() {
+        0.0
+    } else {
+        throttle.clamp(0.0, 1.0)
+    };
+    if gear == NEUTRAL {
+        return 950.0 + throttle * 1200.0;
+    }
+    let lowest = if gear == REVERSE {
+        0.0
+    } else {
+        f32::from(gear.saturating_sub(1)) * GEAR_SPAN_KMH
+    };
+    let within = ((speed_kmh - lowest) / GEAR_SPAN_KMH).clamp(0.0, 1.0);
+    let within = if within.is_nan() { 0.0 } else { within };
+    1800.0 + within * 4900.0 + throttle * 500.0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TachSegment {
+    Off,
+    Lit,
+    Redline,
+}
+
+fn tach_segment(index: usize, rpm: f32) -> TachSegment {
+    let threshold =
+        TACH_MIN_RPM + (TACH_MAX_RPM - TACH_MIN_RPM) * (index + 1) as f32 / TACH_SEGMENTS as f32;
+    if rpm.is_nan() || rpm < threshold {
+        TachSegment::Off
+    } else if threshold > REDLINE_RPM {
+        TachSegment::Redline
+    } else {
+        TachSegment::Lit
+    }
+}
+
+fn invalid_banner(reason: InvalidReason) -> &'static str {
+    match reason {
+        InvalidReason::MissedCheckpoint => "RUN INVALID  /  MISSED CHECKPOINT",
+        InvalidReason::WrongWay => "RUN INVALID  /  WRONG WAY",
+        InvalidReason::CutCourse => "RUN INVALID  /  CUT COURSE",
+    }
+}
+
+/// A center-zero input in -1..=1; anything unusable reads as neutral.
+fn input_indicator(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 pub struct HudState<'a> {
     pub track_name: &'a str,
     /// Speed in kilometers per hour.
@@ -89,6 +172,8 @@ pub struct HudState<'a> {
     pub gear: u8,
     pub throttle: f32,
     pub brake: f32,
+    /// Commanded steering input, -1 (full left) to 1 (full right). The wheel
+    /// angle itself is speed-limited, so it cannot show where neutral is.
     pub steering: f32,
     pub slip: f32,
     pub elapsed: f32,
@@ -100,7 +185,8 @@ pub struct HudState<'a> {
     pub paused: bool,
     pub started: bool,
     pub finished: bool,
-    pub invalid: bool,
+    /// Why the current lap or run cannot count, if it cannot.
+    pub invalid: Option<InvalidReason>,
     pub airborne: bool,
     pub offroad: bool,
     pub mouse_enabled: bool,
@@ -197,13 +283,102 @@ fn fit_lines(
     lines
 }
 
+/// Lines fitted for one label at one size and width, with the widest line.
+struct FittedLines {
+    label: String,
+    width: u32,
+    size: u32,
+    dpi_scale: u32,
+    max_lines: usize,
+    lines: Vec<String>,
+    widest: f32,
+}
+
+const FIT_CACHE_ENTRIES: usize = 4;
+
+thread_local! {
+    /// Most recently used first. Fitting measures every prefix of a line, so
+    /// redoing it each frame would be quadratic in the label length.
+    static FIT_CACHE: RefCell<Vec<FittedLines>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `fit_lines` with the HUD font, cached across frames. Passes the lines and
+/// the width of the widest one to `use_lines`.
+fn with_fitted_lines<R>(
+    label: &str,
+    width: f32,
+    max_lines: usize,
+    size: f32,
+    use_lines: impl FnOnce(&[String], f32) -> R,
+) -> R {
+    // Glyph advances depend on the DPI scale as well as the font size.
+    let dpi_scale = macroquad::miniquad::window::dpi_scale();
+    FIT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let fitted = cached_fit(
+            &mut cache,
+            label,
+            width,
+            max_lines,
+            (size, dpi_scale),
+            |candidate| measure(candidate, size).width,
+        );
+        use_lines(&fitted.lines, fitted.widest)
+    })
+}
+
+/// Look up or fit `label`, keeping the result as the most recent entry.
+/// `style` must identify everything else `measure_width` depends on.
+fn cached_fit<'a>(
+    cache: &'a mut Vec<FittedLines>,
+    label: &str,
+    width: f32,
+    max_lines: usize,
+    style: (f32, f32),
+    measure_width: impl Fn(&str) -> f32,
+) -> &'a FittedLines {
+    let (size, dpi_scale) = (style.0.to_bits(), style.1.to_bits());
+    let found = cache.iter().position(|entry| {
+        entry.width == width.to_bits()
+            && entry.size == size
+            && entry.dpi_scale == dpi_scale
+            && entry.max_lines == max_lines
+            && entry.label == label
+    });
+    match found {
+        Some(index) => cache[..=index].rotate_right(1),
+        None => {
+            let lines = fit_lines(label, width, max_lines, &measure_width);
+            let widest = lines
+                .iter()
+                .map(|line| measure_width(line))
+                .fold(0.0, f32::max);
+            cache.truncate(FIT_CACHE_ENTRIES - 1);
+            cache.insert(
+                0,
+                FittedLines {
+                    label: label.to_owned(),
+                    width: width.to_bits(),
+                    size,
+                    dpi_scale,
+                    max_lines,
+                    lines,
+                    widest,
+                },
+            );
+        }
+    }
+    &cache[0]
+}
+
 fn tracking(label: &str, x: f32, y: f32, size: f32, spacing: f32, color: Color) {
     let size = size * 1.1;
     let mut cursor = x;
+    let mut buffer = [0; 4];
     for character in label.chars() {
-        let glyph = character.to_string();
-        text(&glyph, cursor, y, size, color);
-        cursor += measure(&glyph, size).width + spacing * 0.7;
+        let glyph = character.encode_utf8(&mut buffer);
+        text(glyph, cursor, y, size, color);
+        cursor += measure(glyph, size).width + spacing * 0.7;
     }
 }
 
@@ -357,13 +532,11 @@ fn gauges(state: &HudState<'_>, u: f32) {
     );
 
     // A clean segmented tachometer caps the entire floating instrument pod.
-    let revs = ((state.rpm - 850.0) / 6650.0).clamp(0.0, 1.0);
-    for i in 0..32 {
-        let fraction = (i + 1) as f32 / 32.0;
-        let color = if fraction <= revs {
-            if i > 26 { ORANGE } else { CYAN }
-        } else {
-            alpha(PAPER, 0.12)
+    for i in 0..TACH_SEGMENTS {
+        let color = match tach_segment(i, state.rpm) {
+            TachSegment::Off => alpha(PAPER, 0.12),
+            TachSegment::Lit => CYAN,
+            TachSegment::Redline => ORANGE,
         };
         draw_rectangle(
             x + (24.0 + i as f32 * 13.85) * u,
@@ -395,8 +568,8 @@ fn gauges(state: &HudState<'_>, u: f32) {
     );
 
     let gear = match state.gear {
-        0 => "N".to_owned(),
-        7 => "R".to_owned(),
+        NEUTRAL => "N".to_owned(),
+        REVERSE => "R".to_owned(),
         value => value.to_string(),
     };
     text_center(&gear, x + 206.0 * u, y + 88.0 * u, 47.0 * u, CYAN);
@@ -449,7 +622,9 @@ fn gauges(state: &HudState<'_>, u: f32) {
             ORANGE,
         );
     }
-    // Steering is a tiny center-zero indicator for either input method.
+    // Steering is a tiny center-zero indicator of the commanded input for
+    // any input method, so mouse drivers can always find neutral.
+    let steering = input_indicator(state.steering);
     draw_line(
         tx,
         y + 114.0 * u,
@@ -467,7 +642,7 @@ fn gauges(state: &HudState<'_>, u: f32) {
         alpha(PAPER, 0.32),
     );
     draw_circle(
-        tx + (44.0 + state.steering.clamp(-1.0, 1.0) * 41.0) * u,
+        tx + (44.0 + steering * 41.0) * u,
         y + 114.0 * u,
         2.5 * u,
         PAPER,
@@ -497,9 +672,12 @@ fn gauges(state: &HudState<'_>, u: f32) {
         u,
         alpha(PAPER, 0.14),
     );
+    // The dot leans toward the demand that is asking too much of the tires:
+    // steering sideways, pedals along. Use the commanded steering here too;
+    // the speed-limited wheel angle would hide lateral demand at speed.
     let shift = state.slip.clamp(0.0, 1.0) * 16.0 * u;
     let slip_pos = vec2(
-        grip_x + state.steering.clamp(-1.0, 1.0) * shift,
+        grip_x + steering * shift,
         grip_y + (state.brake - state.throttle) * shift,
     );
     draw_circle(slip_pos.x, slip_pos.y, 7.0 * u, alpha(grip_color, 0.14));
@@ -690,14 +868,17 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     } else {
         timer_x
     };
-    for name in fit_lines(
+    with_fitted_lines(
         state.track_name,
         name_right - margin - 16.0 * u,
         1,
-        |label| measure(label, 18.0 * u).width,
-    ) {
-        text(&name, margin, margin + 49.0 * u, 18.0 * u, PAPER);
-    }
+        18.0 * u,
+        |lines, _| {
+            for name in lines {
+                text(name, margin, margin + 49.0 * u, 18.0 * u, PAPER);
+            }
+        },
+    );
     panel(
         margin,
         margin + 63.0 * u,
@@ -741,7 +922,11 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         timer_x + 15.0 * u,
         timer_y + 67.0 * u,
         37.0 * u,
-        if state.invalid { ORANGE } else { PAPER },
+        if state.invalid.is_some() {
+            ORANGE
+        } else {
+            PAPER
+        },
     );
     draw_line(
         timer_x + 17.0 * u,
@@ -892,8 +1077,11 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         );
     }
 
-    if state.invalid && state.started && !state.finished {
-        let label = "RUN INVALID  /  MISSED CHECKPOINT";
+    if let Some(reason) = state.invalid
+        && state.started
+        && !state.finished
+    {
+        let label = invalid_banner(reason);
         let ww = 314.0 * u;
         let xx = (w - ww) * 0.5;
         panel(xx, h - 204.0 * u, ww, 26.0 * u, 5.0 * u, alpha(PANEL, 0.86));
@@ -901,33 +1089,35 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     }
     if let Some(notification) = state.notification {
         let size = 16.0 * u;
-        let lines = fit_lines(notification, w - 2.0 * margin - 42.0 * u, 6, |label| {
-            measure(label, size).width
-        });
-        if !lines.is_empty() {
-            let notification_w = lines
-                .iter()
-                .map(|line| measure(line, size).width)
-                .fold(0.0, f32::max)
-                + 42.0 * u;
-            panel(
-                (w - notification_w) * 0.5,
-                h * 0.24,
-                notification_w,
-                (41.0 + (lines.len() - 1) as f32 * 22.0) * u,
-                8.0 * u,
-                alpha(PANEL, 0.90),
-            );
-            for (index, line) in lines.iter().enumerate() {
-                text_center(
-                    line,
-                    w * 0.5,
-                    h * 0.24 + (26.0 + index as f32 * 22.0) * u,
-                    size,
-                    PAPER,
+        with_fitted_lines(
+            notification,
+            w - 2.0 * margin - 42.0 * u,
+            6,
+            size,
+            |lines, widest| {
+                if lines.is_empty() {
+                    return;
+                }
+                let notification_w = widest + 42.0 * u;
+                panel(
+                    (w - notification_w) * 0.5,
+                    h * 0.24,
+                    notification_w,
+                    (41.0 + (lines.len() - 1) as f32 * 22.0) * u,
+                    8.0 * u,
+                    alpha(PANEL, 0.90),
                 );
-            }
-        }
+                for (index, line) in lines.iter().enumerate() {
+                    text_center(
+                        line,
+                        w * 0.5,
+                        h * 0.24 + (26.0 + index as f32 * 22.0) * u,
+                        size,
+                        PAPER,
+                    );
+                }
+            },
+        );
     }
 
     if !state.started && !state.help {
@@ -977,7 +1167,7 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         let fy = h * 0.31;
         panel(fx, fy, fw, 190.0 * u, 16.0 * u, alpha(PANEL, 0.94));
         tracking(
-            if state.invalid {
+            if state.invalid.is_some() {
                 "RUN COMPLETE"
             } else {
                 "ACROSS THE LINE"
@@ -986,7 +1176,11 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
             fy + 34.0 * u,
             11.0 * u,
             2.0 * u,
-            if state.invalid { ORANGE } else { CYAN },
+            if state.invalid.is_some() {
+                ORANGE
+            } else {
+                CYAN
+            },
         );
         text(
             &time_string(state.elapsed),
@@ -996,11 +1190,9 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
             PAPER,
         );
         text(
-            if state.invalid {
-                "Missed a checkpoint. Give it another run."
-            } else {
-                "The next lap is yours."
-            },
+            state
+                .invalid
+                .map_or("The next lap is yours.", InvalidReason::explanation),
             fx + 30.0 * u,
             fy + 131.0 * u,
             15.0 * u,
@@ -1016,6 +1208,132 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     }
     if state.paused || state.help {
         controls_overlay(state, u);
+    }
+}
+
+#[cfg(test)]
+mod gauge_tests {
+    use super::*;
+
+    fn tach(rpm: f32) -> (usize, usize) {
+        let segments = (0..TACH_SEGMENTS).map(|i| tach_segment(i, rpm));
+        let lit = segments.clone().filter(|s| *s != TachSegment::Off).count();
+        let red = segments.filter(|s| *s == TachSegment::Redline).count();
+        (lit, red)
+    }
+
+    #[test]
+    fn full_throttle_reaches_the_redline_at_the_top_of_every_gear() {
+        for gear_number in 1..=TOP_GEAR {
+            let top = f32::from(gear_number) * GEAR_SPAN_KMH - 0.5;
+            assert_eq!(gear(top, false), gear_number);
+            let (lit, red) = tach(engine_rpm(top, gear_number, 1.0));
+            assert!(red > 0 && lit < TACH_SEGMENTS, "gear {gear_number}");
+            if gear_number == TOP_GEAR {
+                continue;
+            }
+            // Just after the shift the revs drop well clear of it.
+            let shifted = top + 1.0;
+            let (_, red) = tach(engine_rpm(shifted, gear(shifted, false), 1.0));
+            assert_eq!(red, 0, "gear {gear_number}");
+        }
+    }
+
+    #[test]
+    fn cruising_and_idling_stay_below_the_redline() {
+        for speed in [10.0, 60.0, 100.0, 140.0, 200.0, 240.0] {
+            for throttle in [0.0, 0.3, 0.6] {
+                let rpm = engine_rpm(speed, gear(speed, false), throttle);
+                assert_eq!(tach(rpm).1, 0, "{speed} km/h at {throttle}");
+            }
+        }
+        for throttle in [0.0, 1.0] {
+            assert_eq!(tach(engine_rpm(0.0, NEUTRAL, throttle)).1, 0);
+        }
+    }
+
+    #[test]
+    fn revs_rise_through_each_gear_without_wrapping_in_top_gear() {
+        let mut previous = 0.0;
+        for step in 0..420 {
+            let speed = 210.0 + step as f32 * 0.25;
+            let rpm = engine_rpm(speed, gear(speed, false), 1.0);
+            assert!(rpm >= previous, "{speed} km/h");
+            previous = rpm;
+        }
+        assert_eq!(gear(400.0, false), TOP_GEAR);
+        assert!(tach(engine_rpm(400.0, TOP_GEAR, 1.0)).1 > 0);
+        assert_eq!(gear(f32::NAN, false), NEUTRAL);
+        assert!(engine_rpm(f32::NAN, 3, f32::NAN).is_finite());
+        assert_eq!(gear(30.0, true), REVERSE);
+        assert!(engine_rpm(30.0, REVERSE, 0.0) < engine_rpm(40.0, REVERSE, 0.0));
+    }
+
+    #[test]
+    fn steering_indicator_shows_the_full_commanded_input() {
+        // The wheel angle at 100 km/h is limited to about 30% of full lock;
+        // the indicator still reaches its end for a full input.
+        assert_eq!(input_indicator(1.0), 1.0);
+        assert_eq!(input_indicator(-0.4), -0.4);
+        assert_eq!(input_indicator(3.0), 1.0);
+        assert_eq!(input_indicator(f32::NAN), 0.0);
+        assert_eq!(input_indicator(f32::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn invalid_reasons_have_distinct_messages() {
+        let reasons = [
+            InvalidReason::MissedCheckpoint,
+            InvalidReason::WrongWay,
+            InvalidReason::CutCourse,
+        ];
+        for (index, reason) in reasons.iter().enumerate() {
+            for other in &reasons[index + 1..] {
+                assert_ne!(invalid_banner(*reason), invalid_banner(*other));
+                assert_ne!(reason.explanation(), other.explanation());
+            }
+        }
+        assert!(invalid_banner(InvalidReason::CutCourse).ends_with("CUT COURSE"));
+    }
+
+    #[test]
+    fn fitted_lines_are_cached_by_label_width_and_style() {
+        let calls = std::cell::Cell::new(0);
+        let measure = |label: &str| {
+            calls.set(calls.get() + 1);
+            label.chars().count() as f32
+        };
+        let mut cache = Vec::new();
+        let label = "Reload failed: invalid banking value";
+        let first = cached_fit(&mut cache, label, 15.0, 3, (16.0, 1.0), measure);
+        assert_eq!(
+            first.lines,
+            fit_lines(label, 15.0, 3, |l| l.chars().count() as f32)
+        );
+        assert_eq!(first.widest, 15.0);
+        let measured = calls.get();
+        assert!(measured > 0);
+        for _ in 0..10 {
+            cached_fit(&mut cache, label, 15.0, 3, (16.0, 1.0), measure);
+        }
+        assert_eq!(calls.get(), measured);
+        // Any key change refits: width, size, DPI scale, and line count.
+        for (width, max_lines, style) in [
+            (16.0, 3, (16.0, 1.0)),
+            (15.0, 2, (16.0, 1.0)),
+            (15.0, 3, (17.0, 1.0)),
+            (15.0, 3, (16.0, 2.0)),
+        ] {
+            let before = calls.get();
+            cached_fit(&mut cache, label, width, max_lines, style, measure);
+            assert!(calls.get() > before);
+        }
+        assert_eq!(cache.len(), FIT_CACHE_ENTRIES);
+        let before = calls.get();
+        cached_fit(&mut cache, "Another label", 15.0, 3, (16.0, 1.0), measure);
+        assert!(calls.get() > before);
+        assert_eq!(cache.len(), FIT_CACHE_ENTRIES);
+        assert_eq!(cache[0].label, "Another label");
     }
 }
 
