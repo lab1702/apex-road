@@ -811,7 +811,45 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
     let margin = 37.0 * u;
     let timer_x = w - margin - 224.0 * u;
 
-    // Soft edge shade keeps white UI legible against snow and sky without a cockpit frame.
+    edge_shade(w, h, u);
+    title(state, w, u, margin, timer_x);
+    let timer_y = margin - 10.0 * u;
+    timing_panel(state, timer_x, timer_y, u);
+    track_map(
+        track,
+        position,
+        heading,
+        vec2(timer_x, timer_y + 174.0 * u),
+        u,
+        state.units,
+    );
+    if w >= 800.0 && state.started {
+        checkpoint_ribbon(state, w, margin, u);
+    }
+    gauges(state, u);
+    driving_hints(state, w, h, margin, u);
+    if let Some(reason) = state.invalid
+        && state.started
+        && !state.finished
+    {
+        invalid_notice(reason, w, h, u);
+    }
+    if let Some(notification) = state.notification {
+        notification_panel(notification, w, h, margin, u);
+    }
+    if !state.started && !state.help {
+        start_prompt(w, h, u);
+    }
+    if state.finished && state.started && !state.paused && !state.help {
+        finish_panel(state, w, h, u);
+    }
+    if state.paused || state.help {
+        controls_overlay(state, u);
+    }
+}
+
+/// Soft edge shade keeps white UI legible against snow and sky without a cockpit frame.
+fn edge_shade(w: f32, h: f32, u: f32) {
     for i in 0..64 {
         let t = i as f32 / 64.0;
         draw_rectangle(
@@ -829,7 +867,10 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
             alpha(BLACK, (1.0 - t).powi(2) * 0.32),
         );
     }
+}
 
+/// The wordmark, the course name and the mode tag, top left.
+fn title(state: &HudState<'_>, w: f32, u: f32, margin: f32, timer_x: f32) {
     // Compact wordmark, with a track-like double apex motif.
     draw_line(
         margin,
@@ -895,8 +936,10 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         1.2 * u,
         CYAN,
     );
+}
 
-    let timer_y = margin - 10.0 * u;
+/// The run clock with best and last times, top right.
+fn timing_panel(state: &HudState<'_>, timer_x: f32, timer_y: f32, u: f32) {
     panel(
         timer_x,
         timer_y,
@@ -964,62 +1007,56 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
         17.0 * u,
         MUTED,
     );
-    track_map(
-        track,
-        position,
-        heading,
-        vec2(timer_x, timer_y + 174.0 * u),
-        u,
-        state.units,
+}
+
+/// Checkpoint count and course progress, top center.
+fn checkpoint_ribbon(state: &HudState<'_>, w: f32, margin: f32, u: f32) {
+    let ribbon_w = 248.0 * u;
+    let rx = (w - ribbon_w) * 0.5;
+    panel(
+        rx,
+        margin - 8.0 * u,
+        ribbon_w,
+        51.0 * u,
+        8.0 * u,
+        alpha(PANEL, 0.62),
     );
+    text(
+        "CHECKPOINT",
+        rx + 16.0 * u,
+        margin + 14.0 * u,
+        10.0 * u,
+        MUTED,
+    );
+    text_right(
+        &format!(
+            "{:02} / {:02}",
+            state.checkpoint.min(state.checkpoint_count),
+            state.checkpoint_count
+        ),
+        rx + ribbon_w - 16.0 * u,
+        margin + 15.0 * u,
+        14.0 * u,
+        PAPER,
+    );
+    draw_rectangle(
+        rx + 16.0 * u,
+        margin + 26.0 * u,
+        ribbon_w - 32.0 * u,
+        3.0 * u,
+        alpha(PAPER, 0.16),
+    );
+    draw_rectangle(
+        rx + 16.0 * u,
+        margin + 26.0 * u,
+        (ribbon_w - 32.0 * u) * state.progress.clamp(0.0, 1.0),
+        3.0 * u,
+        CYAN,
+    );
+}
 
-    if w >= 800.0 && state.started {
-        let ribbon_w = 248.0 * u;
-        let rx = (w - ribbon_w) * 0.5;
-        panel(
-            rx,
-            margin - 8.0 * u,
-            ribbon_w,
-            51.0 * u,
-            8.0 * u,
-            alpha(PANEL, 0.62),
-        );
-        text(
-            "CHECKPOINT",
-            rx + 16.0 * u,
-            margin + 14.0 * u,
-            10.0 * u,
-            MUTED,
-        );
-        text_right(
-            &format!(
-                "{:02} / {:02}",
-                state.checkpoint.min(state.checkpoint_count),
-                state.checkpoint_count
-            ),
-            rx + ribbon_w - 16.0 * u,
-            margin + 15.0 * u,
-            14.0 * u,
-            PAPER,
-        );
-        draw_rectangle(
-            rx + 16.0 * u,
-            margin + 26.0 * u,
-            ribbon_w - 32.0 * u,
-            3.0 * u,
-            alpha(PAPER, 0.16),
-        );
-        draw_rectangle(
-            rx + 16.0 * u,
-            margin + 26.0 * u,
-            (ribbon_w - 32.0 * u) * state.progress.clamp(0.0, 1.0),
-            3.0 * u,
-            CYAN,
-        );
-    }
-
-    gauges(state, u);
-
+/// The active input method and key reminders along the bottom edge.
+fn driving_hints(state: &HudState<'_>, w: f32, h: f32, margin: f32, u: f32) {
     text_center(
         if state.autodrive {
             "AUTO DRIVER  ·  RIGHT CLICK TO TAKE CONTROL"
@@ -1076,139 +1113,135 @@ pub fn draw(state: &HudState<'_>, track: &Track, position: Vec3, heading: f32) {
             alpha(PAPER, 0.72),
         );
     }
+}
 
-    if let Some(reason) = state.invalid
-        && state.started
-        && !state.finished
-    {
-        let label = invalid_banner(reason);
-        let ww = 314.0 * u;
-        let xx = (w - ww) * 0.5;
-        panel(xx, h - 204.0 * u, ww, 26.0 * u, 5.0 * u, alpha(PANEL, 0.86));
-        text_center(label, w * 0.5, h - 186.0 * u, 11.0 * u, ORANGE);
-    }
-    if let Some(notification) = state.notification {
-        let size = 16.0 * u;
-        with_fitted_lines(
-            notification,
-            w - 2.0 * margin - 42.0 * u,
-            6,
-            size,
-            |lines, widest| {
-                if lines.is_empty() {
-                    return;
-                }
-                let notification_w = widest + 42.0 * u;
-                panel(
-                    (w - notification_w) * 0.5,
-                    h * 0.24,
-                    notification_w,
-                    (41.0 + (lines.len() - 1) as f32 * 22.0) * u,
-                    8.0 * u,
-                    alpha(PANEL, 0.90),
+fn invalid_notice(reason: InvalidReason, w: f32, h: f32, u: f32) {
+    let label = invalid_banner(reason);
+    let ww = 314.0 * u;
+    let xx = (w - ww) * 0.5;
+    panel(xx, h - 204.0 * u, ww, 26.0 * u, 5.0 * u, alpha(PANEL, 0.86));
+    text_center(label, w * 0.5, h - 186.0 * u, 11.0 * u, ORANGE);
+}
+
+fn notification_panel(notification: &str, w: f32, h: f32, margin: f32, u: f32) {
+    let size = 16.0 * u;
+    with_fitted_lines(
+        notification,
+        w - 2.0 * margin - 42.0 * u,
+        6,
+        size,
+        |lines, widest| {
+            if lines.is_empty() {
+                return;
+            }
+            let notification_w = widest + 42.0 * u;
+            panel(
+                (w - notification_w) * 0.5,
+                h * 0.24,
+                notification_w,
+                (41.0 + (lines.len() - 1) as f32 * 22.0) * u,
+                8.0 * u,
+                alpha(PANEL, 0.90),
+            );
+            for (index, line) in lines.iter().enumerate() {
+                text_center(
+                    line,
+                    w * 0.5,
+                    h * 0.24 + (26.0 + index as f32 * 22.0) * u,
+                    size,
+                    PAPER,
                 );
-                for (index, line) in lines.iter().enumerate() {
-                    text_center(
-                        line,
-                        w * 0.5,
-                        h * 0.24 + (26.0 + index as f32 * 22.0) * u,
-                        size,
-                        PAPER,
-                    );
-                }
-            },
-        );
-    }
+            }
+        },
+    );
+}
 
-    if !state.started && !state.help {
-        let x = w * 0.075;
-        let y = h * 0.37;
-        // Vertex-interpolated transparency avoids overlapping strips and fades
-        // both horizontally and vertically into the windshield view.
-        start_scrim(y, u);
-        tracking(
-            "YOU. THE ROAD. THE CLOCK.",
-            x,
-            y - 9.0 * u,
-            11.0 * u,
-            2.0 * u,
-            CYAN,
-        );
-        text("Find your", x - 2.0 * u, y + 54.0 * u, 64.0 * u, PAPER);
-        text("racing line.", x - 2.0 * u, y + 116.0 * u, 64.0 * u, PAPER);
-        text(
-            "Smooth inputs. Late apexes. One perfect run.",
-            x,
-            y + 150.0 * u,
-            16.0 * u,
-            alpha(PAPER, 0.80),
-        );
-        panel(x, y + 179.0 * u, 224.0 * u, 43.0 * u, 6.0 * u, CYAN);
-        tracking(
-            "ENTER  /  START ENGINE",
-            x + 16.0 * u,
-            y + 206.0 * u,
-            11.0 * u,
-            0.7 * u,
-            PANEL,
-        );
-        text(
-            "TAB  CHANGE TRACK    F1  CONTROLS",
-            x,
-            y + 249.0 * u,
-            11.0 * u,
-            MUTED,
-        );
-    }
+/// The start screen's invitation, before the first run begins.
+fn start_prompt(w: f32, h: f32, u: f32) {
+    let x = w * 0.075;
+    let y = h * 0.37;
+    // Vertex-interpolated transparency avoids overlapping strips and fades
+    // both horizontally and vertically into the windshield view.
+    start_scrim(y, u);
+    tracking(
+        "YOU. THE ROAD. THE CLOCK.",
+        x,
+        y - 9.0 * u,
+        11.0 * u,
+        2.0 * u,
+        CYAN,
+    );
+    text("Find your", x - 2.0 * u, y + 54.0 * u, 64.0 * u, PAPER);
+    text("racing line.", x - 2.0 * u, y + 116.0 * u, 64.0 * u, PAPER);
+    text(
+        "Smooth inputs. Late apexes. One perfect run.",
+        x,
+        y + 150.0 * u,
+        16.0 * u,
+        alpha(PAPER, 0.80),
+    );
+    panel(x, y + 179.0 * u, 224.0 * u, 43.0 * u, 6.0 * u, CYAN);
+    tracking(
+        "ENTER  /  START ENGINE",
+        x + 16.0 * u,
+        y + 206.0 * u,
+        11.0 * u,
+        0.7 * u,
+        PANEL,
+    );
+    text(
+        "TAB  CHANGE TRACK    F1  CONTROLS",
+        x,
+        y + 249.0 * u,
+        11.0 * u,
+        MUTED,
+    );
+}
 
-    if state.finished && state.started && !state.paused && !state.help {
-        let fw = 420.0 * u;
-        let fx = (w - fw) * 0.5;
-        let fy = h * 0.31;
-        panel(fx, fy, fw, 190.0 * u, 16.0 * u, alpha(PANEL, 0.94));
-        tracking(
-            if state.invalid.is_some() {
-                "RUN COMPLETE"
-            } else {
-                "ACROSS THE LINE"
-            },
-            fx + 30.0 * u,
-            fy + 34.0 * u,
-            11.0 * u,
-            2.0 * u,
-            if state.invalid.is_some() {
-                ORANGE
-            } else {
-                CYAN
-            },
-        );
-        text(
-            &time_string(state.elapsed),
-            fx + 27.0 * u,
-            fy + 101.0 * u,
-            58.0 * u,
-            PAPER,
-        );
-        text(
-            state
-                .invalid
-                .map_or("The next lap is yours.", InvalidReason::explanation),
-            fx + 30.0 * u,
-            fy + 131.0 * u,
-            15.0 * u,
-            MUTED,
-        );
-        text(
-            "R  /  RACE AGAIN",
-            fx + 30.0 * u,
-            fy + 166.0 * u,
-            13.0 * u,
-            CYAN,
-        );
-    }
-    if state.paused || state.help {
-        controls_overlay(state, u);
-    }
+fn finish_panel(state: &HudState<'_>, w: f32, h: f32, u: f32) {
+    let fw = 420.0 * u;
+    let fx = (w - fw) * 0.5;
+    let fy = h * 0.31;
+    panel(fx, fy, fw, 190.0 * u, 16.0 * u, alpha(PANEL, 0.94));
+    tracking(
+        if state.invalid.is_some() {
+            "RUN COMPLETE"
+        } else {
+            "ACROSS THE LINE"
+        },
+        fx + 30.0 * u,
+        fy + 34.0 * u,
+        11.0 * u,
+        2.0 * u,
+        if state.invalid.is_some() {
+            ORANGE
+        } else {
+            CYAN
+        },
+    );
+    text(
+        &time_string(state.elapsed),
+        fx + 27.0 * u,
+        fy + 101.0 * u,
+        58.0 * u,
+        PAPER,
+    );
+    text(
+        state
+            .invalid
+            .map_or("The next lap is yours.", InvalidReason::explanation),
+        fx + 30.0 * u,
+        fy + 131.0 * u,
+        15.0 * u,
+        MUTED,
+    );
+    text(
+        "R  /  RACE AGAIN",
+        fx + 30.0 * u,
+        fy + 166.0 * u,
+        13.0 * u,
+        CYAN,
+    );
 }
 
 #[cfg(test)]
