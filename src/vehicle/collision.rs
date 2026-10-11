@@ -62,7 +62,7 @@ impl Car {
         if tunnel_roof_sweep(track, before, self.position).is_some() {
             self.position = first_stop;
         }
-        self.impact = 0.6;
+        self.impact = self.impact.max(0.6);
         // The sweep can stop before a gate that the unconstrained step
         // crossed. Timing and surface state must follow the corrected car.
         let road = nearest_road(
@@ -197,6 +197,22 @@ impl Car {
             old_offset - Vec3::Y * old_offset.dot(road.sample.up) / road.sample.up.y.max(0.15);
         let old_lateral = old_contact.dot(road.sample.right);
         if old_lateral.abs() > road.sample.width * 0.5 + SEGMENT_TOLERANCE {
+            return;
+        }
+        // The rail is only met within its height band. Check the clearance
+        // where the step crossed the rail plane, or at its start for a car
+        // that was already beyond it, so that a car that flew over the rail
+        // and descended outside it is not pulled back through.
+        let old_clearance = before.y - RIDE_HEIGHT - (road.sample.pos.y + old_contact.y);
+        let old_inset = old_lateral * side;
+        let new_inset = road.lateral.abs();
+        let crossing_clearance = if old_inset < limit {
+            let fraction = (limit - old_inset) / (new_inset - old_inset);
+            old_clearance + (clearance - old_clearance) * fraction
+        } else {
+            old_clearance
+        };
+        if !(-0.45..0.85).contains(&crossing_clearance) {
             return;
         }
         let normal = road.sample.up;
@@ -679,6 +695,43 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn flying_over_a_guardrail_and_descending_outside_it_is_not_pulled_back() {
+        for kind in ["bridge", "tunnel"] {
+            let track = Track::parse(&format!("start 0 8 0\n{kind} 160")).unwrap();
+            for side in [-1.0, 1.0] {
+                let mut car = Car::new(&track);
+                car.reset(&track, 40.0);
+                // Just inside the rail, but above the rail band: the chassis
+                // crosses the rail plane over the rail, then descends into
+                // the band's height range outside it within the same step.
+                car.position = vec3(side * 5.25, 8.0 + RIDE_HEIGHT + 1.0, 40.0);
+                car.velocity = vec3(side * 30.0, -10.0, 10.0);
+                car.grounded = false;
+                let dt = 1.0 / 30.0;
+                let road = nearest_road(
+                    &track,
+                    car.position + car.velocity * dt,
+                    car.distance,
+                    9.0,
+                    track.ground_height(),
+                    None,
+                );
+                assert!(road.is_some_and(|road| matches!(
+                    road.sample.kind,
+                    RoadKind::Bridge | RoadKind::Tunnel
+                )));
+                car.update(&track, Control::default(), dt);
+                assert!(
+                    car.position.x * side > rail_limit(12.0) + 0.5,
+                    "pulled back through the {kind} rail, side {side}: {car:?}"
+                );
+                assert!(car.velocity.x * side > 0.0, "{kind}, side {side}: {car:?}");
+                assert_eq!(car.impact, 0.0, "{kind}, side {side}: {car:?}");
             }
         }
     }

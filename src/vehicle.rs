@@ -289,7 +289,7 @@ fn approach(current: f32, target: f32, max_change: f32) -> f32 {
     current + (target - current).clamp(-max_change, max_change)
 }
 
-fn wrap_angle(angle: f32) -> f32 {
+pub(crate) fn wrap_angle(angle: f32) -> f32 {
     (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 

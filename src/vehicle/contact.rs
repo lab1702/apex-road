@@ -89,14 +89,30 @@ impl Car {
             && clearance > -CONTACT_TOLERANCE
             && clearance < CONTACT_TOLERANCE + self.velocity.y.max(0.0) * dt
             && connected();
+        // A crest launches once it falls away faster than gravity can
+        // follow; the slack is a rate, so the threshold matches across
+        // fixed-step sizes.
+        let followable = self.velocity.y - required_vertical <= (GRAVITY + 3.0) * dt;
+        // Every shoulder slopes down to the base terrain, and none lies
+        // beneath it, so the terrain is connected to any shoulder that rises
+        // within the contact tolerance of tires standing on it. No sweep or
+        // route test is needed (or reliable) there: entering across the
+        // outer edge puts the crossing exactly on the footprint's boundary,
+        // and a footprint can also be entered across a cross-section where
+        // the shoulder ends (beside a bridge, at a course's end, inside a
+        // tight bend) or from beneath the shoulder itself.
+        let terrain_step = was_grounded
+            && stood_on_terrain(before, ground_height)
+            && surface.finite
+            && surface.offroad
+            && clearance.abs() < CONTACT_TOLERANCE
+            && followable;
         let on_same_surface = was_grounded
             && (new_road.is_some_and(|road| road.swept_contact)
                 || shoulder_crest
+                || terrain_step
                 || (clearance.abs() < CONTACT_TOLERANCE
-                    // A crest launches once it falls away faster than
-                    // gravity can follow; the slack is a rate, so the
-                    // threshold matches across fixed-step sizes.
-                    && self.velocity.y - required_vertical <= (GRAVITY + 3.0) * dt
+                    && followable
                     && (!surface.finite || connected())));
         // A step can leave one supporting surface and strike another: a steep
         // downhill shoulder can cross the terrain before the car is airborne.
@@ -121,6 +137,22 @@ impl Car {
                             ground_height,
                         )
                 }));
+
+        // The base terrain lies beneath every deck and shoulder and is solid
+        // everywhere. A car that reaches it beneath a finite surface it did
+        // not land on (an embankment it drove into from the side, or a
+        // shoulder it fell through) stands on the terrain instead. Without
+        // this floor nothing could ever catch it again: off the footprint,
+        // landing on the terrain requires approaching it from above.
+        let (surface, landed) = if !on_same_surface
+            && !landed
+            && surface.finite
+            && current_bottom <= ground_height + TERRAIN_STAND
+        {
+            (terrain(ground_height), true)
+        } else {
+            (surface, landed)
+        };
 
         self.grounded = on_same_surface || landed;
         self.offroad = surface.offroad;
@@ -825,22 +857,35 @@ pub(super) fn over_gap_route(road: Option<RoadPoint>) -> bool {
     })
 }
 
+/// How far from the base terrain a grounded car's tires may be and still be
+/// standing on it: rounding in `ground_height + RIDE_HEIGHT - RIDE_HEIGHT`.
+const TERRAIN_STAND: f32 = 0.001;
+
+/// Whether a chassis at `position` has its tires on the base terrain.
+fn stood_on_terrain(position: Vec3, ground_height: f32) -> bool {
+    (position.y - RIDE_HEIGHT - ground_height).abs() <= TERRAIN_STAND
+}
+
+/// The base terrain: level, unbounded and offroad.
+fn terrain(ground_height: f32) -> Surface {
+    Surface {
+        height: ground_height,
+        normal: Vec3::Y,
+        offroad: true,
+        finite: false,
+    }
+}
+
 pub(super) fn contact_surface(
     road: Option<RoadPoint>,
     max_surface_height: f32,
     ground_height: f32,
 ) -> Surface {
-    let ground = Surface {
-        height: ground_height,
-        normal: Vec3::Y,
-        offroad: true,
-        finite: false,
-    };
     road.and_then(|road| {
         road_surface(road, ground_height)
             .filter(|surface| surface.height <= max_surface_height || road.swept_contact)
     })
-    .unwrap_or(ground)
+    .unwrap_or_else(|| terrain(ground_height))
 }
 
 pub(super) fn road_surface(road: RoadPoint, ground_height: f32) -> Option<Surface> {
@@ -1601,6 +1646,49 @@ mod tests {
             car.update(&track, Control::default(), STEP);
             assert!((car.position.y - track.ground_height() - RIDE_HEIGHT).abs() < 0.01);
             assert!(car.grounded && car.offroad);
+        }
+    }
+
+    #[test]
+    fn terrain_onto_a_low_shoulder_stays_grounded_without_sinking() {
+        // The shoulder falls from the road's edge (x = 6) to the terrain
+        // (x = 18), 3 m lower. Each car stands on the terrain where the
+        // shoulder is within the contact tolerance: entering through the
+        // course's end cross-section beside the outer edge, and leaving the
+        // embankment it drove under. Both once lost the terrain and fell.
+        let track = Track::parse("width 12\nstraight 100").unwrap();
+        let ground = track.ground_height();
+        let shoulder_height = |x: f32| ground + 3.0 * ((18.0 - x.abs()) / 12.0).clamp(0.0, 1.0);
+        for side in [-1.0, 1.0] {
+            for (start, velocity) in [
+                (vec3(side * 17.6, 0.0, 101.0), vec3(0.0, 0.0, -5.0)),
+                (vec3(side * 14.0, 0.0, 50.0), vec3(side * 5.0, 0.0, 0.0)),
+                (vec3(side * 17.9, 0.0, 101.0), vec3(-side * 3.0, 0.0, -4.0)),
+            ] {
+                for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+                    let mut car = Car::new(&track);
+                    car.position = vec3(start.x, ground + RIDE_HEIGHT, start.z);
+                    car.velocity = velocity;
+                    car.heading = velocity.x.atan2(velocity.z);
+                    car.distance = start.z.min(100.0);
+                    for step in 0..(1.5 / dt) as usize {
+                        car.update(&track, Control::default(), dt);
+                        let bottom = car.position.y - RIDE_HEIGHT;
+                        assert!(
+                            car.grounded && bottom >= ground - 0.01,
+                            "start {start}, dt {dt}, step {step}: lost the terrain: {car:?}"
+                        );
+                        // Standing on the terrain or the shoulder, never
+                        // hovering above both.
+                        let on_shoulder = car.position.z <= 100.0
+                            && (bottom - shoulder_height(car.position.x)).abs() < 0.02;
+                        assert!(
+                            on_shoulder || (bottom - ground).abs() < 0.01,
+                            "start {start}, dt {dt}, step {step}: off the surface: {car:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

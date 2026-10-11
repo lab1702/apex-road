@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 const MIN_CELL_SIZE: f32 = 16.0;
 /// Rounding in cell coordinates is far below this distance.
 const CELL_SLACK: f32 = 1.0;
+/// How many cells beyond the grid a point's cell may lie. Far more than any
+/// search walks, yet small enough that ring arithmetic never overflows.
+const CELL_RANGE: i64 = 1 << 40;
 
 /// One segment, from `samples[i]` to `samples[i + 1]`.
 #[derive(Clone, Copy, Debug)]
@@ -175,10 +178,17 @@ impl SegmentIndex {
         }
     }
 
-    /// The cell containing `point`, which may lie outside the grid.
+    /// The cell containing `point`, which may lie outside the grid. Cells
+    /// farther than [`CELL_RANGE`] beyond either side of the grid are pulled
+    /// in to that distance, so ring arithmetic around them cannot overflow.
+    /// A pulled-in cell is no farther from any grid cell than the true one,
+    /// so distance bounds derived from it stay conservative.
     fn cell(&self, point: Vec2) -> [i64; 2] {
         let local = (point - self.origin) / self.cell_size;
-        [local.x.floor() as i64, local.y.floor() as i64]
+        [
+            (local.x.floor() as i64).clamp(-CELL_RANGE, self.columns as i64 + CELL_RANGE),
+            (local.y.floor() as i64).clamp(-CELL_RANGE, self.rows as i64 + CELL_RANGE),
+        ]
     }
 
     fn clamped_cell(&self, point: Vec2) -> [usize; 2] {
@@ -360,6 +370,37 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn searches_from_astronomically_distant_points_do_not_overflow() {
+        let track = Track::parse("straight 100").unwrap();
+        let index = SegmentIndex::new(&track.samples);
+        for point in [
+            Vec2::new(1e21, 0.0),
+            Vec2::new(-1e21, 0.0),
+            Vec2::new(0.0, 1e21),
+            Vec2::new(0.0, -1e21),
+            Vec2::splat(f32::MAX),
+            Vec2::splat(f32::MIN),
+        ] {
+            for limit in [0.0, 1e30, f32::INFINITY] {
+                let mut visits = vec![0; index.segment_count()];
+                let complete = index.visit_nearby(point, limit, |segment| {
+                    visits[segment] += 1;
+                    limit
+                });
+                assert!(visits.iter().all(|&count| count <= 1));
+                if complete {
+                    for (segment, &count) in index.segments.iter().zip(&visits) {
+                        let gap =
+                            point.distance(point.clamp(segment.min, segment.max)) - segment.reach;
+                        assert_eq!(count == 1, gap <= limit, "{point} {limit}");
+                    }
+                }
+            }
+            index.for_each_near(point, point, 10.0, |_| {});
         }
     }
 }

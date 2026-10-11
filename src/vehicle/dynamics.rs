@@ -59,6 +59,10 @@ impl Car {
             self.velocity.y = surface_vertical_speed(self.velocity, step.old_surface.normal);
         } else {
             self.velocity.y -= GRAVITY * dt;
+            // No tire force acts in the air, so the drive or braking load
+            // transfer of the takeoff fades as it would on the ground once
+            // released; a landing then starts from a settled chassis.
+            self.longitudinal_acceleration *= (-9.0 * dt).exp();
             let air_drag = horizontal(self.velocity) * (0.0015 * step.speed * dt);
             self.velocity -= air_drag;
             self.yaw_rate *= (-0.30 * dt).exp();
@@ -126,10 +130,14 @@ impl Car {
         let front_demand = -braking * 0.65 * brake_sign;
         // Locked rear wheels resist the slope as well as the motion, so a
         // car parked on a hill stays put as far as the rear tires can hold.
+        // They supply only what the brakes leave of stopping in this step:
+        // near rest, the capped brakes already remove all of the motion, and
+        // removing it twice would reverse the car every step.
         let rear_demand = engine
             - braking * 0.35 * brake_sign
             - if handbrake {
-                (longitudinal / dt + slope_gravity.dot(forward)).clamp(-8.0, 8.0)
+                (longitudinal / dt - braking * brake_sign + slope_gravity.dot(forward))
+                    .clamp(-8.0, 8.0)
             } else {
                 0.0
             };
@@ -225,6 +233,53 @@ mod tests {
             .dot(right)
             .atan2(car.velocity.dot(forward))
             .to_degrees()
+    }
+
+    #[test]
+    fn brake_and_handbrake_near_rest_do_not_reverse_the_car() {
+        let surface = Surface {
+            height: 0.0,
+            normal: Vec3::Y,
+            offroad: false,
+            finite: true,
+        };
+        for dt in [STEP, 1.0 / 60.0, 1.0 / 30.0] {
+            // A sideways slide keeps the car above the brake's rest snap.
+            for lateral in [0.0, 1.0] {
+                for longitudinal in [0.01, 0.05, 0.1, 0.3] {
+                    for brake in [0.2, 1.0] {
+                        let track = wide_straight();
+                        let mut car = Car::new(&track);
+                        car.heading = 0.0;
+                        car.brake = brake;
+                        car.velocity = vec3(lateral, 0.0, longitudinal);
+                        car.ground_dynamics(Vec3::Z, Vec3::X, surface, true, dt);
+                        assert!(
+                            car.velocity.z >= -0.1 * longitudinal && car.velocity.z <= longitudinal,
+                            "dt {dt}, lateral {lateral}, brake {brake}: {longitudinal} m/s became {}",
+                            car.velocity.z
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_transfer_from_takeoff_does_not_persist_through_a_jump() {
+        let track = wide_straight();
+        let mut car = Car::new(&track);
+        car.position.y += 20.0;
+        car.velocity = Vec3::Z * 20.0;
+        car.grounded = false;
+        car.longitudinal_acceleration = 7.0;
+        advance(&mut car, &track, Control::default(), 1.0);
+        assert!(!car.grounded);
+        assert!(
+            car.longitudinal_acceleration.abs() < 0.01,
+            "stale load transfer: {}",
+            car.longitudinal_acceleration
+        );
     }
 
     #[test]

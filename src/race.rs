@@ -13,6 +13,9 @@ pub const CUT_ALLOWANCE: f32 = 30.0;
 /// below it.
 pub const OFFROAD_LIMIT: f32 = 2.0 * CUT_ALLOWANCE;
 
+/// Progress change (m) in one step beyond which the course was skipped.
+const JUMP_LIMIT: f32 = 12.0;
+
 /// The first rule a lap or run broke. Later violations keep the first reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvalidReason {
@@ -55,9 +58,16 @@ pub struct Race {
     /// A circuit car went back across the start line. Its next forward
     /// crossing restarts the lap instead of completing one.
     behind_line: bool,
+    /// Signed course progress since this lap or run began, in metres.
+    lap_progress: f32,
+    /// The furthest `lap_progress` reached this lap or run. Only ground
+    /// beyond it is new: reversing and driving the same stretch again
+    /// neither adds cut debt nor repays it.
+    lap_furthest: f32,
 }
 impl Race {
     pub fn new(best: Option<f32>, start: f32) -> Self {
+        let start = if start.is_finite() { start } else { 0.0 };
         Self {
             started: false,
             finished: false,
@@ -67,10 +77,14 @@ impl Race {
             last: None,
             next_checkpoint: 0,
             invalid_reason: None,
-            previous: if start.is_finite() { start } else { 0.0 },
+            previous: start,
             cut_debt: 0.0,
             offroad_progress: 0.0,
             behind_line: false,
+            // Measured from the line, so a run started partway round (as
+            // with `--at`) has already got that far into its lap.
+            lap_progress: start,
+            lap_furthest: start.max(0.0),
         }
     }
 
@@ -83,14 +97,25 @@ impl Race {
         self.invalid_reason.get_or_insert(reason);
     }
 
-    /// Start a new lap at the line. Only circuits use this.
-    fn reset_lap(&mut self, elapsed: f64) {
+    /// Start a new lap at the line, `progress` metres of which the step that
+    /// crossed it has already driven. Only circuits use this.
+    fn reset_lap(&mut self, elapsed: f64, progress: f32) {
         self.elapsed = elapsed;
         self.next_checkpoint = 0;
         self.invalid_reason = None;
         self.cut_debt = 0.0;
         self.offroad_progress = 0.0;
         self.behind_line = false;
+        self.lap_progress = progress;
+        self.lap_furthest = progress.max(0.0);
+    }
+
+    /// Record signed progress and return the part of it that is new ground.
+    fn advance_progress(&mut self, delta: f32) -> f32 {
+        self.lap_progress += delta;
+        let new_ground = (self.lap_progress - self.lap_furthest).max(0.0);
+        self.lap_furthest = self.lap_furthest.max(self.lap_progress);
+        new_ground
     }
 
     /// Returns a newly established record, if any.
@@ -130,15 +155,45 @@ impl Race {
                 crossed_back = true;
             }
         }
-        if delta.abs() > 12. {
+        if delta.abs() > JUMP_LIMIT {
             self.invalidate(InvalidReason::CutCourse);
-            // A sprint that lands beyond its finish cannot cross it later.
-            // End the run there instead of leaving its clock running.
-            if !track.closed && self.previous < finish && distance >= finish {
+            let end = self.previous + delta;
+            if track.closed && crossed_back {
+                // Skipped backwards over the line: as with reversing over it,
+                // the next forward crossing restarts the lap.
+                self.behind_line = true;
+            } else if track.closed && delta > 0.0 && end >= finish {
+                // Skipped forwards over the line. The skipped lap is over and
+                // sets no time; a fresh lap starts at the line.
+                let remainder = f64::from(dt) * f64::from(((end - finish) / delta).clamp(0.0, 1.0));
+                if !self.behind_line {
+                    self.completed_runs += 1;
+                    self.last = None;
+                }
+                let carried = end - track.length;
+                self.reset_lap(remainder, carried);
+                // Skipped ground collects no gates. A long skip into the new
+                // lap cuts that lap as well, and one past its first gate has
+                // already missed it.
+                if carried > JUMP_LIMIT {
+                    self.invalidate(InvalidReason::CutCourse);
+                } else if track
+                    .checkpoints
+                    .first()
+                    .is_some_and(|&gate| gate <= carried)
+                {
+                    self.invalidate(InvalidReason::MissedCheckpoint);
+                }
+                self.previous = distance;
+                return None;
+            } else if !track.closed && self.previous < finish && distance >= finish {
+                // A sprint that lands beyond its finish cannot cross it later.
+                // End the run there instead of leaving its clock running.
                 self.completed_runs += 1;
                 self.last = None;
                 self.finished = true;
             }
+            self.advance_progress(delta);
             self.previous = distance;
             return None;
         }
@@ -147,16 +202,19 @@ impl Race {
             // current lap by immediately crossing forwards again. Rolling
             // back within a metre of the line, as off the grid, has not
             // started a lap yet, so it is not shown as wrong-way driving.
-            if !self.behind_line && (self.previous > 1.0 || self.next_checkpoint > 0) {
+            if !self.behind_line && (self.lap_furthest > 1.0 || self.next_checkpoint > 0) {
                 self.invalidate(InvalidReason::WrongWay);
             }
             self.behind_line = true;
         }
+        // Only new ground counts, so rocking back and forth neither builds
+        // up cut debt off the road nor repays it on the road.
+        let new_ground = self.advance_progress(delta);
         if on_course {
-            self.cut_debt = (self.cut_debt - delta.max(0.0)).max(0.0);
+            self.cut_debt = (self.cut_debt - new_ground).max(0.0);
         } else {
-            self.cut_debt += delta.max(0.0);
-            self.offroad_progress += delta.max(0.0);
+            self.cut_debt += new_ground;
+            self.offroad_progress += new_ground;
             if self.cut_debt > CUT_ALLOWANCE || self.offroad_progress > OFFROAD_LIMIT {
                 self.invalidate(InvalidReason::CutCourse);
             }
@@ -171,7 +229,7 @@ impl Race {
                 if self.behind_line {
                     // Back over the line it was reversed across: this starts
                     // a fresh lap, but no lap was completed.
-                    self.reset_lap(remainder);
+                    self.reset_lap(remainder, end - track.length);
                     self.cross_checkpoints(track, 0.0, end - track.length, on_course);
                     self.previous = distance;
                     return None;
@@ -194,7 +252,7 @@ impl Race {
                     Some(record_time)
                 };
                 if track.closed {
-                    self.reset_lap(remainder);
+                    self.reset_lap(remainder, end - track.length);
                     // A legal step can cross both the seam and the first gate
                     // of a short circuit; count the part after the seam too.
                     self.cross_checkpoints(track, 0.0, end - track.length, on_course);
@@ -565,6 +623,156 @@ mod tests {
         assert!((record.unwrap() - 1800.0).abs() < 0.001);
         assert_eq!(race.last, record);
         assert_eq!(race.best, record);
+    }
+
+    /// Step from `from` to `to`, in either direction, 0.25 m at a time.
+    fn drive(race: &mut Race, track: &Track, from: f32, to: f32, on_course: bool) {
+        let steps = ((to - from).abs() / 0.25).round() as usize;
+        for step in 1..=steps {
+            let distance = from + (to - from) * step as f32 / steps as f32;
+            race.update(track, 0.025, distance, on_course);
+        }
+    }
+
+    #[test]
+    fn forward_jump_over_the_line_ends_the_cut_lap_and_starts_a_clean_one() {
+        let track = circuit();
+        let mut race = Race::new(None, 0.0);
+        race.started = true;
+        assert!(advance(&mut race, &track, 0.0, track.length - 5.0, 10.0).is_empty());
+        assert!(!race.invalid());
+        // Cut across the infield from 5 m before the line to 10 m past it.
+        assert!(race.update(&track, 0.1, 10.0, true).is_none());
+        assert_eq!(race.completed_runs, 1);
+        assert!(race.last.is_none() && race.best.is_none());
+        assert!(!race.invalid());
+        assert_eq!(race.next_checkpoint, 0);
+        assert!((race.elapsed - 0.1 * 10.0 / 15.0).abs() < 0.0001);
+        let records = advance(&mut race, &track, 10.0, track.length, 10.0);
+        assert_eq!(records.len(), 1);
+        let expected = 0.1 * 10.0 / 15.0 + (track.length - 10.0) / 10.0;
+        assert!((records[0] - expected).abs() < 0.001);
+        assert_eq!(race.completed_runs, 2);
+    }
+
+    #[test]
+    fn backward_jump_over_the_line_does_not_complete_a_lap() {
+        let track = circuit();
+        let mut race = Race::new(None, 0.0);
+        race.started = true;
+        assert!(advance(&mut race, &track, 0.0, 5.0, 10.0).is_empty());
+        assert!(
+            race.update(&track, 0.1, track.length - 10.0, true)
+                .is_none()
+        );
+        assert_eq!(race.invalid_reason, Some(InvalidReason::CutCourse));
+        assert!(
+            advance(
+                &mut race,
+                &track,
+                track.length - 10.0,
+                track.length + 1.0,
+                10.0
+            )
+            .is_empty()
+        );
+        // Back over the line it skipped across: a fresh lap, none completed.
+        assert_eq!(race.completed_runs, 0);
+        assert!(!race.invalid());
+        let records = advance(&mut race, &track, 1.0, track.length, 10.0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(race.completed_runs, 1);
+    }
+
+    #[test]
+    fn rocking_off_the_road_counts_only_net_progress() {
+        let track = Track::parse(
+            "straight 200
+checkpoint
+straight 300
+",
+        )
+        .unwrap();
+        let mut race = Race::new(None, 5.0);
+        race.started = true;
+        drive(&mut race, &track, 5.0, 100.0, true);
+        drive(&mut race, &track, 100.0, 120.0, false);
+        drive(&mut race, &track, 120.0, 105.0, false);
+        drive(&mut race, &track, 105.0, 121.0, false);
+        // 21 m net off-road gain stays within the allowance.
+        assert!(!race.invalid());
+        drive(&mut race, &track, 121.0, 497.0, true);
+        assert!(race.finished && !race.invalid() && race.last.is_some());
+    }
+
+    #[test]
+    fn rocking_on_the_road_does_not_repay_cut_debt() {
+        let track = Track::parse(
+            "straight 200
+checkpoint
+straight 300
+",
+        )
+        .unwrap();
+        let mut race = Race::new(None, 5.0);
+        race.started = true;
+        drive(&mut race, &track, 5.0, 100.0, true);
+        drive(&mut race, &track, 100.0, 125.0, false);
+        for _ in 0..3 {
+            drive(&mut race, &track, 125.0, 110.0, true);
+            drive(&mut race, &track, 110.0, 125.0, true);
+        }
+        assert!(!race.invalid());
+        // 25 m of debt is still owed, so 10 m more off the road is a cut.
+        drive(&mut race, &track, 125.0, 135.0, false);
+        assert_eq!(race.invalid_reason, Some(InvalidReason::CutCourse));
+    }
+
+    #[test]
+    fn reversing_over_the_line_after_starting_a_lap_is_wrong_way() {
+        let track = circuit();
+        let mut race = Race::new(None, 0.0);
+        race.started = true;
+        assert!(advance(&mut race, &track, 0.0, 8.0, 10.0).is_empty());
+        assert_eq!(race.next_checkpoint, 0);
+        for distance in (-1..8).rev() {
+            assert!(race.update(&track, 0.1, distance as f32, true).is_none());
+        }
+        assert_eq!(race.invalid_reason, Some(InvalidReason::WrongWay));
+    }
+
+    #[test]
+    fn forward_jump_past_the_first_gate_voids_the_new_lap_at_once() {
+        let track = Track::parse(
+            "straight 10
+checkpoint
+right 180 radius 20
+straight 30
+checkpoint
+right 180 radius 20
+straight 20
+close",
+        )
+        .unwrap();
+        assert_eq!(track.checkpoints[0], 10.0);
+        let mut race = Race::new(None, 0.0);
+        race.started = true;
+        assert!(advance(&mut race, &track, 0.0, track.length - 2.0, 10.0).is_empty());
+        // 13 m over the line lands 11 m in, past the gate at 10 m.
+        assert!(race.update(&track, 0.1, 11.0, true).is_none());
+        assert_eq!(race.completed_runs, 1);
+        assert_eq!(race.invalid_reason, Some(InvalidReason::MissedCheckpoint));
+    }
+
+    #[test]
+    fn reversing_over_the_line_from_a_start_partway_round_is_wrong_way() {
+        let track = circuit();
+        let mut race = Race::new(None, 60.0);
+        race.started = true;
+        for step in 1..=122 {
+            race.update(&track, 0.05, 60.0 - step as f32 * 0.5, true);
+        }
+        assert_eq!(race.invalid_reason, Some(InvalidReason::WrongWay));
     }
 
     #[test]

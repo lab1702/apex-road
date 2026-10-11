@@ -12,8 +12,8 @@ repository = "https://github.com/lab1702/apex-road"
 publish = false
 
 [dependencies]
-macroquad = "=0.4.16"
-image = { version = "=0.24.9", default-features = false, features = ["png"] }
+macroquad = "0.4.16"
+image = { version = "0.24.9", default-features = false, features = ["png"] }
 
 [profile.dev]
 opt-level = 1
