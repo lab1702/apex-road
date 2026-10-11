@@ -37,7 +37,8 @@ apex-road [PATH | --track PATH] [options]
   --autodrive         Run the demonstration driver
   --demo              Auto-play every bundled track in a repeating loop
   --frames N          Exit after N rendered frames
-  --capture PATH      Save the final frame as PNG (after 30 frames unless --frames is given)
+  --capture PATH      Save the final frame as PNG (after 30 frames, or the
+                      --frames / --smoke-test frame count when given)
   --at METERS         Preview a position on the track
 
 Relative track paths are read from the current directory. Bundled
@@ -307,8 +308,9 @@ fn save_record(path: &Path, time: f32) -> std::io::Result<SavedRecord> {
         improved: true,
     })
 }
-/// Bounded so a stuck writer cannot freeze the render thread, which saves
-/// records; contended saves report an error and retry after the next run.
+/// Bounded so a stuck writer cannot hold up the saver thread, or quitting,
+/// which waits for queued saves; contended saves report an error and retry
+/// after the next run.
 const RECORD_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 /// Take the record lock, waiting briefly for another game to finish saving.
 /// Returns false when the filesystem cannot lock files at all; saving then
@@ -474,30 +476,155 @@ impl RunRecords {
         candidate
     }
 
+    /// Accept a completed run's time for saving. Returns the time to save
+    /// and the best time to restore if the save fails.
+    fn begin_save(&mut self, candidate: Option<f32>) -> Option<(f32, Option<f32>)> {
+        let previous_best = self.best;
+        self.accept(candidate).map(|time| (time, previous_best))
+    }
+
+    /// Apply the outcome of saving a time accepted by `begin_save`.
+    fn finish_save(
+        &mut self,
+        race: &mut Race,
+        previous_best: Option<f32>,
+        saved: &std::io::Result<SavedRecord>,
+    ) {
+        let best = match saved {
+            Ok(saved) => Some(saved.best),
+            // Race already promoted the candidate. Keep both best-time
+            // thresholds at the saved value so a failed write cannot
+            // suppress later records, including after a restart.
+            Err(_) => previous_best,
+        };
+        self.best = best;
+        race.best = best;
+    }
+
+    /// Accept and save a candidate synchronously.
+    #[cfg(test)]
     fn save_candidate(
         &mut self,
         path: &Path,
         race: &mut Race,
         candidate: Option<f32>,
     ) -> std::io::Result<Option<SavedRecord>> {
-        let previous_best = self.best;
-        let Some(candidate) = self.accept(candidate) else {
+        let Some((time, previous_best)) = self.begin_save(candidate) else {
             return Ok(None);
         };
-        let saved = match save_record(path, candidate) {
-            Ok(saved) => saved,
-            Err(error) => {
-                // Race already promoted the candidate. Keep both best-time
-                // thresholds at the saved value so a failed write cannot
-                // suppress later records, including after a restart.
-                self.best = previous_best;
-                race.best = previous_best;
-                return Err(error);
-            }
+        let saved = save_record(path, time);
+        self.finish_save(race, previous_best, &saved);
+        saved.map(Some)
+    }
+}
+
+/// A record save handed to the background saver.
+struct SaveJob {
+    /// Issue order, so only the newest save's outcome sets the best time.
+    sequence: u64,
+    path: PathBuf,
+    time: f32,
+    previous_best: Option<f32>,
+}
+
+struct SaveOutcome {
+    job: SaveJob,
+    saved: std::io::Result<SavedRecord>,
+}
+
+/// Saves records on one background thread, so lock waits, disk syncs and
+/// rename retries never stall a frame. A single worker keeps this process's
+/// saves in order; the record lock still serializes them with other games.
+/// Dropping the saver finishes every queued save before returning.
+struct RecordSaver {
+    jobs: Option<std::sync::mpsc::Sender<SaveJob>>,
+    outcomes: std::sync::mpsc::Receiver<SaveOutcome>,
+    /// Outcomes of saves made on this thread because the worker was gone.
+    inline: Vec<SaveOutcome>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    issued: u64,
+    finished: u64,
+}
+
+impl RecordSaver {
+    fn new() -> Self {
+        let (jobs, queue) = std::sync::mpsc::channel::<SaveJob>();
+        let (report, outcomes) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("record saver".into())
+            .spawn(move || {
+                for job in queue {
+                    let saved = save_record(&job.path, job.time);
+                    // The game may already have stopped listening while it
+                    // quits; the record is on disk either way.
+                    let _ = report.send(SaveOutcome { job, saved });
+                }
+            })
+            .ok();
+        Self {
+            // Without a worker, `submit` saves in place.
+            jobs: worker.as_ref().map(|_| jobs),
+            outcomes,
+            inline: Vec::new(),
+            worker,
+            issued: 0,
+            finished: 0,
+        }
+    }
+
+    /// Queue a save. If no worker thread could be started, save in place.
+    fn submit(&mut self, path: PathBuf, time: f32, previous_best: Option<f32>) {
+        self.issued += 1;
+        let job = SaveJob {
+            sequence: self.issued,
+            path,
+            time,
+            previous_best,
         };
-        self.best = Some(saved.best);
-        race.best = Some(saved.best);
-        Ok(Some(saved))
+        let job = match &self.jobs {
+            Some(jobs) => match jobs.send(job) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::SendError(unsent)) => unsent,
+            },
+            None => job,
+        };
+        let saved = save_record(&job.path, job.time);
+        self.inline.push(SaveOutcome { job, saved });
+    }
+
+    /// Whether `sequence` is the most recently submitted save.
+    fn is_latest(&self, sequence: u64) -> bool {
+        sequence == self.issued
+    }
+
+    /// Saves that finished since the last call, in order. With `wait`,
+    /// block until every submitted save has finished.
+    fn finished(&mut self, wait: bool) -> Vec<SaveOutcome> {
+        let mut done = std::mem::take(&mut self.inline);
+        self.finished += done.len() as u64;
+        while self.finished < self.issued {
+            let outcome = if wait {
+                self.outcomes.recv().ok()
+            } else {
+                self.outcomes.try_recv().ok()
+            };
+            let Some(outcome) = outcome else {
+                break;
+            };
+            self.finished += 1;
+            done.push(outcome);
+        }
+        done
+    }
+}
+
+impl Drop for RecordSaver {
+    fn drop(&mut self) {
+        // Closing the queue lets the worker finish what is queued and exit.
+        self.jobs = None;
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -617,7 +744,13 @@ struct GameState {
     records_dir: Option<PathBuf>,
     record_file: PathBuf,
     records: RunRecords,
+    saves: RecordSaver,
+    /// The lowest road surface less `FALL_DEPTH`, cached per course.
+    fall_floor: f32,
     car: Car,
+    /// The car's pose before the latest physics step, for rendering between
+    /// steps. Equal to the current pose after a reset, so jumps snap.
+    previous_pose: Pose,
     race: Race,
     attitude: CameraAttitude,
     /// The controls applied on the latest frame, as shown by the HUD.
@@ -665,11 +798,14 @@ impl GameState {
         }
         Self {
             attitude: CameraAttitude::new(&car),
+            fall_floor: track.ground_height() - FALL_DEPTH,
             track,
             path: opts.path.clone(),
             records_dir,
             record_file,
             records,
+            saves: RecordSaver::new(),
+            previous_pose: Pose::of(&car),
             car,
             race,
             control: Control::default(),
@@ -711,7 +847,49 @@ impl GameState {
             self.autodrive,
         );
         self.attitude.snap(&self.car);
+        self.settle();
         self.mouse.reset();
+    }
+
+    /// Drop any partial physics step and render the car exactly where it
+    /// is, so the view snaps rather than blending across a stop or a jump.
+    fn settle(&mut self) {
+        self.accumulator = 0.;
+        self.previous_pose = Pose::of(&self.car);
+    }
+
+    /// The car's pose to draw this frame: between the last two physics
+    /// states, by how far the accumulator has run into the next step.
+    fn render_pose(&self) -> Pose {
+        let alpha = (self.accumulator / PHYSICS_STEP).clamp(0., 1.);
+        self.previous_pose.blend(Pose::of(&self.car), alpha)
+    }
+
+    /// Apply the outcomes of finished record saves. With `wait`, first
+    /// wait for every queued save to finish.
+    fn collect_saves(&mut self, wait: bool) {
+        for outcome in self.saves.finished(wait) {
+            // A save for another course no longer concerns this run.
+            if outcome.job.path != self.record_file {
+                continue;
+            }
+            // An older save's result must not undo a newer one's threshold.
+            if self.saves.is_latest(outcome.job.sequence) {
+                self.records
+                    .finish_save(&mut self.race, outcome.job.previous_best, &outcome.saved);
+            }
+            match outcome.saved {
+                Err(e) => self.notify(format!("Record could not be saved: {e}"), 8.),
+                Ok(saved) => self.notify(
+                    if saved.improved {
+                        "NEW PERSONAL BEST"
+                    } else {
+                        "PERSONAL BEST SYNCED"
+                    },
+                    5.,
+                ),
+            }
+        }
     }
 
     /// Apply one frame of input, then advance the simulation. Returns the
@@ -734,6 +912,11 @@ impl GameState {
         };
         self.frames += 1;
         self.note_time = (self.note_time - dt).max(0.);
+        self.collect_saves(false);
+        // miniquad can set fullscreen but cannot report it, so this flag is
+        // only what F11 last requested. If the window leaves fullscreen some
+        // other way (an OS shortcut or window manager), the next F11 asks for
+        // windowed again and a second press is needed to go fullscreen.
         if input.pressed(KeyCode::F11) {
             self.fullscreen = !self.fullscreen;
             actions.push(Action::SetFullscreen(self.fullscreen));
@@ -774,7 +957,6 @@ impl GameState {
         }
         if input.pressed(KeyCode::R) {
             self.restart();
-            self.accumulator = 0.;
             self.respawn_timer = 0.;
             self.notify("NEW RUN", 2.);
         }
@@ -812,7 +994,7 @@ impl GameState {
         if driving {
             self.simulate(dt, demo);
         } else {
-            self.accumulator = 0.;
+            self.settle();
         }
         self.attitude.follow(&self.car, dt);
         actions
@@ -828,6 +1010,7 @@ impl GameState {
         };
         match next.and_then(|path| Track::load(&path).map(|track| (path, track))) {
             Ok((path, track)) => {
+                self.fall_floor = track.ground_height() - FALL_DEPTH;
                 self.track = track;
                 self.path = path;
                 self.car = Car::new(&self.track);
@@ -839,7 +1022,7 @@ impl GameState {
                     println!("Demo: {}", self.track.name);
                 }
                 self.attitude.snap(&self.car);
-                self.accumulator = 0.;
+                self.settle();
                 self.paused = false;
                 self.respawn_timer = 0.;
                 self.mouse.reset();
@@ -877,6 +1060,7 @@ impl GameState {
         };
         self.accumulator += dt;
         while self.accumulator >= PHYSICS_STEP {
+            self.previous_pose = Pose::of(&self.car);
             self.car.update(&self.track, self.control, PHYSICS_STEP);
             let candidate = self.race.update(
                 &self.track,
@@ -884,32 +1068,20 @@ impl GameState {
                 self.car.distance,
                 self.car.on_course(),
             );
-            match self
-                .records
-                .save_candidate(&self.record_file, &mut self.race, candidate)
-            {
-                Err(e) => self.notify(format!("Record could not be saved: {e}"), 8.),
-                Ok(Some(saved)) => self.notify(
-                    if saved.improved {
-                        "NEW PERSONAL BEST"
-                    } else {
-                        "PERSONAL BEST SYNCED"
-                    },
-                    5.,
-                ),
-                Ok(None) => {}
+            // Saved on the record thread; `collect_saves` reports the outcome.
+            if let Some((time, previous_best)) = self.records.begin_save(candidate) {
+                self.saves
+                    .submit(self.record_file.clone(), time, previous_best);
             }
-            if !self.car.position.is_finite()
-                || self.car.position.y < self.track.ground_height() - FALL_DEPTH
-            {
+            if !self.car.position.is_finite() || self.car.position.y < self.fall_floor {
+                // `restart` settles the accumulator and the rendered pose.
                 self.restart();
                 self.notify("BACK ON THE GRID", 3.);
-                self.accumulator = 0.;
                 break;
             }
             self.accumulator -= PHYSICS_STEP;
             if self.race.finished || (demo && self.race.completed_runs > 0) {
-                self.accumulator = 0.;
+                self.settle();
                 break;
             }
         }
@@ -929,10 +1101,10 @@ impl GameState {
         self.frame_limit.is_some_and(|limit| self.frames >= limit)
     }
 
-    fn driver_camera(&self, aspect: f32) -> view::DriverCamera {
+    fn driver_camera(&self, pose: Pose, aspect: f32) -> view::DriverCamera {
         view::DriverCamera::new(
-            self.car.position,
-            self.car.heading,
+            pose.position,
+            pose.heading,
             self.attitude.pitch,
             self.attitude.roll,
             self.car.speed_kmh(),
@@ -1000,12 +1172,15 @@ async fn game(opts: Options, track: Track) -> Result<(), String> {
                 Action::RebuildWorld => world.rebuild(&state.track),
             }
         }
-        world.draw(&state.driver_camera(screen_width() / screen_height().max(1.)));
+        // Draw the car between physics steps, so motion is smooth at any
+        // refresh rate rather than advancing in whole steps.
+        let pose = state.render_pose();
+        world.draw(&state.driver_camera(pose, screen_width() / screen_height().max(1.)));
         hud::draw(
             &state.hud(get_fps()),
             &state.track,
-            state.car.position,
-            state.car.heading,
+            pose.position,
+            pose.heading,
         );
         if state.frame_limit_reached() {
             if let Some(ref dest) = opts.capture {
@@ -1030,6 +1205,37 @@ async fn game(opts: Options, track: Track) -> Result<(), String> {
     show_mouse(true);
     hud::shutdown();
     result
+}
+
+/// Where the car is drawn: its position and heading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pose {
+    position: Vec3,
+    heading: f32,
+}
+
+impl Pose {
+    fn of(car: &Car) -> Self {
+        Self {
+            position: car.position,
+            heading: car.heading,
+        }
+    }
+
+    /// `self` at 0, `to` at 1. Heading turns the short way around. A
+    /// non-finite pose is never blended: the newer one is used as is.
+    fn blend(self, to: Self, alpha: f32) -> Self {
+        if !(self.position.is_finite() && self.heading.is_finite()) {
+            return to;
+        }
+        let turn = (to.heading - self.heading + std::f32::consts::PI)
+            .rem_euclid(std::f32::consts::TAU)
+            - std::f32::consts::PI;
+        Self {
+            position: self.position.lerp(to.position, alpha),
+            heading: self.heading + turn * alpha,
+        }
+    }
 }
 
 /// The driver's view follows the car's pitch and roll with a little lag.
@@ -1908,6 +2114,8 @@ mod frame_checks {
         }
         assert!(state.race.finished && !state.race.invalid());
         let finish_time = state.race.last.unwrap();
+        // The record is saved off the frame; wait for it as quitting does.
+        state.collect_saves(true);
         assert_eq!(state.notification(), Some("NEW PERSONAL BEST"));
         assert_eq!(read_record(&state.record_file), Some(finish_time));
         // A finished run stays put.
@@ -2240,5 +2448,100 @@ mod frame_checks {
             ..lasting(0.1)
         });
         assert!(state.race.elapsed > 0.09);
+    }
+
+    #[test]
+    fn poses_blend_the_short_way_around() {
+        let from = Pose {
+            position: Vec3::ZERO,
+            heading: 3.0,
+        };
+        let to = Pose {
+            position: vec3(2., 0., 4.),
+            heading: -3.0,
+        };
+        assert_eq!(from.blend(to, 0.), from);
+        let half = from.blend(to, 0.5);
+        assert_eq!(half.position, vec3(1., 0., 2.));
+        // 3.0 and -3.0 rad are 0.28 rad apart across ±π, not 6 rad.
+        assert!((half.heading - std::f32::consts::PI).abs() < 1e-5);
+        let end = from.blend(to, 1.);
+        assert!((end.heading.sin() - to.heading.sin()).abs() < 1e-5);
+        let broken = Pose {
+            position: Vec3::NAN,
+            heading: 0.,
+        };
+        assert_eq!(broken.blend(to, 0.5), to);
+    }
+
+    #[test]
+    fn the_view_is_drawn_between_physics_steps_and_snaps_on_resets() {
+        let (_dir, mut state) = game(&[]);
+        state.update(&frame(&[KeyCode::Enter]));
+        for _ in 0..60 {
+            state.update(&throttle());
+        }
+        // A frame that leaves part of a step draws between the two states.
+        state.update(&FrameInput {
+            frame_time: PHYSICS_STEP * 1.5,
+            ..throttle()
+        });
+        let alpha = state.accumulator / PHYSICS_STEP;
+        assert!(alpha > 0.1 && alpha < 0.9, "{alpha}");
+        let previous = state.previous_pose.position;
+        let current = state.car.position;
+        assert!(previous.distance(current) > 0.01);
+        let drawn = state.render_pose().position;
+        assert!((drawn - previous.lerp(current, alpha)).length() < 1e-4);
+
+        // A restart puts the view straight on the grid.
+        state.restart();
+        assert_eq!(state.render_pose(), Pose::of(&state.car));
+        // So does a respawn, and the paused or finished view sits on the car.
+        for _ in 0..30 {
+            state.update(&throttle());
+        }
+        state.car.position.y = state.fall_floor - 5.;
+        state.update(&idle());
+        assert_eq!(state.notification(), Some("BACK ON THE GRID"));
+        assert_eq!(state.render_pose(), Pose::of(&state.car));
+        state.update(&frame(&[KeyCode::Escape]));
+        assert_eq!(state.render_pose(), Pose::of(&state.car));
+    }
+
+    #[test]
+    fn records_are_saved_off_the_frame_and_finished_before_quitting() {
+        let (_dir, mut state) = game(&[]);
+        let record_file = state.record_file.clone();
+        state.update(&frame(&[KeyCode::Enter]));
+        for _ in 0..3000 {
+            if state.race.finished {
+                break;
+            }
+            state.update(&throttle());
+        }
+        let finish_time = state.race.last.unwrap();
+        // Dropping the game, as quitting does, waits for the queued save.
+        drop(state);
+        assert_eq!(read_record(&record_file), Some(finish_time));
+    }
+
+    #[test]
+    fn an_older_save_cannot_undo_a_newer_best_time() {
+        let (_dir, mut state) = game(&[]);
+        let path = state.record_file.clone();
+        state.records.eligible = true;
+        let (time, previous) = state.records.begin_save(Some(50.)).unwrap();
+        state.saves.submit(path.clone(), time, previous);
+        let (time, previous) = state.records.begin_save(Some(40.)).unwrap();
+        state.saves.submit(path.clone(), time, previous);
+        state.collect_saves(true);
+        assert_eq!(state.records.best, Some(40.));
+        assert_eq!(state.race.best, Some(40.));
+        assert_eq!(read_record(&path), Some(40.));
+        // Saves for a course no longer loaded are ignored.
+        state.saves.submit(path.with_extension("other"), 10., None);
+        state.collect_saves(true);
+        assert_eq!(state.records.best, Some(40.));
     }
 }

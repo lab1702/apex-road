@@ -354,9 +354,10 @@ Run the parser, vehicle, and timing checks with:
 cargo test --locked
 ```
 
-The [CI workflow](.github/workflows/ci.yml) runs formatting, Clippy, tests,
-release builds, and all bundled track validations on Windows, Linux, and
-Apple silicon macOS.
+The [CI workflow](.github/workflows/ci.yml) runs Clippy, tests, release
+builds, and all bundled track validations on Windows, Linux, and Apple silicon
+macOS. The rustfmt check and the minimum supported Rust version (1.89) check
+run once, on Linux.
 Linux also runs the renderer smoke test with Xvfb and Mesa software rendering.
 Windows and macOS renderer smoke tests need a graphical desktop with OpenGL.
 On Windows:
