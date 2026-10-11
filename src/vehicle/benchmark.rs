@@ -93,6 +93,11 @@ pub(super) fn long_course() -> Track {
 /// Drive four 90-second runs (one plain, three disturbed) on `track` and
 /// return the digest of every step.
 fn drive(track: &Track) -> u64 {
+    drive_observed(track, |_, _, _| {})
+}
+
+/// [`drive`], calling `observe(run, step, car)` after every step.
+fn drive_observed(track: &Track, mut observe: impl FnMut(u64, usize, &Car)) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for (run, noisy) in [(0_u64, false), (1, true), (2, true), (3, true)] {
         let mut seed = run.wrapping_mul(0x2545f4914f6cdd1d) ^ 0x1234_5678;
@@ -101,6 +106,7 @@ fn drive(track: &Track) -> u64 {
             let control = control(&car, track, &mut seed, noisy, step);
             car.update(track, control, STEP);
             digest_car(&mut hash, &car);
+            observe(run, step, &car);
             if noisy && step % 3600 == 3599 {
                 // Restart mid-course so every run covers more track.
                 car.reset(track, (seed % 997) as f32 / 997.0 * track.length);
@@ -155,4 +161,33 @@ fn autodrive_benchmark() {
         totals[1].as_secs_f64() * 1000.0,
         totals[1].as_secs_f64() / totals[0].as_secs_f64()
     );
+}
+
+/// The base terrain is the lowest surface on every course. A car that sinks
+/// beneath it has lost contact for good: nothing below can catch it again.
+/// Moving between the terrain and a low shoulder once did exactly that: on
+/// ridgeway's plain run, leaving an embankment the car had driven under past
+/// the finish; on alpine's first disturbed run, entering a shoulder's
+/// footprint beside its outer edge.
+#[test]
+fn autodrive_never_sinks_below_the_terrain() {
+    use super::contact::index_check::{Mode, with_mode};
+    for path in crate::courses::BUNDLED_PATHS {
+        let track = Track::load(path).unwrap();
+        let ground = track.ground_height();
+        let mut sunk: Option<(f32, u64, usize, Vec3)> = None;
+        with_mode(Mode::Indexed, || {
+            drive_observed(&track, |run, step, car| {
+                let depth = ground - (car.position.y - RIDE_HEIGHT);
+                if sunk.is_none() && depth > 0.08 {
+                    sunk = Some((depth, run, step, car.position));
+                }
+            })
+        });
+        if let Some((depth, run, step, position)) = sunk {
+            panic!(
+                "{path}: run {run}, step {step}: {depth:.3} m below the terrain at {position:?}"
+            );
+        }
+    }
 }
