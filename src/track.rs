@@ -198,9 +198,7 @@ impl Track {
         self.source_hash
     }
 
-    /// A spatial index of the segments between samples, built on the first
-    /// call and kept with this course; a reloaded course builds its own.
-    /// `None` if samples were added or removed after it was built.
+    /// The road's centerline samples, in driving order.
     pub fn samples(&self) -> &[RoadSample] {
         &self.samples
     }
@@ -213,6 +211,9 @@ impl Track {
         &mut self.samples
     }
 
+    /// A spatial index of the segments between samples, built on the first
+    /// call and kept with this course; a reloaded course builds its own.
+    /// `None` if samples were added or removed after it was built.
     pub fn segment_index(&self) -> Option<&SegmentIndex> {
         let index = self.segment_index.get_or_build(&self.samples);
         (index.segment_count() + 1 == self.samples.len()).then_some(index)
