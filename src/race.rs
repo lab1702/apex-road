@@ -67,6 +67,7 @@ pub struct Race {
 }
 impl Race {
     pub fn new(best: Option<f32>, start: f32) -> Self {
+        let start = if start.is_finite() { start } else { 0.0 };
         Self {
             started: false,
             finished: false,
@@ -76,12 +77,14 @@ impl Race {
             last: None,
             next_checkpoint: 0,
             invalid_reason: None,
-            previous: if start.is_finite() { start } else { 0.0 },
+            previous: start,
             cut_debt: 0.0,
             offroad_progress: 0.0,
             behind_line: false,
-            lap_progress: 0.0,
-            lap_furthest: 0.0,
+            // Measured from the line, so a run started partway round (as
+            // with `--at`) has already got that far into its lap.
+            lap_progress: start,
+            lap_furthest: start.max(0.0),
         }
     }
 
@@ -170,9 +173,16 @@ impl Race {
                 let carried = end - track.length;
                 self.reset_lap(remainder, carried);
                 // Skipped ground collects no gates. A long skip into the new
-                // lap cuts that lap as well.
+                // lap cuts that lap as well, and one past its first gate has
+                // already missed it.
                 if carried > JUMP_LIMIT {
                     self.invalidate(InvalidReason::CutCourse);
+                } else if track
+                    .checkpoints
+                    .first()
+                    .is_some_and(|&gate| gate <= carried)
+                {
+                    self.invalidate(InvalidReason::MissedCheckpoint);
                 }
                 self.previous = distance;
                 return None;
@@ -727,6 +737,40 @@ straight 300
         assert_eq!(race.next_checkpoint, 0);
         for distance in (-1..8).rev() {
             assert!(race.update(&track, 0.1, distance as f32, true).is_none());
+        }
+        assert_eq!(race.invalid_reason, Some(InvalidReason::WrongWay));
+    }
+
+    #[test]
+    fn forward_jump_past_the_first_gate_voids_the_new_lap_at_once() {
+        let track = Track::parse(
+            "straight 10
+checkpoint
+right 180 radius 20
+straight 30
+checkpoint
+right 180 radius 20
+straight 20
+close",
+        )
+        .unwrap();
+        assert_eq!(track.checkpoints[0], 10.0);
+        let mut race = Race::new(None, 0.0);
+        race.started = true;
+        assert!(advance(&mut race, &track, 0.0, track.length - 2.0, 10.0).is_empty());
+        // 13 m over the line lands 11 m in, past the gate at 10 m.
+        assert!(race.update(&track, 0.1, 11.0, true).is_none());
+        assert_eq!(race.completed_runs, 1);
+        assert_eq!(race.invalid_reason, Some(InvalidReason::MissedCheckpoint));
+    }
+
+    #[test]
+    fn reversing_over_the_line_from_a_start_partway_round_is_wrong_way() {
+        let track = circuit();
+        let mut race = Race::new(None, 60.0);
+        race.started = true;
+        for step in 1..=122 {
+            race.update(&track, 0.05, 60.0 - step as f32 * 0.5, true);
         }
         assert_eq!(race.invalid_reason, Some(InvalidReason::WrongWay));
     }

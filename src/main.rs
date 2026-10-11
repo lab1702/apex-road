@@ -15,7 +15,7 @@ use race::Race;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use track::Track;
-use vehicle::{Car, Control};
+use vehicle::{Car, Control, wrap_angle};
 
 struct Options {
     path: PathBuf,
@@ -434,11 +434,8 @@ fn demo_control(car: &Car, track: &Track) -> Control {
     let target = track.sample_at(car.distance + 12. + speed * 0.55);
     let to = target.pos - car.position;
     let desired = to.x.atan2(to.z);
-    let angle = (desired - car.heading + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-        - std::f32::consts::PI;
-    let corner = (target.forward.x.atan2(target.forward.z) - car.heading + std::f32::consts::PI)
-        .rem_euclid(std::f32::consts::TAU)
-        - std::f32::consts::PI;
+    let angle = wrap_angle(desired - car.heading);
+    let corner = wrap_angle(target.forward.x.atan2(target.forward.z) - car.heading);
     let target_speed = (27. - corner.abs() * 28.).clamp(12., 27.);
     Control {
         throttle: if speed < target_speed { 0.7 } else { 0. },
@@ -450,6 +447,9 @@ fn demo_control(car: &Car, track: &Track) -> Control {
 /// Keep legitimate records separate from the best time displayed during a preview.
 struct RunRecords {
     best: Option<f32>,
+    /// The best time known to be in the record file. A failed save falls
+    /// back to this, never to a time that was only promoted in memory.
+    saved: Option<f32>,
     eligible: bool,
 }
 
@@ -457,6 +457,7 @@ impl RunRecords {
     fn new(best: Option<f32>) -> Self {
         Self {
             best,
+            saved: best,
             eligible: false,
         }
     }
@@ -476,29 +477,26 @@ impl RunRecords {
         candidate
     }
 
-    /// Accept a completed run's time for saving. Returns the time to save
-    /// and the best time to restore if the save fails.
-    fn begin_save(&mut self, candidate: Option<f32>) -> Option<(f32, Option<f32>)> {
-        let previous_best = self.best;
-        self.accept(candidate).map(|time| (time, previous_best))
+    /// Accept a completed run's time for saving. Returns the time to save.
+    fn begin_save(&mut self, candidate: Option<f32>) -> Option<f32> {
+        self.accept(candidate)
     }
 
-    /// Apply the outcome of saving a time accepted by `begin_save`.
-    fn finish_save(
-        &mut self,
-        race: &mut Race,
-        previous_best: Option<f32>,
-        saved: &std::io::Result<SavedRecord>,
-    ) {
-        let best = match saved {
-            Ok(saved) => Some(saved.best),
-            // Race already promoted the candidate. Keep both best-time
-            // thresholds at the saved value so a failed write cannot
-            // suppress later records, including after a restart.
-            Err(_) => previous_best,
-        };
-        self.best = best;
-        race.best = best;
+    /// Apply the outcome of saving a time accepted by `begin_save`. Only the
+    /// newest save (`latest`) sets the best-time thresholds, so an older
+    /// save's result cannot undo a newer one.
+    fn finish_save(&mut self, race: &mut Race, latest: bool, saved: &std::io::Result<SavedRecord>) {
+        if let Ok(saved) = saved {
+            self.saved = Some(saved.best);
+        }
+        if latest {
+            // On failure Race has already promoted the candidate. Fall back
+            // to what is on disk so a failed write cannot suppress later
+            // records, including after a restart.
+            let best = saved.as_ref().map_or(self.saved, |saved| Some(saved.best));
+            self.best = best;
+            race.best = best;
+        }
     }
 
     /// Accept and save a candidate synchronously.
@@ -509,11 +507,11 @@ impl RunRecords {
         race: &mut Race,
         candidate: Option<f32>,
     ) -> std::io::Result<Option<SavedRecord>> {
-        let Some((time, previous_best)) = self.begin_save(candidate) else {
+        let Some(time) = self.begin_save(candidate) else {
             return Ok(None);
         };
         let saved = save_record(path, time);
-        self.finish_save(race, previous_best, &saved);
+        self.finish_save(race, true, &saved);
         saved.map(Some)
     }
 }
@@ -524,7 +522,6 @@ struct SaveJob {
     sequence: u64,
     path: PathBuf,
     time: f32,
-    previous_best: Option<f32>,
 }
 
 struct SaveOutcome {
@@ -573,13 +570,12 @@ impl RecordSaver {
     }
 
     /// Queue a save. If no worker thread could be started, save in place.
-    fn submit(&mut self, path: PathBuf, time: f32, previous_best: Option<f32>) {
+    fn submit(&mut self, path: PathBuf, time: f32) {
         self.issued += 1;
         let job = SaveJob {
             sequence: self.issued,
             path,
             time,
-            previous_best,
         };
         let job = match &self.jobs {
             Some(jobs) => match jobs.send(job) {
@@ -869,15 +865,11 @@ impl GameState {
     /// wait for every queued save to finish.
     fn collect_saves(&mut self, wait: bool) {
         for outcome in self.saves.finished(wait) {
-            // A save for another course no longer concerns this run.
-            if outcome.job.path != self.record_file {
-                continue;
-            }
-            // An older save's result must not undo a newer one's threshold.
-            if self.saves.is_latest(outcome.job.sequence) {
-                self.records
-                    .finish_save(&mut self.race, outcome.job.previous_best, &outcome.saved);
-            }
+            // `change_course` waits for queued saves, so every outcome is
+            // for the current course.
+            let latest = self.saves.is_latest(outcome.job.sequence);
+            self.records
+                .finish_save(&mut self.race, latest, &outcome.saved);
             match outcome.saved {
                 Err(e) => self.notify(format!("Record could not be saved: {e}"), 8.),
                 Ok(saved) => self.notify(
@@ -1010,6 +1002,9 @@ impl GameState {
         };
         match next.and_then(|path| Track::load(&path).map(|track| (path, track))) {
             Ok((path, track)) => {
+                // Finish and report this course's queued saves before its
+                // records are replaced or re-read from disk.
+                self.collect_saves(true);
                 self.fall_floor = track.ground_height() - FALL_DEPTH;
                 self.track = track;
                 self.path = path;
@@ -1069,9 +1064,8 @@ impl GameState {
                 self.car.on_course(),
             );
             // Saved on the record thread; `collect_saves` reports the outcome.
-            if let Some((time, previous_best)) = self.records.begin_save(candidate) {
-                self.saves
-                    .submit(self.record_file.clone(), time, previous_best);
+            if let Some(time) = self.records.begin_save(candidate) {
+                self.saves.submit(self.record_file.clone(), time);
             }
             if !self.car.position.is_finite() || self.car.position.y < self.fall_floor {
                 // `restart` settles the accumulator and the rendered pose.
@@ -1228,9 +1222,7 @@ impl Pose {
         if !(self.position.is_finite() && self.heading.is_finite()) {
             return to;
         }
-        let turn = (to.heading - self.heading + std::f32::consts::PI)
-            .rem_euclid(std::f32::consts::TAU)
-            - std::f32::consts::PI;
+        let turn = wrap_angle(to.heading - self.heading);
         Self {
             position: self.position.lerp(to.position, alpha),
             heading: self.heading + turn * alpha,
@@ -2531,17 +2523,53 @@ mod frame_checks {
         let (_dir, mut state) = game(&[]);
         let path = state.record_file.clone();
         state.records.eligible = true;
-        let (time, previous) = state.records.begin_save(Some(50.)).unwrap();
-        state.saves.submit(path.clone(), time, previous);
-        let (time, previous) = state.records.begin_save(Some(40.)).unwrap();
-        state.saves.submit(path.clone(), time, previous);
+        let time = state.records.begin_save(Some(50.)).unwrap();
+        state.saves.submit(path.clone(), time);
+        let time = state.records.begin_save(Some(40.)).unwrap();
+        state.saves.submit(path.clone(), time);
         state.collect_saves(true);
         assert_eq!(state.records.best, Some(40.));
         assert_eq!(state.race.best, Some(40.));
         assert_eq!(read_record(&path), Some(40.));
-        // Saves for a course no longer loaded are ignored.
-        state.saves.submit(path.with_extension("other"), 10., None);
-        state.collect_saves(true);
+    }
+
+    #[test]
+    fn failed_saves_fall_back_to_the_best_time_on_disk() {
+        let mut records = RunRecords::new(None);
+        records.eligible = true;
+        let mut race = records.start_race(0.0, true);
+        let failed = || Err(std::io::Error::other("locked"));
+        // Two runs are promoted in memory; both writes fail.
+        assert_eq!(records.begin_save(Some(50.)), Some(50.));
+        assert_eq!(records.begin_save(Some(40.)), Some(40.));
+        records.finish_save(&mut race, false, &failed());
+        records.finish_save(&mut race, true, &failed());
+        // Nothing reached the disk, so a slower run must still be saved.
+        assert_eq!(records.best, None);
+        assert_eq!(race.best, None);
+        // An older save that succeeded is what the disk holds.
+        assert_eq!(records.begin_save(Some(55.)), Some(55.));
+        assert_eq!(records.begin_save(Some(45.)), Some(45.));
+        let saved = Ok(SavedRecord {
+            best: 55.,
+            improved: true,
+        });
+        records.finish_save(&mut race, false, &saved);
+        records.finish_save(&mut race, true, &failed());
+        assert_eq!(records.best, Some(55.));
+        assert_eq!(race.best, Some(55.));
+    }
+
+    #[test]
+    fn changing_course_reports_saves_queued_for_the_old_one() {
+        let (_dir, mut state) = game(&[]);
+        let path = state.record_file.clone();
+        state.records.eligible = true;
+        let time = state.records.begin_save(Some(40.)).unwrap();
+        state.saves.submit(path.clone(), time);
+        // Reloading the same course re-reads the record the save wrote.
+        assert!(state.change_course(false, false));
         assert_eq!(state.records.best, Some(40.));
+        assert_eq!(state.race.best, Some(40.));
     }
 }
