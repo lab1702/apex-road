@@ -32,6 +32,7 @@ pub fn init() {
 pub fn shutdown() {
     HUD_FONT.with(|slot| drop(slot.borrow_mut().take()));
     FIT_CACHE.with(|cache| cache.borrow_mut().clear());
+    OUTLINE_CACHE.with(|cache| drop(cache.borrow_mut().take()));
 }
 
 fn measure(label: &str, size: f32) -> TextDimensions {
@@ -479,30 +480,132 @@ fn track_map(track: &Track, position: Vec3, heading: f32, origin: Vec2, u: f32, 
         PAPER,
     );
 
-    let mut min = vec2(f32::INFINITY, f32::INFINITY);
-    let mut max = vec2(f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for sample in track.samples() {
-        let p = vec2(sample.pos.x, sample.pos.z);
-        min = min.min(p);
-        max = max.max(p);
+    with_course_outline(track, |outline| {
+        let size = outline.max - outline.min;
+        let map_extent = vec2(width - 47.0 * u, height - 63.0 * u);
+        let map_scale = (map_extent.x / size.x.max(1.0)).min(map_extent.y / size.y.max(1.0));
+        let center = (outline.min + outline.max) * 0.5;
+        let map_center = vec2(x + width * 0.5, y + 42.0 * u + (height - 54.0 * u) * 0.5);
+        let project = |p: Vec2| map_center + vec2(p.x - center.x, -(p.y - center.y)) * map_scale;
+        for pair in outline.points.windows(2) {
+            let a = project(pair[0]);
+            let b = project(pair[1]);
+            draw_line(a.x, a.y, b.x, b.y, 5.0 * u, alpha(BLACK, 0.40));
+            draw_line(a.x, a.y, b.x, b.y, 2.3 * u, alpha(PAPER, 0.56));
+        }
+        let start = project(outline.points[0]);
+        map_markers(
+            start,
+            project(vec2(position.x, position.z)),
+            heading,
+            map_center,
+            map_extent,
+            u,
+        );
+    });
+}
+
+/// The course drawn on the map: its plan-view bounds and a simplified
+/// centerline, built once per course rather than every frame.
+struct CourseOutline {
+    source_hash: u64,
+    sample_count: usize,
+    min: Vec2,
+    max: Vec2,
+    /// The centerline in plan view (world X, Z), simplified to well under a
+    /// pixel of the largest map so long courses stay a few hundred lines.
+    points: Vec<Vec2>,
+}
+
+/// Map detail relative to the course's larger plan dimension. The map is
+/// at most about 310 px across, so this keeps errors near half a pixel.
+const OUTLINE_TOLERANCE: f32 = 1.0 / 600.0;
+
+thread_local! {
+    static OUTLINE_CACHE: RefCell<Option<CourseOutline>> = const { RefCell::new(None) };
+}
+
+fn with_course_outline(track: &Track, draw: impl FnOnce(&CourseOutline)) {
+    OUTLINE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let current = cache.as_ref().is_some_and(|outline| {
+            outline.source_hash == track.source_hash()
+                && outline.sample_count == track.samples().len()
+        });
+        if !current {
+            *cache = Some(course_outline(track));
+        }
+        if let Some(outline) = cache.as_ref() {
+            draw(outline);
+        }
+    });
+}
+
+fn course_outline(track: &Track) -> CourseOutline {
+    let plan: Vec<Vec2> = track
+        .samples()
+        .iter()
+        .map(|sample| vec2(sample.pos.x, sample.pos.z))
+        .collect();
+    let (min, max) = plan.iter().fold(
+        (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
+        |(min, max), p| (min.min(*p), max.max(*p)),
+    );
+    let tolerance = (max - min).max_element().max(1.0) * OUTLINE_TOLERANCE;
+    CourseOutline {
+        source_hash: track.source_hash(),
+        sample_count: plan.len(),
+        min,
+        max,
+        points: simplify_polyline(&plan, tolerance),
     }
-    let size = max - min;
-    let map_extent = vec2(width - 47.0 * u, height - 63.0 * u);
-    let map_scale = (map_extent.x / size.x.max(1.0)).min(map_extent.y / size.y.max(1.0));
-    let center = (min + max) * 0.5;
-    let map_center = vec2(x + width * 0.5, y + 42.0 * u + (height - 54.0 * u) * 0.5);
-    let project = |p: Vec3| map_center + vec2(p.x - center.x, -(p.z - center.y)) * map_scale;
-    for pair in track.samples().windows(2) {
-        let a = project(pair[0].pos);
-        let b = project(pair[1].pos);
-        draw_line(a.x, a.y, b.x, b.y, 5.0 * u, alpha(BLACK, 0.40));
-        draw_line(a.x, a.y, b.x, b.y, 2.3 * u, alpha(PAPER, 0.56));
+}
+
+/// Ramer-Douglas-Peucker: drop points within `tolerance` of the line kept
+/// around them. Keeps both ends; iterative, so long courses cannot overflow
+/// the stack.
+fn simplify_polyline(points: &[Vec2], tolerance: f32) -> Vec<Vec2> {
+    if points.len() < 3 {
+        return points.to_vec();
     }
-    let start = project(track.samples()[0].pos);
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+    let mut spans = vec![(0, points.len() - 1)];
+    while let Some((first, last)) = spans.pop() {
+        let (a, b) = (points[first], points[last]);
+        let chord = b - a;
+        let length = chord.length();
+        let distance = |p: Vec2| {
+            if length <= f32::EPSILON {
+                p.distance(a)
+            } else {
+                chord.perp_dot(p - a).abs() / length
+            }
+        };
+        let farthest = (first + 1..last)
+            .map(|index| (index, distance(points[index])))
+            .max_by(|x, y| x.1.total_cmp(&y.1));
+        if let Some((index, error)) = farthest
+            && error > tolerance
+        {
+            keep[index] = true;
+            spans.push((first, index));
+            spans.push((index, last));
+        }
+    }
+    points
+        .iter()
+        .zip(keep)
+        .filter_map(|(point, kept)| kept.then_some(*point))
+        .collect()
+}
+
+fn map_markers(start: Vec2, car: Vec2, heading: f32, map_center: Vec2, map_extent: Vec2, u: f32) {
     draw_circle(start.x, start.y, 3.0 * u, PAPER);
     // Keep the entire marker within the map when the car drives beyond the
     // course bounds. The projection's padding also contains its 9 px halo.
-    let car = project(position).clamp(map_center - map_extent * 0.5, map_center + map_extent * 0.5);
+    let car = car.clamp(map_center - map_extent * 0.5, map_center + map_extent * 0.5);
     // In world space heading zero points along +Z.
     let forward = vec2(heading.sin(), -heading.cos());
     let right = vec2(-forward.y, forward.x);
@@ -1367,6 +1470,62 @@ mod gauge_tests {
         assert!(calls.get() > before);
         assert_eq!(cache.len(), FIT_CACHE_ENTRIES);
         assert_eq!(cache[0].label, "Another label");
+    }
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    fn segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+        let ab = b - a;
+        let t = ((p - a).dot(ab) / ab.length_squared().max(f32::EPSILON)).clamp(0.0, 1.0);
+        p.distance(a + ab * t)
+    }
+
+    #[test]
+    fn simplified_polylines_keep_ends_and_stay_within_tolerance() {
+        let line: Vec<Vec2> = (0..100).map(|i| vec2(i as f32, 2.0 * i as f32)).collect();
+        assert_eq!(simplify_polyline(&line, 0.01), [line[0], line[99]]);
+        let arc: Vec<Vec2> = (0..=400)
+            .map(|i| {
+                let angle = i as f32 / 400.0 * std::f32::consts::PI;
+                vec2(angle.cos(), angle.sin()) * 100.0
+            })
+            .collect();
+        let simple = simplify_polyline(&arc, 0.2);
+        assert!(simple.len() < 40, "{}", simple.len());
+        assert_eq!((simple[0], *simple.last().unwrap()), (arc[0], arc[400]));
+        for p in &arc {
+            let error = simple
+                .windows(2)
+                .map(|pair| segment_distance(*p, pair[0], pair[1]))
+                .fold(f32::INFINITY, f32::min);
+            assert!(error <= 0.2 + 1e-3, "{error}");
+        }
+        assert!(simplify_polyline(&[], 1.0).is_empty());
+        assert_eq!(simplify_polyline(&arc[..2], 1.0), arc[..2]);
+    }
+
+    #[test]
+    fn bundled_course_maps_are_a_few_hundred_lines_with_the_same_bounds() {
+        for path in crate::courses::BUNDLED_PATHS {
+            let track =
+                Track::load(crate::courses::resolve_track(std::path::Path::new(path)).unwrap())
+                    .unwrap();
+            let outline = course_outline(&track);
+            assert!(
+                outline.points.len() <= 1000,
+                "{path}: {} of {} samples",
+                outline.points.len(),
+                track.samples().len()
+            );
+            assert_eq!(outline.sample_count, track.samples().len());
+            for sample in track.samples() {
+                let p = vec2(sample.pos.x, sample.pos.z);
+                assert!(p.cmpge(outline.min).all() && p.cmple(outline.max).all());
+            }
+        }
     }
 }
 
